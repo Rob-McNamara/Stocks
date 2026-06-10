@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { apiClient } from '../services/api'
+import { calculateSMA, getLatestSMA } from '../utils/sma'
 import PriceChart from './PriceChart'
 
 interface WatchlistSymbol {
@@ -15,6 +16,7 @@ interface CurrentPrice {
   change_percent: number | null
   volume: number | null
   last_updated: string
+  sma150?: number | null
   error?: string
 }
 
@@ -43,8 +45,24 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
         apiClient.getWatchlistSymbols(),
         apiClient.getWatchlistPrices()
       ])
+      
+      // Fetch and calculate SMA for each symbol
+      const pricesWithSMA = await Promise.all(
+        pricesData.map(async (price) => {
+          try {
+            const history = await apiClient.getPriceHistory(price.symbol, 300)
+            const smaArray = calculateSMA(history, 150)
+            const sma150 = getLatestSMA(smaArray)
+            return { ...price, sma150 }
+          } catch (err) {
+            // If SMA calculation fails, just return price without SMA
+            return price
+          }
+        })
+      )
+      
       setSymbols(symbolsData)
-      setCurrentPrices(pricesData)
+      setCurrentPrices(pricesWithSMA)
       if (symbolsData.length && !selectedSymbol) {
         setSelectedSymbol(symbolsData[0].symbol)
       }
@@ -80,7 +98,19 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
       
       // Refresh prices after adding symbol
       const pricesData = await apiClient.getWatchlistPrices()
-      setCurrentPrices(pricesData)
+      const pricesWithSMA = await Promise.all(
+        pricesData.map(async (price) => {
+          try {
+            const history = await apiClient.getPriceHistory(price.symbol, 300)
+            const smaArray = calculateSMA(history, 150)
+            const sma150 = getLatestSMA(smaArray)
+            return { ...price, sma150 }
+          } catch (err) {
+            return price
+          }
+        })
+      )
+      setCurrentPrices(pricesWithSMA)
       
       // Clear success message after 3 seconds
       setTimeout(() => setSuccess(null), 3000)
@@ -98,7 +128,22 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
       setError(null)
       setSuccess(null)
       const pricesData = await apiClient.getWatchlistPrices()
-      setCurrentPrices(pricesData)
+      
+      // Fetch and calculate SMA for each symbol
+      const pricesWithSMA = await Promise.all(
+        pricesData.map(async (price) => {
+          try {
+            const history = await apiClient.getPriceHistory(price.symbol, 300)
+            const smaArray = calculateSMA(history, 150)
+            const sma150 = getLatestSMA(smaArray)
+            return { ...price, sma150 }
+          } catch (err) {
+            return price
+          }
+        })
+      )
+      
+      setCurrentPrices(pricesWithSMA)
 
       const hasPrice = pricesData.some((item) => item.price !== null)
       const errorDetails = pricesData
@@ -252,6 +297,11 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
                             Vol: {priceData.volume.toLocaleString()}
                           </div>
                         )}
+                        {priceData.sma150 !== undefined && priceData.sma150 !== null && (
+                          <div className="sma-value">
+                            150-day SMA: ${priceData.sma150.toFixed(2)}
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <div className="price-loading">Loading...</div>
@@ -275,7 +325,7 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
       {symbols.length > 0 && (
         <div className="manager-card chart-card">
           <div className="card-header">
-            <h2>150-Day SMA Chart</h2>
+            <h2>Simple Moving Average Chart</h2>
             <div className="chart-select">
               <label htmlFor="chart-symbol">Symbol</label>
               <select

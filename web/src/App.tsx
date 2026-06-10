@@ -3,8 +3,9 @@ import './App.css'
 import WatchlistManager from './components/WatchlistManager'
 import ConfigPanel from './components/ConfigPanel'
 import HoldingsManager from './components/HoldingsManager'
+import EventLogViewer from './components/EventLogViewer'
 
-type Tab = 'watchlist' | 'config' | 'holdings'
+type Tab = 'watchlist' | 'config' | 'holdings' | 'events'
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('watchlist')
@@ -56,6 +57,13 @@ function App() {
           Holdings
         </button>
         <button
+          className={`tab-button ${activeTab === 'events' ? 'active' : ''}`}
+          onClick={() => setActiveTab('events')}
+          disabled={loading}
+        >
+          Event Log
+        </button>
+        <button
           className={`tab-button ${activeTab === 'config' ? 'active' : ''}`}
           onClick={() => setActiveTab('config')}
           disabled={loading}
@@ -70,6 +78,9 @@ function App() {
         )}
         {activeTab === 'holdings' && (
           <HoldingsManager onLoading={setLoading} />
+        )}
+        {activeTab === 'events' && (
+          <EventLogViewer onLoading={setLoading} />
         )}
         {activeTab === 'config' && (
           <ConfigPanel onLoading={setLoading} />

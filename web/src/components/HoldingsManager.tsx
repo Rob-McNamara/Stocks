@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient } from '../services/api'
+import { calculateSMA, getLatestSMA } from '../utils/sma'
 
 interface HoldingTransaction {
   id: number
@@ -18,6 +19,7 @@ interface HoldingTransaction {
 export default function HoldingsManager({ onLoading }: { onLoading: (loading: boolean) => void }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [currentPrices, setCurrentPrices] = useState<Record<string, number | null>>({})
+  const [smaPrices, setSmaPrices] = useState<Record<string, number | null>>({})
   const [symbol, setSymbol] = useState('')
   const [transactionType, setTransactionType] = useState<HoldingTransaction['transaction_type']>('purchase')
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
@@ -56,6 +58,21 @@ export default function HoldingsManager({ onLoading }: { onLoading: (loading: bo
             {} as Record<string, number | null>
           )
           setCurrentPrices(priceMap)
+          
+          // Fetch and calculate SMA for each symbol
+          const smaMap: Record<string, number | null> = {}
+          for (const sym of symbols) {
+            try {
+              const history = await apiClient.getPriceHistory(sym, 300)
+              const smaArray = calculateSMA(history, 150)
+              const sma150 = getLatestSMA(smaArray)
+              smaMap[sym] = sma150
+            } catch (err) {
+              // If SMA calculation fails, just leave it as null
+              smaMap[sym] = null
+            }
+          }
+          setSmaPrices(smaMap)
         } catch (err) {
           // Continue even if price fetch fails
           console.error('Failed to fetch prices:', err)
@@ -223,6 +240,20 @@ export default function HoldingsManager({ onLoading }: { onLoading: (loading: bo
         return acc
       }, {} as Record<string, number | null>)
       setCurrentPrices(priceMap)
+      
+      // Fetch and calculate SMA for each symbol
+      const smaMap: Record<string, number | null> = {}
+      for (const sym of symbols) {
+        try {
+          const history = await apiClient.getPriceHistory(sym, 300)
+          const smaArray = calculateSMA(history, 150)
+          const sma150 = getLatestSMA(smaArray)
+          smaMap[sym] = sma150
+        } catch (err) {
+          smaMap[sym] = null
+        }
+      }
+      setSmaPrices(smaMap)
 
       const hasPrice = prices.some((item) => item.price !== null)
       const errorDetails = prices
@@ -256,7 +287,7 @@ export default function HoldingsManager({ onLoading }: { onLoading: (loading: bo
   }
 
   const summary = useMemo(() => {
-    const totals: Record<string, { symbol: string; shares: number; invested: number; dividends: number; currentPrice: number | null; currentValue: number }> = {}
+    const totals: Record<string, { symbol: string; shares: number; invested: number; dividends: number; currentPrice: number | null; sma150: number | null; currentValue: number }> = {}
 
     transactions.forEach((tx) => {
       const key = tx.symbol
@@ -267,6 +298,7 @@ export default function HoldingsManager({ onLoading }: { onLoading: (loading: bo
           invested: 0,
           dividends: 0,
           currentPrice: currentPrices[tx.symbol] || null,
+          sma150: smaPrices[tx.symbol] || null,
           currentValue: 0,
         }
       }
@@ -291,11 +323,12 @@ export default function HoldingsManager({ onLoading }: { onLoading: (loading: bo
     // Calculate current value
     Object.values(totals).forEach((item) => {
       item.currentPrice = currentPrices[item.symbol] || null
+      item.sma150 = smaPrices[item.symbol] || null
       item.currentValue = item.currentPrice ? item.shares * item.currentPrice : 0
     })
 
     return Object.values(totals)
-  }, [transactions, currentPrices])
+  }, [transactions, currentPrices, smaPrices])
 
   const dividendTotalsBySymbol = useMemo(() => {
     return transactions.reduce<Record<string, number>>((acc, tx) => {
@@ -504,6 +537,9 @@ export default function HoldingsManager({ onLoading }: { onLoading: (loading: bo
                   <strong>{item.symbol}</strong>
                   <div>Shares: {item.shares.toFixed(2)}</div>
                   <div>Price: {item.currentPrice ? `$${item.currentPrice.toFixed(2)}` : '—'}</div>
+                  {item.sma150 !== null && (
+                    <div>150-day SMA: ${item.sma150.toFixed(2)}</div>
+                  )}
                   <div>Current value: ${item.currentValue.toFixed(2)}</div>
                   <div>Net invested: ${item.invested.toFixed(2)}</div>
                   <div>Dividends: ${item.dividends.toFixed(2)}</div>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient } from '../services/api'
+import { calculateSMA } from '../utils/sma'
 
 interface PriceHistoryPoint {
   date: string
@@ -10,33 +11,6 @@ interface PriceHistoryPoint {
 interface PriceChartProps {
   symbol: string
   onLoading: (loading: boolean) => void
-}
-
-function calculateSMA(data: PriceHistoryPoint[], period: number) {
-  const sma: Array<number | null> = Array(data.length).fill(null)
-
-  for (let i = 0; i < data.length; i += 1) {
-    if (i + 1 < period) {
-      continue
-    }
-
-    let sum = 0
-    let valid = true
-    for (let j = i + 1 - period; j <= i; j += 1) {
-      const value = data[j].close
-      if (value === null) {
-        valid = false
-        break
-      }
-      sum += value
-    }
-
-    if (valid) {
-      sma[i] = sum / period
-    }
-  }
-
-  return sma
 }
 
 function buildPath(points: Array<{ x: number; y: number | null }>) {
@@ -54,6 +28,7 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [smaPeriod, setSmaPeriod] = useState<50 | 150>(150)
 
   useEffect(() => {
     if (!symbol) {
@@ -81,13 +56,13 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
   }, [symbol])
 
   const trimmedHistory = useMemo(() => {
-    if (history.length <= 150) {
+    if (history.length <= smaPeriod) {
       return history
     }
-    return history.slice(history.length - 150)
-  }, [history])
+    return history.slice(history.length - smaPeriod)
+  }, [history, smaPeriod])
 
-  const sma = useMemo(() => calculateSMA(history, 150), [history])
+  const sma = useMemo(() => calculateSMA(history, smaPeriod), [history, smaPeriod])
 
   const priceValues = trimmedHistory.map((item) => item.close).filter((v): v is number => v !== null)
   const latestPrice = priceValues[priceValues.length - 1]
@@ -136,7 +111,18 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
       const volume = item.volume ?? 0
       const barHeight = (volume / maxVolume) * volumePlotHeight
       const y = volumeTop + volumePlotHeight - barHeight
-      return { x: x - barWidth / 2, y, width: barWidth, height: barHeight }
+      
+      // Determine color based on price movement
+      let color = '#8fb9ff' // default neutral
+      if (index > 0) {
+        const prevClose = trimmedHistory[index - 1].close
+        const currClose = item.close
+        if (prevClose !== null && currClose !== null) {
+          color = currClose >= prevClose ? '#4caf50' : '#f44336' // green up, red down
+        }
+      }
+      
+      return { x: x - barWidth / 2, y, width: barWidth, height: barHeight, color }
     })
 
     return {
@@ -154,7 +140,7 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
   }, [trimmedHistory, history.length, sma])
 
   if (!symbol) {
-    return <p className="chart-message">Select a watchlist symbol to display the 150-day SMA chart.</p>
+    return <p className="chart-message">Select a watchlist symbol to display the Simple Moving Average chart.</p>
   }
 
   if (loading) {
@@ -177,8 +163,22 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
           <span className="chart-value">{latestPrice ? `$${latestPrice.toFixed(2)}` : 'Price unavailable'}</span>
         </div>
         <div>
-          <span className="chart-detail">150-day SMA: {latestSma ? `$${latestSma.toFixed(2)}` : 'N/A'}</span>
+          <span className="chart-detail">{smaPeriod}-day SMA: {latestSma ? `$${latestSma.toFixed(2)}` : 'N/A'}</span>
           <span className="chart-detail">Last: {trimmedHistory[trimmedHistory.length - 1]?.date}</span>
+          <div className="sma-selector">
+            <button
+              className={`sma-button ${smaPeriod === 50 ? 'active' : ''}`}
+              onClick={() => setSmaPeriod(50)}
+            >
+              50-day
+            </button>
+            <button
+              className={`sma-button ${smaPeriod === 150 ? 'active' : ''}`}
+              onClick={() => setSmaPeriod(150)}
+            >
+              150-day
+            </button>
+          </div>
         </div>
       </div>
       <div className="chart-frame">
@@ -195,7 +195,7 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
               y={bar.y}
               width={bar.width}
               height={bar.height}
-              fill="#8fb9ff"
+              fill={bar.color}
               opacity="0.85"
             />
           ))}
@@ -206,10 +206,13 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
           <span className="legend-swatch price-line" /> Closing Price
         </span>
         <span className="legend-item">
-          <span className="legend-swatch sma-line" /> 150-day SMA
+          <span className="legend-swatch sma-line" /> {smaPeriod}-day SMA
         </span>
         <span className="legend-item">
-          <span className="legend-swatch volume-bar" /> Volume
+          <span className="legend-swatch" style={{ background: '#4caf50' }} /> Volume Up
+        </span>
+        <span className="legend-item">
+          <span className="legend-swatch" style={{ background: '#f44336' }} /> Volume Down
         </span>
       </div>
     </div>

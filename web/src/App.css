@@ -184,6 +184,36 @@
   gap: 8px;
 }
 
+.sma-selector {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.sma-button {
+  padding: 6px 14px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: white;
+  color: #555;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.sma-button:hover {
+  border-color: #667eea;
+  color: #667eea;
+  background: #f5f7fa;
+}
+
+.sma-button.active {
+  background: #667eea;
+  color: white;
+  border-color: #667eea;
+}
+
 .legend-swatch {
   width: 16px;
   height: 12px;
@@ -459,6 +489,13 @@
   margin-top: 2px;
 }
 
+.sma-value {
+  font-size: 12px;
+  color: #2f5ce4;
+  font-weight: 500;
+  margin-top: 4px;
+}
+
 .price-loading {
   font-size: 12px;
   color: #999;
@@ -516,7 +553,110 @@
 .holdings-table tr:hover {
   background: #fbfcff;
 }
+.event-log-card {
+  padding: 24px;
+}
 
+.event-log-summary {
+  color: #555;
+  font-size: 14px;
+  margin: 0;
+}
+
+.event-log-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+  align-items: flex-end;
+  margin-bottom: 20px;
+}
+
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.filter-group label {
+  font-size: 13px;
+  color: #555;
+  font-weight: 600;
+}
+
+.filter-group input,
+.filter-group select {
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #ddd;
+  background: white;
+  font-size: 14px;
+}
+
+.filter-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.event-log-table-wrapper {
+  overflow-x: auto;
+}
+
+.event-log-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 900px;
+}
+
+.event-log-table th,
+.event-log-table td {
+  padding: 12px 14px;
+  border: 1px solid #e8edf4;
+  font-size: 13px;
+  text-align: left;
+}
+
+.event-log-table th {
+  background: #f4f6fb;
+  color: #444;
+  font-weight: 700;
+}
+
+.event-log-table tr:nth-child(even) {
+  background: #fbfcff;
+}
+
+.event-level {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.event-level.info {
+  color: #2f5ce4;
+}
+
+.event-level.warn {
+  color: #ff9800;
+}
+
+.event-level.error {
+  color: #f44336;
+}
+
+.event-log-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+
+.event-log-pagination span {
+  font-size: 14px;
+  color: #555;
+}
 /* Config List */
 .config-list {
   display: flex;

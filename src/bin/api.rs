@@ -1,6 +1,6 @@
 use actix_cors::Cors;
 use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer, Responder};
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use reqwest::Client;
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -899,10 +899,10 @@ async fn fetch_watchlist_current_prices(db_path: &PathBuf) -> Result<Vec<Current
             Ok(price_data) => {
                 prices.push(CurrentPrice {
                     symbol: symbol_data.symbol,
-                    price: price_data.regularMarketPrice,
-                    change: price_data.regularMarketChange,
-                    change_percent: price_data.regularMarketChangePercent,
-                    volume: price_data.regularMarketVolume,
+                    price: price_data.regular_market_price,
+                    change: price_data.regular_market_change,
+                    change_percent: price_data.regular_market_change_percent,
+                    volume: price_data.regular_market_volume,
                     last_updated: last_updated.clone(),
                     error: None,
                 });
@@ -955,6 +955,18 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
 
     let mut history = rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?;
     history.reverse();
+
+    if history.is_empty() {
+        let client = Client::builder()
+            .user_agent("stocks-api/1.0")
+            .build()
+            .map_err(|err| err.to_string())?;
+        let yahoo_history = fetch_price_history_from_yahoo(&client, symbol, days).await;
+        if let Ok(records) = yahoo_history {
+            return Ok(records);
+        }
+    }
+
     Ok(history)
 }
 
@@ -991,12 +1003,101 @@ struct YahooResultData {
     meta: YahooMeta,
 }
 
+#[allow(non_snake_case)]
 #[derive(Deserialize)]
 struct YahooMeta {
-    regularMarketPrice: Option<f64>,
-    regularMarketChange: Option<f64>,
-    regularMarketChangePercent: Option<f64>,
-    regularMarketVolume: Option<i64>,
+    #[serde(rename = "regularMarketPrice")]
+    regular_market_price: Option<f64>,
+    #[serde(rename = "regularMarketChange")]
+    regular_market_change: Option<f64>,
+    #[serde(rename = "regularMarketChangePercent")]
+    regular_market_change_percent: Option<f64>,
+    #[serde(rename = "regularMarketVolume")]
+    regular_market_volume: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryResponse {
+    chart: YahooHistoryChart,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryChart {
+    result: Option<Vec<YahooHistoryResult>>,
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryResult {
+    timestamp: Option<Vec<i64>>,
+    indicators: YahooHistoryIndicators,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryIndicators {
+    quote: Vec<YahooHistoryQuote>,
+}
+
+#[derive(Deserialize)]
+struct YahooHistoryQuote {
+    close: Option<Vec<Option<f64>>>,
+    volume: Option<Vec<Option<i64>>>,
+}
+
+async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str, days: i64) -> Result<Vec<PriceHistoryPoint>, String> {
+    let range = if days <= 365 { "1y" } else { "2y" };
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range={}",
+        symbol,
+        range
+    );
+
+    let response = client.get(&url).send().await.map_err(|err| err.to_string())?;
+    let response = response.error_for_status().map_err(|err| err.to_string())?;
+    let payload: YahooHistoryResponse = response.json().await.map_err(|err| err.to_string())?;
+
+    let result = payload
+        .chart
+        .result
+        .as_ref()
+        .and_then(|items| items.first())
+        .ok_or_else(|| {
+            if let Some(error) = payload.chart.error {
+                anyhow::anyhow!("No chart result found for {}: {}", symbol, error).to_string()
+            } else {
+                format!("No chart result found for {}", symbol)
+            }
+        })?;
+
+    let timestamps = result.timestamp.as_ref().ok_or_else(|| format!("No timestamp data in Yahoo response for {}", symbol))?;
+    let quote = result
+        .indicators
+        .quote
+        .first()
+        .ok_or_else(|| format!("No quote data in Yahoo response for {}", symbol))?;
+
+    let mut records = Vec::with_capacity(timestamps.len());
+    for (index, ts) in timestamps.iter().enumerate() {
+        let date = Utc
+            .timestamp_opt(*ts, 0)
+            .single()
+            .ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let close = quote.close.as_ref().and_then(|v| v.get(index).cloned().flatten());
+        let volume = quote.volume.as_ref().and_then(|v| v.get(index).cloned().flatten());
+
+        if close.is_some() {
+            records.push(PriceHistoryPoint { date, close, volume });
+        }
+    }
+
+    if records.is_empty() {
+        Err(format!("Yahoo returned no historical prices for {}", symbol))
+    } else {
+        Ok(records)
+    }
 }
 
 async fn fetch_current_price(client: &Client, symbol: &str) -> Result<YahooMeta, String> {
@@ -1042,13 +1143,13 @@ async fn fetch_current_prices_for_symbols(
         match fetch_current_price(&client, symbol).await {
             Ok(meta) => {
                 // Log successful fetch
-                let _ = insert_event_log(db_path, "info", "price_fetch", "api", Some(symbol), &format!("Fetched price from Yahoo: {:?}", meta.regularMarketPrice));
+                let _ = insert_event_log(db_path, "info", "price_fetch", "api", Some(symbol), &format!("Fetched price from Yahoo: {:?}", meta.regular_market_price));
                 prices.push(CurrentPrice {
                     symbol: symbol.clone(),
-                    price: meta.regularMarketPrice,
-                    change: meta.regularMarketChange,
-                    change_percent: meta.regularMarketChangePercent,
-                    volume: meta.regularMarketVolume,
+                    price: meta.regular_market_price,
+                    change: meta.regular_market_change,
+                    change_percent: meta.regular_market_change_percent,
+                    volume: meta.regular_market_volume,
                     last_updated: now.clone(),
                     error: None,
                 });
