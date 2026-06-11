@@ -28,21 +28,21 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    loadEvents()
+    loadEvents({ page, level, source, eventType, symbol })
   }, [page])
 
-  const loadEvents = async () => {
+  const loadEvents = async (opts: { page: number; level: string; source: string; eventType: string; symbol: string }) => {
     try {
       setLoading(true)
       setError(null)
       onLoading(true)
       const result = await apiClient.getEventLog({
-        page,
+        page: opts.page,
         size,
-        level: level || undefined,
-        source: source || undefined,
-        event_type: eventType || undefined,
-        symbol: symbol || undefined,
+        level: opts.level || undefined,
+        source: opts.source || undefined,
+        event_type: opts.eventType || undefined,
+        symbol: opts.symbol || undefined,
       })
       setEvents(result.items)
       setTotal(result.total)
@@ -57,7 +57,7 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
   const handleFilterSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setPage(1)
-    await loadEvents()
+    await loadEvents({ page: 1, level, source, eventType, symbol })
   }
 
   const handleResetFilters = async () => {
@@ -66,7 +66,7 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
     setEventType('')
     setSymbol('')
     setPage(1)
-    await loadEvents()
+    await loadEvents({ page: 1, level: '', source: '', eventType: '', symbol: '' })
   }
 
   const handlePrevPage = () => {

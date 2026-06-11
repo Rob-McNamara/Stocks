@@ -40,6 +40,8 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [manualSymbol, setManualSymbol] = useState('')
+  const [manualPrice, setManualPrice] = useState('')
 
   useEffect(() => {
     loadConfig()
@@ -90,6 +92,49 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
   const handleCancel = () => {
     setEditingKey(null)
     setEditingValue('')
+  }
+
+  const manualPrices = Object.entries(config)
+    .filter(([k, v]) => k.startsWith('manual_price_') && v !== '')
+    .map(([k, v]) => ({ symbol: k.replace('manual_price_', ''), price: v }))
+
+  const handleSaveManualPrice = async () => {
+    const sym = manualSymbol.trim().toUpperCase()
+    const val = manualPrice.trim()
+    if (!sym || !val || isNaN(parseFloat(val))) return
+    try {
+      setLoading(true)
+      setError(null)
+      await apiClient.updateConfig(`manual_price_${sym}`, val)
+      setConfig((c) => ({ ...c, [`manual_price_${sym}`]: val }))
+      setManualSymbol('')
+      setManualPrice('')
+      setSuccess(`Manual price set for ${sym}`)
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save manual price')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleRemoveManualPrice = async (symbol: string) => {
+    try {
+      setLoading(true)
+      setError(null)
+      await apiClient.updateConfig(`manual_price_${symbol}`, '')
+      setConfig((c) => {
+        const next = { ...c }
+        delete next[`manual_price_${symbol}`]
+        return next
+      })
+      setSuccess(`Manual price removed for ${symbol}`)
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove manual price')
+    } finally {
+      setLoading(false)
+    }
   }
 
   return (
@@ -158,6 +203,77 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
                 </div>
               </div>
             ))}
+          </div>
+
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>Manual Prices</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              Set prices manually for stocks that cannot be fetched automatically. These appear in blue on the Holdings screen.
+            </p>
+
+            {manualPrices.length > 0 && (
+              <table className="holdings-table" style={{ marginBottom: 20 }}>
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Price</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {manualPrices.map(({ symbol, price }) => (
+                    <tr key={symbol}>
+                      <td><strong>{symbol}</strong></td>
+                      <td>${parseFloat(price).toFixed(4)}</td>
+                      <td>
+                        <button
+                          className="btn btn-danger btn-small"
+                          onClick={() => handleRemoveManualPrice(symbol)}
+                          disabled={loading}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            <div className="config-edit" style={{ alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Symbol</label>
+                <input
+                  type="text"
+                  value={manualSymbol}
+                  onChange={(e) => setManualSymbol(e.target.value.toUpperCase())}
+                  placeholder="e.g. ETPMPM.AX"
+                  className="config-input"
+                  disabled={loading}
+                  maxLength={12}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Price ($)</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={manualPrice}
+                  onChange={(e) => setManualPrice(e.target.value)}
+                  placeholder="e.g. 4.25"
+                  className="config-input"
+                  disabled={loading}
+                />
+              </div>
+              <button
+                className="btn btn-primary btn-small"
+                onClick={handleSaveManualPrice}
+                disabled={loading || !manualSymbol || !manualPrice}
+              >
+                Set Price
+              </button>
+            </div>
           </div>
 
           <div className="config-card info-card">

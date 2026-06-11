@@ -191,6 +191,21 @@ export const apiClient = {
     return response.json()
   },
 
+  async getDividends(): Promise<{ symbol: string; ex_date: string; payment_date: string | null; amount: number }[]> {
+    const response = await fetch(`${API_BASE_URL}/dividends`)
+    if (!response.ok) throw new Error('Failed to fetch dividends')
+    return response.json()
+  },
+
+  async refreshDividends(): Promise<{ updated: number; errors: string[] }> {
+    const response = await fetch(`${API_BASE_URL}/dividends/refresh`, { method: 'POST' })
+    if (!response.ok) {
+      const message = await response.text()
+      throw new Error(message || 'Failed to refresh dividends')
+    }
+    return response.json()
+  },
+
   async updateConfig(key: string, value: string): Promise<void> {
     const response = await fetch(`${API_BASE_URL}/config`, {
       method: 'PUT',

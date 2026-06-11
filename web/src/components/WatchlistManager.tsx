@@ -298,7 +298,7 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
                           </div>
                         )}
                         {priceData.sma150 !== undefined && priceData.sma150 !== null && (
-                          <div className="sma-value">
+                          <div className={`sma-value ${priceData.price !== null && priceData.sma150 > priceData.price ? 'sma-above-price' : ''}`}>
                             150-day SMA: ${priceData.sma150.toFixed(2)}
                           </div>
                         )}

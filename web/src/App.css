@@ -288,7 +288,12 @@
 }
 
 /* Forms */
-.add-symbol-form,
+.add-symbol-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .config-edit {
   display: flex;
   gap: 12px;
@@ -298,13 +303,13 @@
 .form-group {
   display: flex;
   gap: 12px;
-  flex: 1;
-  min-width: 300px;
+  flex-wrap: wrap;
 }
 
 .symbol-input,
 .config-input {
   flex: 1;
+  min-width: 140px;
   padding: 10px 14px;
   border: 1px solid #ddd;
   border-radius: 6px;
@@ -397,16 +402,18 @@
   list-style: none;
   padding: 0;
   margin: 16px 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
 }
 
 .symbol-item {
   display: flex;
+  flex-direction: column;
   justify-content: space-between;
-  align-items: center;
   padding: 14px;
   border: 1px solid #e0e0e0;
   border-radius: 6px;
-  margin-bottom: 10px;
   background: #fafafa;
   transition: all 0.3s ease;
 }
@@ -421,7 +428,7 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
-  flex: 1;
+  margin-bottom: 10px;
 }
 
 .symbol-name {
@@ -440,15 +447,14 @@
 .price-info {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  margin-right: 12px;
-  min-width: 120px;
+  align-items: flex-start;
+  margin-bottom: 12px;
 }
 
 .price-details {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: flex-start;
   gap: 2px;
 }
 
@@ -496,10 +502,71 @@
   margin-top: 4px;
 }
 
+.sma-value.sma-above-price {
+  color: #f44336;
+}
+
 .price-loading {
   font-size: 12px;
   color: #999;
   font-style: italic;
+}
+
+/* Dashboard */
+.dashboard-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  background: white;
+  border-radius: 8px;
+  padding: 24px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  text-align: center;
+}
+
+.stat-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #333;
+}
+
+.stat-value.positive {
+  color: #4caf50;
+}
+
+.stat-value.negative {
+  color: #f44336;
+}
+
+.stat-sub {
+  font-size: 13px;
+  color: #aaa;
+  margin-top: 4px;
+}
+
+.dashboard-lists {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 24px;
+}
+
+.dashboard-list-desc {
+  font-size: 13px;
+  color: #888;
+  margin: -8px 0 16px;
 }
 
 .holdings-card {
@@ -537,6 +604,10 @@
   min-width: 900px;
 }
 
+.holdings-table.compact {
+  min-width: 0;
+}
+
 .holdings-table th,
 .holdings-table td {
   padding: 12px 14px;
@@ -552,6 +623,16 @@
 
 .holdings-table tr:hover {
   background: #fbfcff;
+}
+
+.sortable-header {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.sortable-header:hover {
+  background: #e8ecf7;
 }
 .event-log-card {
   padding: 24px;
@@ -839,8 +920,7 @@
   }
 
   .price-info {
-    margin-right: 0;
-    margin-top: 8px;
+    margin-bottom: 10px;
     align-items: flex-start;
     width: 100%;
   }

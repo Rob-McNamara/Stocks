@@ -28,7 +28,8 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [smaPeriod, setSmaPeriod] = useState<50 | 150>(150)
+  const [smaPeriod, setSmaPeriod] = useState<20 | 50 | 100 | 150 | 200>(150)
+  const [timeframe, setTimeframe] = useState<'12m' | '6m' | '3m' | '1m' | '1w'>('6m')
 
   useEffect(() => {
     if (!symbol) {
@@ -42,7 +43,7 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
         setError(null)
         onLoading(true)
 
-        const data = await apiClient.getPriceHistory(symbol, 300)
+        const data = await apiClient.getPriceHistory(symbol, 600)
         setHistory(data)
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load price history')
@@ -56,11 +57,17 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
   }, [symbol])
 
   const trimmedHistory = useMemo(() => {
-    if (history.length <= smaPeriod) {
-      return history
-    }
-    return history.slice(history.length - smaPeriod)
-  }, [history, smaPeriod])
+    if (history.length === 0) return history
+    const cutoff = new Date()
+    if (timeframe === '12m') cutoff.setFullYear(cutoff.getFullYear() - 1)
+    else if (timeframe === '6m') cutoff.setMonth(cutoff.getMonth() - 6)
+    else if (timeframe === '3m') cutoff.setMonth(cutoff.getMonth() - 3)
+    else if (timeframe === '1m') cutoff.setMonth(cutoff.getMonth() - 1)
+    else cutoff.setDate(cutoff.getDate() - 7)
+    const cutoffStr = cutoff.toISOString().slice(0, 10)
+    const filtered = history.filter((item) => item.date >= cutoffStr)
+    return filtered.length > 0 ? filtered : history.slice(-5)
+  }, [history, timeframe])
 
   const sma = useMemo(() => calculateSMA(history, smaPeriod), [history, smaPeriod])
 
@@ -125,6 +132,26 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
       return { x: x - barWidth / 2, y, width: barWidth, height: barHeight, color }
     })
 
+    const axisY = top + plotHeight
+    const labelY = axisY + 18
+
+    const labelCount = trimmedHistory.length <= 7 ? trimmedHistory.length : trimmedHistory.length <= 30 ? 4 : 6
+    const xLabels: Array<{ x: number; label: string }> = []
+    if (trimmedHistory.length > 0) {
+      const indices = Array.from({ length: labelCount }, (_, i) =>
+        Math.round((i / (labelCount - 1)) * (trimmedHistory.length - 1))
+      )
+      for (const idx of indices) {
+        const item = trimmedHistory[idx]
+        if (!item) continue
+        const [year, month, day] = item.date.split('-')
+        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+        const label = `${day} ${months[parseInt(month, 10) - 1]} '${year.slice(2)}`
+        const x = left + (plotWidth * idx) / Math.max(trimmedHistory.length - 1, 1)
+        xLabels.push({ x, label })
+      }
+    }
+
     return {
       width: 1100,
       height: volumeTop + volumeHeight,
@@ -136,6 +163,9 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
       top,
       bottom,
       pricePlotHeight: plotHeight,
+      axisY,
+      labelY,
+      xLabels,
     }
   }, [trimmedHistory, history.length, sma])
 
@@ -166,18 +196,25 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
           <span className="chart-detail">{smaPeriod}-day SMA: {latestSma ? `$${latestSma.toFixed(2)}` : 'N/A'}</span>
           <span className="chart-detail">Last: {trimmedHistory[trimmedHistory.length - 1]?.date}</span>
           <div className="sma-selector">
-            <button
-              className={`sma-button ${smaPeriod === 50 ? 'active' : ''}`}
-              onClick={() => setSmaPeriod(50)}
-            >
-              50-day
-            </button>
-            <button
-              className={`sma-button ${smaPeriod === 150 ? 'active' : ''}`}
-              onClick={() => setSmaPeriod(150)}
-            >
-              150-day
-            </button>
+            {(['1w', '1m', '3m', '6m', '12m'] as const).map((tf) => (
+              <button
+                key={tf}
+                className={`sma-button ${timeframe === tf ? 'active' : ''}`}
+                onClick={() => setTimeframe(tf)}
+              >
+                {tf === '1w' ? '1W' : tf === '1m' ? '1M' : tf === '3m' ? '3M' : tf === '6m' ? '6M' : '12M'}
+              </button>
+            ))}
+            <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
+            {([20, 50, 100, 150, 200] as const).map((p) => (
+              <button
+                key={p}
+                className={`sma-button ${smaPeriod === p ? 'active' : ''}`}
+                onClick={() => setSmaPeriod(p)}
+              >
+                SMA {p}
+              </button>
+            ))}
           </div>
         </div>
       </div>
@@ -186,6 +223,12 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
           <rect x="0" y="0" width={chartData.width} height={chartData.height} fill="#ffffff" rx="18" />
           <line x1={chartData.left} y1={chartData.top} x2={chartData.left} y2={chartData.top + chartData.pricePlotHeight} stroke="#e1e7f1" strokeWidth="1" />
           <line x1={chartData.left} y1={chartData.top + chartData.pricePlotHeight} x2={chartData.width - chartData.right} y2={chartData.top + chartData.pricePlotHeight} stroke="#e1e7f1" strokeWidth="1" />
+          {chartData.xLabels.map(({ x, label }) => (
+            <g key={label}>
+              <line x1={x} y1={chartData.axisY} x2={x} y2={chartData.axisY + 5} stroke="#aaa" strokeWidth="1" />
+              <text x={x} y={chartData.labelY} textAnchor="middle" fontSize="13" fill="#888" fontFamily="inherit">{label}</text>
+            </g>
+          ))}
           <path d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
           <path d={buildPath(chartData.smaPoints)} fill="none" stroke="#ff9800" strokeWidth="2" strokeDasharray="8 6" />
           {chartData.volumeBars.map((bar, index) => (

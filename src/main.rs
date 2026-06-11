@@ -122,7 +122,6 @@ async fn main() -> anyhow::Result<()> {
         watchlist_loop(
             &client,
             &db_path,
-            &watchlist_symbols,
             watchlist_interval_secs,
             historical_range.clone(),
         )
@@ -133,13 +132,11 @@ async fn main() -> anyhow::Result<()> {
     if watchlist_enabled {
         let client_clone = client.clone();
         let db_path_clone = db_path.clone();
-        let watchlist_symbols_clone = watchlist_symbols.clone();
         let historical_range_clone = historical_range.clone();
         tokio::spawn(async move {
             watchlist_loop(
                 &client_clone,
                 &db_path_clone,
-                &watchlist_symbols_clone,
                 watchlist_interval_secs,
                 historical_range_clone,
             )
@@ -230,7 +227,6 @@ fn next_daily_run(hour: u32, minute: u32) -> chrono::DateTime<Local> {
 async fn watchlist_loop(
     client: &Client,
     db_path: &PathBuf,
-    symbols: &[String],
     interval_secs: u64,
     historical_range: Option<DateRange>,
 ) {

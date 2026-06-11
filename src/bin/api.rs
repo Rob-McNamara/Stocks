@@ -4,7 +4,7 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use reqwest::Client;
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{env, path::PathBuf};
+use std::{collections::HashMap, env, path::PathBuf};
 
 #[derive(Serialize)]
 struct EventLogEntry {
@@ -234,6 +234,35 @@ async fn get_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
     }
 }
 
+#[get("/api/dividends")]
+async fn get_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
+    let conn = match Connection::open(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT symbol, ex_date, payment_date, amount FROM dividend_events ORDER BY ex_date DESC",
+    ) {
+        Ok(s) => s,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "symbol": row.get::<_, String>(0)?,
+            "ex_date": row.get::<_, String>(1)?,
+            "payment_date": row.get::<_, Option<String>>(2)?,
+            "amount": row.get::<_, f64>(3)?,
+        }))
+    });
+    match rows {
+        Ok(mapped) => {
+            let items: Vec<_> = mapped.filter_map(|r| r.ok()).collect();
+            HttpResponse::Ok().json(items)
+        }
+        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+    }
+}
+
 #[get("/api/events")]
 async fn get_events(db_path: web::Data<PathBuf>, query: web::Query<EventQuery>) -> impl Responder {
     match fetch_event_log(&db_path, &query.into_inner()) {
@@ -331,6 +360,203 @@ async fn get_price_history(
     }
 }
 
+#[derive(Serialize)]
+struct DividendRefreshResult {
+    updated: usize,
+    errors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct YahooDivChart {
+    result: Option<Vec<YahooDivResult>>,
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct YahooDivResponse {
+    chart: YahooDivChart,
+}
+
+#[derive(Deserialize)]
+struct YahooDivResult {
+    events: Option<YahooDivEvents>,
+}
+
+#[derive(Deserialize)]
+struct YahooDivEvents {
+    dividends: Option<HashMap<String, YahooDivEntry>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct YahooDivEntry {
+    amount: Option<f64>,
+    date: Option<i64>,
+    ex_date: Option<i64>,
+    payment_date: Option<i64>,
+    record_date: Option<i64>,
+}
+
+async fn fetch_dividend_events_for_symbol(client: &Client, symbol: &str) -> Result<Vec<DividendEvent>, String> {
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=5y&events=div",
+        symbol
+    );
+
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let response = response.error_for_status().map_err(|e| e.to_string())?;
+    let payload: YahooDivResponse = response.json().await.map_err(|e| e.to_string())?;
+
+    let result = payload
+        .chart
+        .result
+        .and_then(|items| items.into_iter().next())
+        .ok_or_else(|| {
+            if let Some(err) = payload.chart.error {
+                format!("No chart result for {}: {}", symbol, err)
+            } else {
+                format!("No chart result for {}", symbol)
+            }
+        })?;
+
+    let now = Utc::now().to_rfc3339();
+    let mut events = Vec::new();
+
+    if let Some(ev) = result.events {
+        if let Some(dividends) = ev.dividends {
+            for entry in dividends.values() {
+                let amount = entry.amount.unwrap_or(0.0);
+                if amount <= 0.0 {
+                    continue;
+                }
+                let ts = entry.ex_date.or(entry.date).ok_or_else(|| {
+                    format!("Dividend entry missing date for {}", symbol)
+                })?;
+                let ex_date = Utc
+                    .timestamp_opt(ts, 0)
+                    .single()
+                    .ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?
+                    .date_naive();
+                let payment_date = entry
+                    .payment_date
+                    .and_then(|t| Utc.timestamp_opt(t, 0).single())
+                    .map(|dt| dt.date_naive());
+                let record_date = entry
+                    .record_date
+                    .and_then(|t| Utc.timestamp_opt(t, 0).single())
+                    .map(|dt| dt.date_naive());
+                events.push(DividendEvent {
+                    symbol: symbol.to_string(),
+                    ex_date,
+                    payment_date,
+                    record_date,
+                    amount,
+                    fetched_at: now.clone(),
+                });
+            }
+        }
+    }
+
+    events.sort_by_key(|e| e.ex_date);
+    Ok(events)
+}
+
+fn store_dividend_events_for_symbol(db_path: &PathBuf, symbol: &str, events: &[DividendEvent]) -> Result<(), String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dividend_events (
+            id INTEGER PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            ex_date TEXT NOT NULL,
+            payment_date TEXT,
+            record_date TEXT,
+            amount REAL NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(symbol, ex_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dividend_events_symbol_date ON dividend_events(symbol, ex_date);",
+    ).map_err(|e| e.to_string())?;
+
+    let mut conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO dividend_events (symbol, ex_date, payment_date, record_date, amount, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        ).map_err(|e| e.to_string())?;
+        for event in events {
+            stmt.execute(params![
+                symbol,
+                event.ex_date.format("%Y-%m-%d").to_string(),
+                event.payment_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                event.record_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                event.amount,
+                event.fetched_at,
+            ]).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_holding_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT symbol FROM holdings_transactions ORDER BY symbol")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+#[post("/api/dividends/refresh")]
+async fn refresh_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
+    let symbols = match load_holding_symbols(&db_path) {
+        Ok(s) => s,
+        Err(err) => return HttpResponse::InternalServerError().body(err),
+    };
+
+    if symbols.is_empty() {
+        return HttpResponse::Ok().json(DividendRefreshResult { updated: 0, errors: vec![] });
+    }
+
+    let client = match Client::builder().user_agent("stocks-api/1.0").build() {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+
+    let mut updated = 0;
+    let mut errors = Vec::new();
+
+    for symbol in &symbols {
+        match fetch_dividend_events_for_symbol(&client, symbol).await {
+            Ok(events) => {
+                let count = events.len();
+                match store_dividend_events_for_symbol(&db_path, symbol, &events) {
+                    Ok(()) => {
+                        let details = format!("Stored {} dividend events", count);
+                        let _ = insert_event_log(&db_path, "info", "dividend_fetch", "api", Some(symbol), &details);
+                        updated += 1;
+                    }
+                    Err(err) => {
+                        let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", Some(symbol), &err);
+                        errors.push(format!("{}: {}", symbol, err));
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", Some(symbol), &err);
+                errors.push(format!("{}: {}", symbol, err));
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(DividendRefreshResult { updated, errors })
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let database_path = env::var("DATABASE_PATH").unwrap_or_else(|_| "stocks.db".to_string());
@@ -363,7 +589,9 @@ async fn main() -> std::io::Result<()> {
             .service(update_holding_transaction)
             .service(delete_holding_transaction)
             .service(get_price_history)
-                    .service(get_events)
+            .service(get_dividends)
+            .service(get_events)
+            .service(refresh_dividends)
     })
     .bind(bind)?
     .run()
