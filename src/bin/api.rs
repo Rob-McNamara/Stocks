@@ -702,6 +702,22 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
+    // dividend_events table
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dividend_events (
+            id INTEGER PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            ex_date TEXT NOT NULL,
+            payment_date TEXT,
+            record_date TEXT,
+            amount REAL NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(symbol, ex_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dividend_events_symbol_date ON dividend_events(symbol, ex_date);",
+    )
+    .map_err(|err| err.to_string())?;
+
     // symbol_info table for instrument type and long name
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS symbol_info (
@@ -1564,4 +1580,285 @@ fn fetch_event_log(db_path: &PathBuf, q: &EventQuery) -> Result<(Vec<EventLogEnt
 
     let items = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     Ok((items, total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use rusqlite::Connection;
+    use tempfile::NamedTempFile;
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    fn make_tx(id: i64, tx_type: &str, date: &str, quantity: f64, price: f64) -> HoldingTransaction {
+        HoldingTransaction {
+            id,
+            symbol: "TST.AX".to_string(),
+            transaction_type: tx_type.to_string(),
+            date: date.to_string(),
+            quantity: Some(quantity),
+            price: Some(price),
+            amount: None,
+            brokerage: None,
+            notes: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            dividends_total: 0.0,
+        }
+    }
+
+    fn make_event(date: &str, amount: f64) -> DividendEvent {
+        DividendEvent {
+            symbol: "TST.AX".to_string(),
+            ex_date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            payment_date: None,
+            record_date: None,
+            amount,
+            fetched_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn setup_test_db() -> (NamedTempFile, PathBuf) {
+        let file = NamedTempFile::new().unwrap();
+        let path = PathBuf::from(file.path());
+        init_db(&path).unwrap();
+        (file, path)
+    }
+
+    fn insert_tx(db_path: &PathBuf, id: i64, tx_type: &str, date: &str, qty: f64, price: f64, brokerage: f64) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+             VALUES (?1, 'TST.AX', ?2, ?3, ?4, ?5, ?6, '2024-01-01T00:00:00Z')",
+            rusqlite::params![id, tx_type, date, qty, price, brokerage],
+        ).unwrap();
+    }
+
+    fn insert_dividend_event(db_path: &PathBuf, ex_date: &str, amount: f64) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO dividend_events (symbol, ex_date, amount, fetched_at)
+             VALUES ('TST.AX', ?1, ?2, '2024-01-01T00:00:00Z')",
+            rusqlite::params![ex_date, amount],
+        ).unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // calculate_shares_on_date
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn shares_on_date_single_purchase() {
+        let txs = vec![make_tx(1, "purchase", "2024-01-15", 100.0, 10.0)];
+        let date = NaiveDate::parse_from_str("2024-02-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 100.0);
+    }
+
+    #[test]
+    fn shares_on_date_before_purchase() {
+        let txs = vec![make_tx(1, "purchase", "2024-03-01", 100.0, 10.0)];
+        let date = NaiveDate::parse_from_str("2024-02-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 0.0);
+    }
+
+    #[test]
+    fn shares_on_date_on_purchase_day() {
+        // ex_date is inclusive — purchase on the same day counts
+        let txs = vec![make_tx(1, "purchase", "2024-02-01", 100.0, 10.0)];
+        let date = NaiveDate::parse_from_str("2024-02-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 100.0);
+    }
+
+    #[test]
+    fn shares_on_date_after_partial_sale() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-01-01", 200.0, 10.0),
+            make_tx(2, "sale",     "2024-03-01",  50.0, 12.0),
+        ];
+        let date = NaiveDate::parse_from_str("2024-04-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 150.0);
+    }
+
+    #[test]
+    fn shares_on_date_between_purchase_and_sale() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-01-01", 200.0, 10.0),
+            make_tx(2, "sale",     "2024-06-01",  50.0, 12.0),
+        ];
+        // Date is after purchase but before sale
+        let date = NaiveDate::parse_from_str("2024-03-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 200.0);
+    }
+
+    #[test]
+    fn shares_on_date_fully_sold_returns_zero() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-01-01", 100.0, 10.0),
+            make_tx(2, "sale",     "2024-06-01", 100.0, 15.0),
+        ];
+        let date = NaiveDate::parse_from_str("2024-12-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 0.0);
+    }
+
+    #[test]
+    fn shares_on_date_multiple_purchases() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-01-01", 100.0, 10.0),
+            make_tx(2, "purchase", "2024-03-01",  50.0, 11.0),
+        ];
+        let date = NaiveDate::parse_from_str("2024-04-01", "%Y-%m-%d").unwrap();
+        assert_eq!(calculate_shares_on_date(&txs, date), 150.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // calculate_dividend_payments
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn dividend_payment_for_shares_held() {
+        let txs = vec![make_tx(1, "purchase", "2024-01-01", 100.0, 10.0)];
+        let events = vec![make_event("2024-06-01", 0.50)];
+        let payments = calculate_dividend_payments(&txs, &events);
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].shares_held, 100.0);
+        assert!((payments[0].total_payment - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dividend_payment_before_purchase_is_zero() {
+        let txs = vec![make_tx(1, "purchase", "2024-07-01", 100.0, 10.0)];
+        let events = vec![make_event("2024-06-01", 0.50)]; // ex_date before purchase
+        let payments = calculate_dividend_payments(&txs, &events);
+        assert_eq!(payments.len(), 0);
+    }
+
+    #[test]
+    fn dividend_payment_after_full_sale_is_zero() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-01-01", 100.0, 10.0),
+            make_tx(2, "sale",     "2024-04-01", 100.0, 12.0),
+        ];
+        let events = vec![make_event("2024-06-01", 0.50)];
+        let payments = calculate_dividend_payments(&txs, &events);
+        assert_eq!(payments.len(), 0);
+    }
+
+    #[test]
+    fn dividend_payment_proportional_to_shares_held() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-01-01", 200.0, 10.0),
+            make_tx(2, "sale",     "2024-04-01", 100.0, 12.0), // 100 remain
+        ];
+        let events = vec![make_event("2024-06-01", 0.50)];
+        let payments = calculate_dividend_payments(&txs, &events);
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].shares_held, 100.0);
+        assert!((payments[0].total_payment - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dividend_payment_multiple_events() {
+        let txs = vec![make_tx(1, "purchase", "2024-01-01", 100.0, 10.0)];
+        let events = vec![
+            make_event("2024-03-01", 0.30),
+            make_event("2024-09-01", 0.35),
+        ];
+        let payments = calculate_dividend_payments(&txs, &events);
+        assert_eq!(payments.len(), 2);
+        let total: f64 = payments.iter().map(|p| p.total_payment).sum();
+        assert!((total - 65.0).abs() < 0.001);
+    }
+
+    // -------------------------------------------------------------------------
+    // Integration tests: DB-backed operations
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn integration_load_holding_symbols_excludes_fully_sold() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2024-01-01", 100.0, 10.0, 0.0);
+        insert_tx(&db_path, 2, "sale",     "2024-06-01", 100.0, 12.0, 0.0);
+
+        let symbols = load_holding_symbols(&db_path).unwrap();
+        assert!(!symbols.contains(&"TST.AX".to_string()), "fully sold symbol should be excluded");
+    }
+
+    #[test]
+    fn integration_load_holding_symbols_includes_partial_holding() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2024-01-01", 100.0, 10.0, 0.0);
+        insert_tx(&db_path, 2, "sale",     "2024-06-01",  40.0, 12.0, 0.0);
+
+        let symbols = load_holding_symbols(&db_path).unwrap();
+        assert!(symbols.contains(&"TST.AX".to_string()), "partially sold symbol should be included");
+    }
+
+    #[test]
+    fn integration_calculate_dividend_totals_filters_pre_purchase() {
+        let (_file, db_path) = setup_test_db();
+        // Insert a purchase
+        insert_tx(&db_path, 1, "purchase", "2024-06-01", 100.0, 10.0, 0.0);
+        // Dividend before purchase — should be excluded
+        insert_dividend_event(&db_path, "2024-01-01", 0.50);
+        // Dividend after purchase — should be included
+        insert_dividend_event(&db_path, "2024-09-01", 0.30);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let txs = fetch_holdings(&db_path).unwrap();
+        drop(conn);
+
+        let totals = calculate_dividend_totals(&db_path, &txs).unwrap();
+        let total = totals.get("TST.AX").copied().unwrap_or(0.0);
+        // Only the September dividend (100 shares × $0.30 = $30) should count
+        assert!((total - 30.0).abs() < 0.001, "expected $30 dividend, got ${}", total);
+    }
+
+    #[test]
+    fn integration_insert_and_fetch_holding_transaction() {
+        let (_file, db_path) = setup_test_db();
+
+        let payload = NewHoldingTransaction {
+            symbol: "TST.AX".to_string(),
+            transaction_type: "purchase".to_string(),
+            date: "2024-01-15".to_string(),
+            quantity: Some(50.0),
+            price: Some(12.50),
+            amount: None,
+            brokerage: Some(9.95),
+            notes: Some("initial buy".to_string()),
+        };
+
+        let result = insert_holding_transaction(&db_path, "TST.AX", payload);
+        assert!(result.is_ok(), "insert failed: {:?}", result.err());
+
+        let tx = result.unwrap();
+        assert_eq!(tx.quantity, Some(50.0));
+        assert_eq!(tx.price, Some(12.50));
+        assert_eq!(tx.brokerage, Some(9.95));
+
+        let holdings = fetch_holdings(&db_path).unwrap();
+        assert_eq!(holdings.len(), 1);
+        assert_eq!(holdings[0].symbol, "TST.AX");
+    }
+
+    #[test]
+    fn integration_insert_transaction_rejects_zero_quantity() {
+        let (_file, db_path) = setup_test_db();
+
+        let payload = NewHoldingTransaction {
+            symbol: "TST.AX".to_string(),
+            transaction_type: "purchase".to_string(),
+            date: "2024-01-15".to_string(),
+            quantity: Some(0.0),
+            price: Some(10.0),
+            amount: None,
+            brokerage: None,
+            notes: None,
+        };
+
+        let result = insert_holding_transaction(&db_path, "TST.AX", payload);
+        assert!(result.is_err(), "should reject zero quantity");
+    }
 }
