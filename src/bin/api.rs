@@ -82,6 +82,9 @@ struct HoldingTransaction {
     created_at: String,
     #[serde(default)]
     dividends_total: f64,
+    currency: String,
+    original_price: Option<f64>,
+    fx_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +117,9 @@ struct NewHoldingTransaction {
     amount: Option<f64>,
     brokerage: Option<f64>,
     notes: Option<String>,
+    currency: Option<String>,
+    original_price: Option<f64>,
+    fx_rate: Option<f64>,
 }
 
 #[get("/api/health")]
@@ -260,6 +266,72 @@ async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
             HttpResponse::Ok().json(items)
         }
         Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct FxRateQuery {
+    currency: String,
+    date: String,
+}
+
+#[get("/api/fx-rate")]
+async fn get_fx_rate_for_date(query: web::Query<FxRateQuery>) -> impl Responder {
+    let pair = format!("{}AUD=X", query.currency.trim().to_uppercase());
+    let client = match Client::builder().user_agent("stocks-api/1.0").build() {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let target_date = match NaiveDate::parse_from_str(&query.date, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return HttpResponse::BadRequest().body("Invalid date format, use YYYY-MM-DD"),
+    };
+    // Fetch a week around the target date to cover weekends/holidays
+    let period1 = Utc.from_utc_datetime(&(target_date - chrono::Duration::days(7)).and_hms_opt(0, 0, 0).unwrap()).timestamp();
+    let period2 = Utc.from_utc_datetime(&(target_date + chrono::Duration::days(2)).and_hms_opt(0, 0, 0).unwrap()).timestamp();
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&period1={}&period2={}",
+        pair, period1, period2
+    );
+    let response = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let payload: YahooHistoryResponse = match response.json().await {
+        Ok(p) => p,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let result = match payload.chart.result.as_ref().and_then(|r| r.first()) {
+        Some(r) => r,
+        None => return HttpResponse::NotFound().body(format!("No FX data for {}", pair)),
+    };
+    let timestamps = match result.timestamp.as_ref() {
+        Some(t) => t,
+        None => return HttpResponse::NotFound().body("No timestamp data"),
+    };
+    let closes = match result.indicators.quote.first().and_then(|q| q.close.as_ref()) {
+        Some(c) => c,
+        None => return HttpResponse::NotFound().body("No close data"),
+    };
+    // Find the entry closest to and on-or-before the target date
+    let target_str = target_date.format("%Y-%m-%d").to_string();
+    let mut best_date = String::new();
+    let mut best_rate: Option<f64> = None;
+    for (i, ts) in timestamps.iter().enumerate() {
+        let date_str = Utc.timestamp_opt(*ts, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        if date_str <= target_str {
+            if let Some(Some(rate)) = closes.get(i) {
+                best_date = date_str;
+                best_rate = Some(*rate);
+            }
+        }
+    }
+    match best_rate {
+        Some(rate) => HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": best_date })),
+        None => HttpResponse::NotFound().body(format!("No FX rate found on or before {}", target_str)),
     }
 }
 
@@ -706,6 +778,7 @@ async fn main() -> std::io::Result<()> {
             .service(delete_holding_transaction)
             .service(get_price_history)
             .service(get_symbol_info)
+            .service(get_fx_rate_for_date)
             .service(get_fx_rates)
             .service(get_dividends)
             .service(get_events)
@@ -812,8 +885,11 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
-    // Migrate: add brokerage column if it doesn't exist
+    // Migrate: add columns if they don't exist
     add_column_if_missing(&conn, "holdings_transactions", "brokerage", "REAL")?;
+    add_column_if_missing(&conn, "holdings_transactions", "currency", "TEXT NOT NULL DEFAULT 'AUD'")?;
+    add_column_if_missing(&conn, "holdings_transactions", "original_price", "REAL")?;
+    add_column_if_missing(&conn, "holdings_transactions", "fx_rate", "REAL")?;
     add_column_if_missing(&conn, "symbol_info", "currency", "TEXT")?;
 
     Ok(())
@@ -907,7 +983,7 @@ fn fetch_holdings(db_path: &PathBuf) -> Result<Vec<HoldingTransaction>, String> 
     let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at
+            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
              FROM holdings_transactions
              ORDER BY date DESC, id DESC",
         )
@@ -927,6 +1003,9 @@ fn fetch_holdings(db_path: &PathBuf) -> Result<Vec<HoldingTransaction>, String> 
                 notes: row.get(8)?,
                 created_at: row.get(9)?,
                 dividends_total: 0.0,
+                currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
+                original_price: row.get(11)?,
+                fx_rate: row.get(12)?,
             })
         })
         .map_err(|err| err.to_string())?;
@@ -1086,9 +1165,10 @@ fn insert_holding_transaction(
 
     let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
     let created_at = Utc::now().to_rfc3339();
+    let currency = transaction.currency.as_deref().unwrap_or("AUD");
     conn.execute(
-        "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             symbol,
             tx_type,
@@ -1099,6 +1179,9 @@ fn insert_holding_transaction(
             transaction.brokerage,
             transaction.notes,
             created_at,
+            currency,
+            transaction.original_price,
+            transaction.fx_rate,
         ],
     )
     .map_err(|err| err.to_string())?;
@@ -1106,7 +1189,7 @@ fn insert_holding_transaction(
     let id = conn.last_insert_rowid();
     let mut stmt = conn
         .prepare(
-            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at
+            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
              FROM holdings_transactions
              WHERE id = ?1",
         )
@@ -1126,6 +1209,9 @@ fn insert_holding_transaction(
                 notes: row.get(8)?,
                 created_at: row.get(9)?,
                 dividends_total: 0.0,
+                currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
+                original_price: row.get(11)?,
+                fx_rate: row.get(12)?,
             })
         })
         .map_err(|err| err.to_string())?;
@@ -1164,8 +1250,9 @@ fn modify_holding_transaction(
     }
 
     let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let currency = transaction.currency.as_deref().unwrap_or("AUD");
     conn.execute(
-        "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8 WHERE id = ?9",
+        "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11 WHERE id = ?12",
         params![
             symbol,
             tx_type,
@@ -1175,6 +1262,9 @@ fn modify_holding_transaction(
             transaction.amount,
             transaction.brokerage,
             transaction.notes,
+            currency,
+            transaction.original_price,
+            transaction.fx_rate,
             id,
         ],
     )
@@ -1182,7 +1272,7 @@ fn modify_holding_transaction(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at
+            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
              FROM holdings_transactions
              WHERE id = ?1",
         )
@@ -1202,6 +1292,9 @@ fn modify_holding_transaction(
                 notes: row.get(8)?,
                 created_at: row.get(9)?,
                 dividends_total: 0.0,
+                currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
+                original_price: row.get(11)?,
+                fx_rate: row.get(12)?,
             })
         })
         .map_err(|err| err.to_string())?;

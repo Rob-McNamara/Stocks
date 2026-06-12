@@ -49,6 +49,9 @@ interface HoldingTransaction {
   notes: string | null
   created_at: string
   dividends_total: number
+  currency: string
+  original_price: number | null
+  fx_rate: number | null
 }
 
 interface HoldingTransactionPayload {
@@ -60,6 +63,9 @@ interface HoldingTransactionPayload {
   amount?: number
   brokerage?: number
   notes?: string
+  currency?: string
+  original_price?: number
+  fx_rate?: number
 }
 
 export const apiClient = {
@@ -200,6 +206,12 @@ export const apiClient = {
   async getFxRates(): Promise<{ USDAUD: number | null }> {
     const response = await fetch(`${API_BASE_URL}/fx-rates`)
     if (!response.ok) return { USDAUD: null }
+    return response.json()
+  },
+
+  async getFxRateForDate(currency: string, date: string): Promise<{ rate: number; date: string } | null> {
+    const response = await fetch(`${API_BASE_URL}/fx-rate?currency=${encodeURIComponent(currency)}&date=${encodeURIComponent(date)}`)
+    if (!response.ok) return null
     return response.json()
   },
 

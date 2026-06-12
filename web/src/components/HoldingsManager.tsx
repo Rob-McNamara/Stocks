@@ -14,7 +14,12 @@ interface HoldingTransaction {
   notes: string | null
   created_at: string
   dividends_total: number
+  currency: string
+  original_price: number | null
+  fx_rate: number | null
 }
+
+const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
 export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
@@ -32,6 +37,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [amount, setAmount] = useState('')
   const [brokerage, setBrokerage] = useState('')
   const [notes, setNotes] = useState('')
+  const [currency, setCurrency] = useState('AUD')
+  const [fxRate, setFxRate] = useState<number | null>(null)
+  const [fxRateDate, setFxRateDate] = useState<string | null>(null)
+  const [fxLoading, setFxLoading] = useState(false)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -40,6 +49,24 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   useEffect(() => {
     loadHoldings()
   }, [configVersion])
+
+  useEffect(() => {
+    if (currency === 'AUD') {
+      setFxRate(null)
+      setFxRateDate(null)
+      return
+    }
+    setFxLoading(true)
+    apiClient.getFxRateForDate(currency, date).then((result) => {
+      if (result) {
+        setFxRate(result.rate)
+        setFxRateDate(result.date)
+      } else {
+        setFxRate(null)
+        setFxRateDate(null)
+      }
+    }).finally(() => setFxLoading(false))
+  }, [currency, date])
 
   const loadHoldings = async () => {
     try {
@@ -150,7 +177,16 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       }
 
       payload.quantity = parsedQuantity
-      payload.price = parsedPrice
+
+      if (currency !== 'AUD' && fxRate) {
+        payload.currency = currency
+        payload.original_price = parsedPrice
+        payload.fx_rate = fxRate
+        payload.price = parsedPrice * fxRate
+      } else {
+        payload.currency = 'AUD'
+        payload.price = parsedPrice
+      }
     }
 
     if (transactionType === 'dividend') {
@@ -185,6 +221,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setBrokerage('')
       setNotes('')
       setDate(new Date().toISOString().slice(0, 10))
+      setCurrency('AUD')
+      setFxRate(null)
+      setFxRateDate(null)
       setEditingId(null)
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
@@ -201,10 +240,17 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setTransactionType(tx.transaction_type)
     setDate(tx.date)
     setQuantity(tx.quantity !== null ? tx.quantity.toString() : '')
-    setPrice(tx.price !== null ? tx.price.toString() : '')
+    // Show original currency price if available, otherwise AUD price
+    const displayPrice = tx.currency !== 'AUD' && tx.original_price !== null
+      ? tx.original_price.toString()
+      : (tx.price !== null ? tx.price.toString() : '')
+    setPrice(displayPrice)
     setAmount(tx.amount !== null ? tx.amount.toString() : '')
     setBrokerage(tx.brokerage !== null ? tx.brokerage.toString() : '')
     setNotes(tx.notes ?? '')
+    setCurrency(tx.currency || 'AUD')
+    setFxRate(tx.fx_rate ?? null)
+    setFxRateDate(tx.currency !== 'AUD' ? tx.date : null)
     setSuccess(null)
     setError(null)
   }
@@ -219,6 +265,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setAmount('')
     setBrokerage('')
     setNotes('')
+    setCurrency('AUD')
+    setFxRate(null)
+    setFxRateDate(null)
   }
 
   const handleDeleteTransaction = async (id: number) => {
@@ -610,28 +659,60 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
           </div>
 
           {(transactionType === 'purchase' || transactionType === 'sale') && (
-            <div className="form-group">
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                value={quantity}
-                onChange={(e) => setQuantity(e.target.value)}
-                placeholder="Quantity"
-                className="symbol-input"
-                disabled={loading}
-              />
-              <input
-                type="number"
-                min="0"
-                step="any"
-                value={price}
-                onChange={(e) => setPrice(e.target.value)}
-                placeholder="Price per share"
-                className="symbol-input"
-                disabled={loading}
-              />
-            </div>
+            <>
+              <div className="form-group">
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={quantity}
+                  onChange={(e) => setQuantity(e.target.value)}
+                  placeholder="Quantity"
+                  className="symbol-input"
+                  disabled={loading}
+                />
+                <select
+                  value={currency}
+                  onChange={(e) => setCurrency(e.target.value)}
+                  className="config-input"
+                  disabled={loading}
+                  style={{ minWidth: 80 }}
+                >
+                  {SUPPORTED_CURRENCIES.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={price}
+                  onChange={(e) => setPrice(e.target.value)}
+                  placeholder={currency !== 'AUD' ? `Price per share (${currency})` : 'Price per share (AUD)'}
+                  className="symbol-input"
+                  disabled={loading}
+                />
+              </div>
+              {currency !== 'AUD' && (
+                <div className="form-group" style={{ alignItems: 'center', fontSize: 13, color: '#666', gap: 8 }}>
+                  {fxLoading && <span>Fetching {currency}/AUD rate...</span>}
+                  {!fxLoading && fxRate && price && !isNaN(parseFloat(price)) && (
+                    <>
+                      <span>
+                        Rate: 1 {currency} = {fxRate.toFixed(4)} AUD
+                        {fxRateDate && ` (${fxRateDate})`}
+                      </span>
+                      <span style={{ fontWeight: 600, color: '#333' }}>
+                        → AUD {(parseFloat(price) * fxRate).toFixed(4)} per share
+                      </span>
+                    </>
+                  )}
+                  {!fxLoading && !fxRate && (
+                    <span style={{ color: '#e53935' }}>Could not fetch {currency}/AUD rate for {date}</span>
+                  )}
+                </div>
+              )}
+            </>
           )}
 
           {transactionType === 'dividend' && (
@@ -831,7 +912,14 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                         <td>{tx.symbol}</td>
                         <td>{new Date(tx.date).toLocaleDateString()}</td>
                         <td>{(remainingQuantities[tx.id] ?? 0).toFixed(2)}</td>
-                        <td>{tx.price !== null ? `$${tx.price.toFixed(2)}` : '—'}</td>
+                        <td>
+                          {tx.price !== null ? `$${tx.price.toFixed(2)}` : '—'}
+                          {tx.currency !== 'AUD' && tx.original_price !== null && (
+                            <span style={{ fontSize: 10, color: '#888', marginLeft: 4 }}>
+                              ({tx.currency} {tx.original_price.toFixed(2)})
+                            </span>
+                          )}
+                        </td>
                         <td>
                           {details.currentValue !== null
                             ? `$${details.currentValue.toFixed(2)}`
