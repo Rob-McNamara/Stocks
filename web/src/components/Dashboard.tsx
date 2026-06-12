@@ -28,6 +28,8 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number | null>>({})
   const [holdingSma, setHoldingSma] = useState<Record<string, number | null>>({})
   const [watchlistEntries, setWatchlistEntries] = useState<SymbolSmaEntry[]>([])
+  const [symbolInfo, setSymbolInfo] = useState<Record<string, string | null>>({})
+  const [appConfig, setAppConfig] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -41,14 +43,19 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       setError(null)
       onLoading(true)
 
-      const [txData, watchlistSymbols, watchlistPricesData, dividendData, configData] = await Promise.all([
+      const [txData, watchlistSymbols, watchlistPricesData, dividendData, configData, infoData] = await Promise.all([
         apiClient.getHoldings(),
         apiClient.getWatchlistSymbols(),
         apiClient.getWatchlistPrices(),
         apiClient.getDividends(),
         apiClient.getConfig(),
+        apiClient.getSymbolInfo(),
       ])
       setTransactions(txData)
+      setAppConfig(configData)
+      const infoMap: Record<string, string | null> = {}
+      infoData.forEach((i) => { infoMap[i.symbol] = i.instrument_type })
+      setSymbolInfo(infoMap)
 
       const holdingSymbols = Array.from(new Set(txData.map((tx) => tx.symbol)))
 
@@ -105,6 +112,10 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
   }
 
   const portfolio = useMemo(() => {
+    const etfTypes = new Set(['ETF', 'MUTUALFUND'])
+    const getType = (symbol: string) => appConfig[`instrument_type_${symbol}`] || symbolInfo[symbol] || ''
+    const isEtf = (symbol: string) => etfTypes.has(getType(symbol))
+
     const groupedBySymbol: Record<string, HoldingTransaction[]> = {}
     transactions.forEach((tx) => {
       if (!groupedBySymbol[tx.symbol]) groupedBySymbol[tx.symbol] = []
@@ -114,12 +125,17 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
     let stockCount = 0
     let totalValue = 0
     let holdingsPL = 0
+    let holdingsDividends = 0
     let soldPL = 0
+    let soldDividendsTotal = 0
+    let soldProceeds = 0
+
+    let equityValue = 0, equityDividends = 0, equityPL = 0
+    let etfValue = 0, etfDividends = 0, etfPL = 0
 
     Object.entries(groupedBySymbol).forEach(([symbol, txs]) => {
       const sorted = [...txs].sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id)
 
-      // Collect dividends the same way as HoldingsManager / SoldStocks
       let dividends = 0
       let dividendsFromTotal = 0
       sorted.forEach((tx) => {
@@ -128,13 +144,13 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       })
       const symbolDividends = dividendsFromTotal > 0 ? dividendsFromTotal : dividends
 
-      // Total sold qty used for proportional dividend attribution (matches SoldStocks)
       const totalSoldQty = sorted.reduce((s, tx) =>
         tx.transaction_type === 'sale' && tx.quantity ? s + tx.quantity : s, 0)
 
-      // FIFO lots — recompute for each sale to get cost basis
       const lots: Array<{ quantity: number; price: number }> = []
       let symbolSoldPL = 0
+      let symbolSoldDividends = 0
+      let symbolSoldProceeds = 0
 
       sorted.forEach((tx) => {
         if (tx.transaction_type === 'purchase' && tx.quantity && tx.price) {
@@ -151,6 +167,8 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
           }
           const saleDividends = totalSoldQty > 0 ? (tx.quantity / totalSoldQty) * symbolDividends : 0
           symbolSoldPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis + saleDividends
+          symbolSoldDividends += saleDividends
+          symbolSoldProceeds += tx.quantity * tx.price
         }
       })
 
@@ -158,20 +176,38 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       const remainingCost = lots.reduce((s, l) => s + l.quantity * l.price, 0)
 
       if (remainingShares > 0) {
-        // Matches HoldingsManager: unrealised P/L on remaining shares + all dividends
         stockCount++
         const price = holdingPrices[symbol]
         const currentValue = price ? remainingShares * price : 0
         if (price) totalValue += currentValue
-        holdingsPL += currentValue - remainingCost + symbolDividends
+        const symPL = currentValue - remainingCost + symbolDividends
+        holdingsPL += symPL
+        holdingsDividends += symbolDividends
+
+        if (isEtf(symbol)) {
+          etfValue += currentValue
+          etfDividends += symbolDividends
+          etfPL += symPL
+        } else {
+          equityValue += currentValue
+          equityDividends += symbolDividends
+          equityPL += symPL
+        }
       }
 
-      // All sale transactions contribute to soldPL (matches SoldStocks which shows all sales)
       soldPL += symbolSoldPL
+      soldDividendsTotal += symbolSoldDividends
+      soldProceeds += symbolSoldProceeds
     })
 
-    return { stockCount, totalValue, totalPL: holdingsPL + soldPL }
-  }, [transactions, holdingPrices])
+    return {
+      stockCount, totalValue, totalPL: holdingsPL + soldPL,
+      holdingsPL, holdingsDividends,
+      soldPL, soldDividendsTotal, soldProceeds,
+      equityValue, equityDividends, equityPL,
+      etfValue, etfDividends, etfPL,
+    }
+  }, [transactions, holdingPrices, symbolInfo, appConfig])
 
   const worstHoldings = useMemo((): SymbolSmaEntry[] => {
     const bySymbol: Record<string, number> = {}
@@ -191,14 +227,14 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       })
       .filter((item): item is SymbolSmaEntry & { pctDiff: number } => item.pctDiff !== null)
       .sort((a, b) => a.pctDiff - b.pctDiff)
-      .slice(0, 3)
+      .slice(0, 10)
   }, [transactions, holdingPrices, holdingSma])
 
   const bestWatchlist = useMemo(() => {
     return [...watchlistEntries]
       .filter((item): item is SymbolSmaEntry & { pctDiff: number } => item.pctDiff !== null)
       .sort((a, b) => b.pctDiff - a.pctDiff)
-      .slice(0, 3)
+      .slice(0, 10)
   }, [watchlistEntries])
 
   if (loading) return <p className="loading-text">Loading dashboard...</p>
@@ -224,6 +260,35 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
         </div>
       </div>
 
+      <div className="dashboard-breakdown">
+        {[
+          { label: 'Equities', value: portfolio.equityValue, dividends: portfolio.equityDividends, pl: portfolio.equityPL },
+          { label: 'ETFs', value: portfolio.etfValue, dividends: portfolio.etfDividends, pl: portfolio.etfPL },
+          { label: 'Holdings', value: portfolio.totalValue, dividends: portfolio.holdingsDividends, pl: portfolio.holdingsPL },
+          { label: 'Sold', value: portfolio.soldProceeds, dividends: portfolio.soldDividendsTotal, pl: portfolio.soldPL },
+        ].map(({ label, value, dividends, pl }) => (
+          <div key={label} className="breakdown-card">
+            <div className="breakdown-label">{label}</div>
+            {value !== null && (
+              <div className="breakdown-row">
+                <span className="breakdown-key">Value</span>
+                <span className="breakdown-val">${value.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              </div>
+            )}
+            <div className="breakdown-row">
+              <span className="breakdown-key">Dividends</span>
+              <span className="breakdown-val">${dividends.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+            <div className="breakdown-row">
+              <span className="breakdown-key">P/L</span>
+              <span className={`breakdown-val ${pl >= 0 ? 'positive' : 'negative'}`}>
+                {pl >= 0 ? '+' : '−'}${Math.abs(pl).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
       <div className="dashboard-lists">
         <div className="manager-card">
           <h2>Worst Holdings — 150SMA</h2>
@@ -246,8 +311,8 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
                     <td><strong>{item.symbol}</strong></td>
                     <td>{item.price !== null ? `$${item.price.toFixed(2)}` : '—'}</td>
                     <td>{item.sma !== null ? `$${item.sma.toFixed(2)}` : '—'}</td>
-                    <td style={{ color: '#f44336', fontWeight: 600 }}>
-                      {(item.pctDiff as number).toFixed(2)}%
+                    <td style={{ color: (item.pctDiff as number) >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
+                      {(item.pctDiff as number) >= 0 ? '+' : ''}{(item.pctDiff as number).toFixed(2)}%
                     </td>
                   </tr>
                 ))}
@@ -277,8 +342,8 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
                     <td><strong>{item.symbol}</strong></td>
                     <td>{item.price !== null ? `$${item.price.toFixed(2)}` : '—'}</td>
                     <td>{item.sma !== null ? `$${item.sma.toFixed(2)}` : '—'}</td>
-                    <td style={{ color: '#4caf50', fontWeight: 600 }}>
-                      +{(item.pctDiff as number).toFixed(2)}%
+                    <td style={{ color: (item.pctDiff as number) >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
+                      {(item.pctDiff as number) >= 0 ? '+' : ''}{(item.pctDiff as number).toFixed(2)}%
                     </td>
                   </tr>
                 ))}

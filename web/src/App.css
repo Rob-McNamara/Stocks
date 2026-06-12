@@ -418,6 +418,12 @@
   transition: all 0.3s ease;
 }
 
+.symbol-item-active {
+  background: white;
+  border-color: #667eea !important;
+  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.2) !important;
+}
+
 .symbol-item:hover {
   background: white;
   border-color: #667eea;
@@ -519,6 +525,52 @@
   gap: 16px;
   margin-bottom: 24px;
 }
+
+.dashboard-breakdown {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.breakdown-card {
+  background: white;
+  border-radius: 8px;
+  border: 1px solid #e8edf5;
+  padding: 14px 16px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+}
+
+.breakdown-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #f0f0f0;
+  padding-bottom: 6px;
+}
+
+.breakdown-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.breakdown-key {
+  color: #888;
+}
+
+.breakdown-val {
+  font-weight: 600;
+  color: #333;
+}
+
+.breakdown-val.positive { color: #4caf50; }
+.breakdown-val.negative { color: #f44336; }
 
 .stat-card {
   background: white;

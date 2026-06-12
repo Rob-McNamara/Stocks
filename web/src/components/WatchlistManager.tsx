@@ -270,7 +270,7 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
             {symbols.map(({ id, symbol, added_at }) => {
               const priceData = currentPrices.find(p => p.symbol === symbol)
               return (
-                <li key={id} className="symbol-item">
+                <li key={id} className={`symbol-item${selectedSymbol === symbol ? ' symbol-item-active' : ''}`} onClick={() => setSelectedSymbol(symbol)} style={{ cursor: 'pointer' }}>
                   <div className="symbol-info">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                       <span className="symbol-name">{symbol}</span>
