@@ -241,7 +241,7 @@ async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
         Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
     };
     let mut stmt = match conn.prepare(
-        "SELECT symbol, instrument_type, long_name FROM symbol_info ORDER BY symbol",
+        "SELECT symbol, instrument_type, long_name, currency FROM symbol_info ORDER BY symbol",
     ) {
         Ok(s) => s,
         Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
@@ -251,6 +251,7 @@ async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
             "symbol": row.get::<_, String>(0)?,
             "instrument_type": row.get::<_, Option<String>>(1)?,
             "long_name": row.get::<_, Option<String>>(2)?,
+            "currency": row.get::<_, Option<String>>(3)?,
         }))
     });
     match rows {
@@ -259,6 +260,21 @@ async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
             HttpResponse::Ok().json(items)
         }
         Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+    }
+}
+
+#[get("/api/fx-rates")]
+async fn get_fx_rates() -> impl Responder {
+    let client = match Client::builder().user_agent("stocks-api/1.0").build() {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    // USDAUD=X gives USD → AUD rate (how many AUD per 1 USD)
+    match fetch_current_price(&client, "USDAUD=X").await {
+        Ok(meta) => HttpResponse::Ok().json(serde_json::json!({
+            "USDAUD": meta.regular_market_price
+        })),
+        Err(err) => HttpResponse::InternalServerError().body(err),
     }
 }
 
@@ -547,9 +563,74 @@ fn load_holding_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
     Ok(rows)
 }
 
+fn load_sold_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT symbol
+             FROM holdings_transactions
+             WHERE transaction_type IN ('purchase', 'sale')
+             GROUP BY symbol
+             HAVING SUM(CASE WHEN transaction_type='purchase' THEN quantity ELSE -quantity END) <= 0
+             ORDER BY symbol",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 #[post("/api/dividends/refresh")]
 async fn refresh_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     let symbols = match load_holding_symbols(&db_path) {
+        Ok(s) => s,
+        Err(err) => return HttpResponse::InternalServerError().body(err),
+    };
+
+    if symbols.is_empty() {
+        return HttpResponse::Ok().json(DividendRefreshResult { updated: 0, errors: vec![] });
+    }
+
+    let client = match Client::builder().user_agent("stocks-api/1.0").build() {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+
+    let mut updated = 0;
+    let mut errors = Vec::new();
+
+    for symbol in &symbols {
+        match fetch_dividend_events_for_symbol(&client, symbol).await {
+            Ok(events) => {
+                let count = events.len();
+                match store_dividend_events_for_symbol(&db_path, symbol, &events) {
+                    Ok(()) => {
+                        let details = format!("Stored {} dividend events", count);
+                        let _ = insert_event_log(&db_path, "info", "dividend_fetch", "api", Some(symbol), &details);
+                        updated += 1;
+                    }
+                    Err(err) => {
+                        let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", Some(symbol), &err);
+                        errors.push(format!("{}: {}", symbol, err));
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", Some(symbol), &err);
+                errors.push(format!("{}: {}", symbol, err));
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(DividendRefreshResult { updated, errors })
+}
+
+#[post("/api/dividends/refresh-sold")]
+async fn refresh_sold_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
+    let symbols = match load_sold_symbols(&db_path) {
         Ok(s) => s,
         Err(err) => return HttpResponse::InternalServerError().body(err),
     };
@@ -625,9 +706,11 @@ async fn main() -> std::io::Result<()> {
             .service(delete_holding_transaction)
             .service(get_price_history)
             .service(get_symbol_info)
+            .service(get_fx_rates)
             .service(get_dividends)
             .service(get_events)
             .service(refresh_dividends)
+            .service(refresh_sold_dividends)
     })
     .bind(bind)?
     .run()
@@ -731,6 +814,7 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
 
     // Migrate: add brokerage column if it doesn't exist
     add_column_if_missing(&conn, "holdings_transactions", "brokerage", "REAL")?;
+    add_column_if_missing(&conn, "symbol_info", "currency", "TEXT")?;
 
     Ok(())
 }
@@ -762,12 +846,7 @@ fn add_column_if_missing(
 }
 
 fn normalize_symbol(symbol: &str) -> String {
-    let normalized = symbol.trim().to_uppercase();
-    if normalized.ends_with(".AX") {
-        normalized
-    } else {
-        format!("{}.AX", normalized)
-    }
+    symbol.trim().to_uppercase()
 }
 
 fn load_watchlist_symbols(db_path: &PathBuf) -> Result<Vec<WatchlistSymbol>, String> {
@@ -1309,6 +1388,7 @@ struct YahooMeta {
     instrument_type: Option<String>,
     #[serde(rename = "longName")]
     long_name: Option<String>,
+    currency: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1439,8 +1519,8 @@ async fn fetch_current_prices_for_symbols(
             Ok(meta) => {
                 let _ = insert_event_log(db_path, "info", "price_fetch", "api", Some(symbol), &format!("Fetched price from Yahoo: {:?}", meta.regular_market_price));
                 // Store instrument type and long name if available
-                if meta.instrument_type.is_some() || meta.long_name.is_some() {
-                    let _ = store_symbol_info(db_path, symbol, meta.instrument_type.as_deref(), meta.long_name.as_deref());
+                if meta.instrument_type.is_some() || meta.long_name.is_some() || meta.currency.is_some() {
+                    let _ = store_symbol_info(db_path, symbol, meta.instrument_type.as_deref(), meta.long_name.as_deref(), meta.currency.as_deref());
                 }
                 prices.push(CurrentPrice {
                     symbol: symbol.clone(),
@@ -1476,17 +1556,18 @@ async fn fetch_current_prices_for_symbols(
     Ok(prices)
 }
 
-fn store_symbol_info(db_path: &PathBuf, symbol: &str, instrument_type: Option<&str>, long_name: Option<&str>) -> Result<(), String> {
+fn store_symbol_info(db_path: &PathBuf, symbol: &str, instrument_type: Option<&str>, long_name: Option<&str>, currency: Option<&str>) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO symbol_info (symbol, instrument_type, long_name, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO symbol_info (symbol, instrument_type, long_name, currency, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(symbol) DO UPDATE SET
            instrument_type = COALESCE(?2, instrument_type),
            long_name = COALESCE(?3, long_name),
-           updated_at = ?4",
-        params![symbol, instrument_type, long_name, now],
+           currency = COALESCE(?4, currency),
+           updated_at = ?5",
+        params![symbol, instrument_type, long_name, currency, now],
     ).map_err(|e| e.to_string())?;
     Ok(())
 }

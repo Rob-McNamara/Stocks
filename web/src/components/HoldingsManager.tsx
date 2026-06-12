@@ -21,8 +21,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [currentPrices, setCurrentPrices] = useState<Record<string, number | null>>({})
   const [manualPriceSymbols, setManualPriceSymbols] = useState<Set<string>>(new Set())
   const [smaPrices, setSmaPrices] = useState<Record<string, number | null>>({})
-  const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null }>>({})
+  const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
   const [appConfig, setAppConfig] = useState<Record<string, string>>({})
+  const [usdToAud, setUsdToAud] = useState<number | null>(null)
   const [symbol, setSymbol] = useState('')
   const [transactionType, setTransactionType] = useState<HoldingTransaction['transaction_type']>('purchase')
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
@@ -58,14 +59,16 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       const symbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
       if (symbols.length > 0) {
         try {
-          const [prices, config, infoData] = await Promise.all([
+          const [prices, config, infoData, fxData] = await Promise.all([
             apiClient.getCurrentPrices(symbols),
             apiClient.getConfig(),
             apiClient.getSymbolInfo(),
+            apiClient.getFxRates(),
           ])
-          const infoMap: Record<string, { instrument_type: string | null; long_name: string | null }> = {}
-          infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name } })
+          const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
+          infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
           setSymbolInfo(infoMap)
+          if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
           setAppConfig(config)
           const priceMap = prices.reduce(
             (acc, p) => {
@@ -293,10 +296,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setSmaPrices(smaMap)
 
       // Reload symbol info now that fetch has populated it
-      const infoData = await apiClient.getSymbolInfo()
-      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null }> = {}
-      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name } })
+      const [infoData, fxData] = await Promise.all([apiClient.getSymbolInfo(), apiClient.getFxRates()])
+      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
+      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
       setSymbolInfo(infoMap)
+      if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
 
       const hasPrice = prices.some((item) => item.price !== null)
       const errorDetails = prices
@@ -355,6 +359,13 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     }
   }
 
+  const toAudPrice = (rawPrice: number | null, symbol: string): number | null => {
+    if (rawPrice === null) return null
+    const currency = symbolInfo[symbol]?.currency?.toUpperCase()
+    if (currency && currency !== 'AUD' && usdToAud) return rawPrice * usdToAud
+    return rawPrice
+  }
+
   const summary = useMemo(() => {
     const groupedBySymbol: Record<string, HoldingTransaction[]> = {}
     transactions.forEach((tx) => {
@@ -390,8 +401,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       if (shares <= 0) return null
 
       const invested = lots.reduce((s, l) => s + l.quantity * l.price, 0)
-      const currentPrice = currentPrices[symbol] || null
-      const sma150 = smaPrices[symbol] || null
+      const rawCurrentPrice = currentPrices[symbol] || null
+      const currentPrice = toAudPrice(rawCurrentPrice, symbol)
+      const rawSma150 = smaPrices[symbol] || null
+      const sma150 = toAudPrice(rawSma150, symbol)
       const currentValue = currentPrice ? shares * currentPrice : 0
       const avgCost = shares > 0 ? invested / shares : null
 
@@ -406,7 +419,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         avgCost,
       }
     }).filter((item): item is NonNullable<typeof item> => item !== null)
-  }, [transactions, currentPrices, smaPrices])
+  }, [transactions, currentPrices, smaPrices, symbolInfo, usdToAud])
 
   const dividendTotalsBySymbol = useMemo(() => {
     return transactions.reduce<Record<string, number>>((acc, tx) => {
@@ -473,7 +486,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         return dateCompare !== 0 ? dateCompare : a.id - b.id
       })
       const lots: Array<{ quantity: number; totalCost: number }> = []
-      const currentPrice = currentPrices[sortedGroup[0].symbol] ?? null
+      const currentPrice = toAudPrice(currentPrices[sortedGroup[0].symbol] ?? null, sortedGroup[0].symbol)
 
       sortedGroup.forEach((tx) => {
         let currentValue: number | null = null
@@ -510,7 +523,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     })
 
     return details
-  }, [transactions, currentPrices, remainingQuantities])
+  }, [transactions, currentPrices, remainingQuantities, symbolInfo, usdToAud])
 
   const [sortColumn, setSortColumn] = useState<string | null>(null)
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc')
@@ -572,10 +585,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
               type="text"
               value={symbol}
               onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-              placeholder="ASX symbol (e.g. CBA, BHP)"
+              placeholder="Symbol (e.g. BHP.AX, AAPL)"
               className="symbol-input"
               disabled={loading}
-              maxLength={6}
+              maxLength={12}
             />
             <select
               value={transactionType}

@@ -30,7 +30,9 @@ interface SoldEntry {
 export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: (loading: boolean) => void; holdingsVersion?: number }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
 
   useEffect(() => {
     const load = async () => {
@@ -49,6 +51,27 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
     }
     load()
   }, [holdingsVersion])
+
+  const handleRefreshDividends = async () => {
+    try {
+      setRefreshing(true)
+      setError(null)
+      setSuccess(null)
+      const result = await apiClient.refreshSoldDividends()
+      const data = await apiClient.getHoldings()
+      setTransactions(data)
+      const msg = result.updated > 0
+        ? `Dividends updated for ${result.updated} sold symbol${result.updated !== 1 ? 's' : ''}`
+        : 'No sold symbols with dividend data found'
+      setSuccess(msg)
+      if (result.errors.length > 0) setError(`Errors: ${result.errors.join(' | ')}`)
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to refresh dividends')
+    } finally {
+      setRefreshing(false)
+    }
+  }
 
   const soldStocks = useMemo((): SoldEntry[] => {
     const bySymbol: Record<string, HoldingTransaction[]> = {}
@@ -132,17 +155,28 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
       <div className="manager-card">
         <div className="card-header">
           <h2>Sold Stocks</h2>
-          {soldStocks.length > 0 && (
-            <span style={{ fontWeight: 600, fontSize: 15, color: totalRealisedPL >= 0 ? '#4caf50' : '#f44336' }}>
-              Total Realised P/L: {totalRealisedPL >= 0 ? '+' : '−'}${Math.abs(totalRealisedPL).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </span>
-          )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+            {soldStocks.length > 0 && (
+              <span style={{ fontWeight: 600, fontSize: 15, color: totalRealisedPL >= 0 ? '#4caf50' : '#f44336' }}>
+                Total Realised P/L: {totalRealisedPL >= 0 ? '+' : '−'}${Math.abs(totalRealisedPL).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            )}
+            <button
+              onClick={handleRefreshDividends}
+              className="btn btn-outline"
+              disabled={refreshing || loading}
+              title="Fetch dividend history for sold stocks from Yahoo Finance"
+            >
+              {refreshing ? 'Refreshing...' : '🔄 Refresh Dividends'}
+            </button>
+          </div>
         </div>
+
+        {success && <div className="alert alert-success">✓ {success}</div>}
+        {error && <div className="alert alert-error">❌ {error}</div>}
 
         {loading ? (
           <p className="loading-text">Loading sold stocks...</p>
-        ) : error ? (
-          <div className="alert alert-error">❌ {error}</div>
         ) : soldStocks.length === 0 ? (
           <p className="empty-text">No sold stocks recorded yet.</p>
         ) : (

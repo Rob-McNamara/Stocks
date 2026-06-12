@@ -220,10 +220,10 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
               type="text"
               value={newSymbol}
               onChange={(e) => setNewSymbol(e.target.value.toUpperCase())}
-              placeholder="Enter ASX symbol (e.g., CBA, BHP)"
+              placeholder="Symbol (e.g. BHP.AX, AAPL)"
               className="symbol-input"
               disabled={loading}
-              maxLength={6}
+              maxLength={12}
             />
             <button 
               type="submit" 
@@ -279,6 +279,11 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
                           {symbolInfo[symbol].instrument_type}
                         </span>
                       )}
+                    {symbolInfo[symbol]?.long_name === undefined && symbolInfo[symbol]?.instrument_type === undefined && !symbol.endsWith('.AX') && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: '#fff8e1', color: '#f57f17' }}>
+                        USD
+                      </span>
+                    )}
                     </div>
                     {symbolInfo[symbol]?.long_name && (
                       <div style={{ fontSize: 11, color: '#888' }}>{symbolInfo[symbol].long_name}</div>
@@ -368,7 +373,7 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
           <li>Use the Update Watchlist Prices button to refresh all watchlist quotes immediately</li>
           <li>Prices are stored in a separate watchlist table for intraday tracking</li>
           <li>Changes take effect on the next fetch cycle</li>
-          <li>Use ASX stock symbols (e.g., CBA for Commonwealth Bank, BHP for BHP Group)</li>
+          <li>Use full symbols: ASX stocks need <code>.AX</code> suffix (e.g. BHP.AX), US stocks use plain ticker (e.g. AAPL, MSFT). US prices are shown converted to AUD.</li>
         </ul>
       </div>
     </div>

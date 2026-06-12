@@ -191,9 +191,15 @@ export const apiClient = {
     return response.json()
   },
 
-  async getSymbolInfo(): Promise<{ symbol: string; instrument_type: string | null; long_name: string | null }[]> {
+  async getSymbolInfo(): Promise<{ symbol: string; instrument_type: string | null; long_name: string | null; currency: string | null }[]> {
     const response = await fetch(`${API_BASE_URL}/symbol-info`)
     if (!response.ok) throw new Error('Failed to fetch symbol info')
+    return response.json()
+  },
+
+  async getFxRates(): Promise<{ USDAUD: number | null }> {
+    const response = await fetch(`${API_BASE_URL}/fx-rates`)
+    if (!response.ok) return { USDAUD: null }
     return response.json()
   },
 
@@ -208,6 +214,15 @@ export const apiClient = {
     if (!response.ok) {
       const message = await response.text()
       throw new Error(message || 'Failed to refresh dividends')
+    }
+    return response.json()
+  },
+
+  async refreshSoldDividends(): Promise<{ updated: number; errors: string[] }> {
+    const response = await fetch(`${API_BASE_URL}/dividends/refresh-sold`, { method: 'POST' })
+    if (!response.ok) {
+      const message = await response.text()
+      throw new Error(message || 'Failed to refresh sold dividends')
     }
     return response.json()
   },

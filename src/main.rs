@@ -32,6 +32,7 @@ struct YahooMeta {
     instrument_type: Option<String>,
     #[serde(rename = "longName")]
     long_name: Option<String>,
+    currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,8 +269,8 @@ async fn fetch_and_store_watchlist(
     symbol: &str,
     historical_range: Option<&DateRange>,
 ) -> anyhow::Result<usize> {
-    let (prices, instrument_type, long_name) = fetch_closing_prices(client, symbol, historical_range).await?;
-    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref())?;
+    let (prices, instrument_type, long_name, currency) = fetch_closing_prices(client, symbol, historical_range).await?;
+    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref(), currency.as_deref())?;
     store_watchlist_prices(db_path, symbol, prices)
 }
 
@@ -283,12 +284,7 @@ fn purge_old_watchlist_entries(db_path: &PathBuf, today: NaiveDate) -> anyhow::R
 }
 
 fn normalize_symbol(symbol: &str) -> String {
-    let normalized = symbol.to_uppercase();
-    if normalized.ends_with(".AX") {
-        normalized
-    } else {
-        format!("{}.AX", normalized)
-    }
+    symbol.trim().to_uppercase()
 }
 
 #[derive(Debug, Clone)]
@@ -528,8 +524,8 @@ async fn fetch_and_store(
     symbol: &str,
     historical_range: Option<&DateRange>,
 ) -> anyhow::Result<usize> {
-    let (prices, instrument_type, long_name) = fetch_closing_prices(client, symbol, historical_range).await?;
-    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref())?;
+    let (prices, instrument_type, long_name, currency) = fetch_closing_prices(client, symbol, historical_range).await?;
+    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref(), currency.as_deref())?;
     store_prices(db_path, symbol, prices)
 }
 
@@ -537,7 +533,7 @@ async fn fetch_closing_prices(
     client: &Client,
     symbol: &str,
     historical_range: Option<&DateRange>,
-) -> anyhow::Result<(Vec<PriceRecord>, Option<String>, Option<String>)> {
+) -> anyhow::Result<(Vec<PriceRecord>, Option<String>, Option<String>, Option<String>)> {
     let url = if let Some(range) = historical_range {
         let period1 = Utc
             .from_utc_datetime(&range.start.and_hms_opt(0, 0, 0).unwrap())
@@ -574,6 +570,7 @@ async fn fetch_closing_prices(
 
     let instrument_type = result.meta.instrument_type.clone();
     let long_name = result.meta.long_name.clone();
+    let currency = result.meta.currency.clone();
 
     let timestamp = result.timestamp.as_ref().ok_or_else(|| {
         anyhow::anyhow!("No timestamp array in Yahoo response for {}", symbol)
@@ -605,7 +602,7 @@ async fn fetch_closing_prices(
         records.push(record);
     }
 
-    Ok((records, instrument_type, long_name))
+    Ok((records, instrument_type, long_name, currency))
 }
 
 fn store_symbol_info(
@@ -613,16 +610,18 @@ fn store_symbol_info(
     symbol: &str,
     instrument_type: Option<&str>,
     long_name: Option<&str>,
+    currency: Option<&str>,
 ) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
     conn.execute(
-        "INSERT INTO symbol_info (symbol, instrument_type, long_name, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO symbol_info (symbol, instrument_type, long_name, currency, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(symbol) DO UPDATE SET
-             instrument_type = excluded.instrument_type,
-             long_name = excluded.long_name,
-             updated_at = excluded.updated_at",
-        params![symbol, instrument_type, long_name, Utc::now().to_rfc3339()],
+             instrument_type = COALESCE(?2, instrument_type),
+             long_name = COALESCE(?3, long_name),
+             currency = COALESCE(?4, currency),
+             updated_at = ?5",
+        params![symbol, instrument_type, long_name, currency, Utc::now().to_rfc3339()],
     )?;
     Ok(())
 }
