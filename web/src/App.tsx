@@ -15,6 +15,7 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [holdingsVersion, setHoldingsVersion] = useState(0)
+  const [configVersion, setConfigVersion] = useState(0)
 
   useEffect(() => {
     // Test connection to backend on mount
@@ -105,7 +106,7 @@ function App() {
           <WatchlistManager onLoading={setLoading} />
         </div>
         <div style={{ display: activeTab === 'holdings' ? 'block' : 'none' }}>
-          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} />
+          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} />
         </div>
         <div style={{ display: activeTab === 'sold' ? 'block' : 'none' }}>
           <SoldStocks onLoading={setLoading} holdingsVersion={holdingsVersion} />
@@ -117,7 +118,7 @@ function App() {
           <EventLogViewer onLoading={setLoading} />
         </div>
         <div style={{ display: activeTab === 'config' ? 'block' : 'none' }}>
-          <ConfigPanel onLoading={setLoading} />
+          <ConfigPanel onLoading={setLoading} onConfigChanged={() => setConfigVersion((v) => v + 1)} />
         </div>
       </main>
 

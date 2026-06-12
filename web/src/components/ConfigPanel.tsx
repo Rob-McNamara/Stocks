@@ -3,6 +3,7 @@ import { apiClient } from '../services/api'
 
 interface ConfigPanelProps {
   onLoading: (loading: boolean) => void
+  onConfigChanged?: () => void
 }
 
 interface ConfigItem {
@@ -33,7 +34,7 @@ const CONFIG_SCHEMA: ConfigItem[] = [
   }
 ]
 
-export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
+export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelProps) {
   const [config, setConfig] = useState<Record<string, string>>({})
   const [editingKey, setEditingKey] = useState<string | null>(null)
   const [editingValue, setEditingValue] = useState('')
@@ -42,6 +43,9 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
   const [success, setSuccess] = useState<string | null>(null)
   const [manualSymbol, setManualSymbol] = useState('')
   const [manualPrice, setManualPrice] = useState('')
+  const [editingPrices, setEditingPrices] = useState<Record<string, string>>({})
+  const [typeSymbol, setTypeSymbol] = useState('')
+  const [typeValue, setTypeValue] = useState('ETF')
 
   useEffect(() => {
     loadConfig()
@@ -78,6 +82,7 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
       setConfig({ ...config, [key]: editingValue })
       setEditingKey(null)
       setSuccess(`Updated ${key}`)
+      onConfigChanged?.()
 
       // Clear success message after 3 seconds
       setTimeout(() => setSuccess(null), 3000)
@@ -98,6 +103,10 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
     .filter(([k, v]) => k.startsWith('manual_price_') && v !== '')
     .map(([k, v]) => ({ symbol: k.replace('manual_price_', ''), price: v }))
 
+  const manualTypes = Object.entries(config)
+    .filter(([k, v]) => k.startsWith('instrument_type_') && v !== '')
+    .map(([k, v]) => ({ symbol: k.replace('instrument_type_', ''), type: v }))
+
   const handleSaveManualPrice = async () => {
     const sym = manualSymbol.trim().toUpperCase()
     const val = manualPrice.trim()
@@ -110,9 +119,29 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
       setManualSymbol('')
       setManualPrice('')
       setSuccess(`Manual price set for ${sym}`)
+      onConfigChanged?.()
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save manual price')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleUpdateManualPrice = async (symbol: string) => {
+    const val = (editingPrices[symbol] ?? '').trim()
+    if (!val || isNaN(parseFloat(val))) return
+    try {
+      setLoading(true)
+      setError(null)
+      await apiClient.updateConfig(`manual_price_${symbol}`, val)
+      setConfig((c) => ({ ...c, [`manual_price_${symbol}`]: val }))
+      setEditingPrices((e) => { const next = { ...e }; delete next[symbol]; return next })
+      setSuccess(`Manual price updated for ${symbol}`)
+      onConfigChanged?.()
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update manual price')
     } finally {
       setLoading(false)
     }
@@ -129,9 +158,49 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
         return next
       })
       setSuccess(`Manual price removed for ${symbol}`)
+      onConfigChanged?.()
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to remove manual price')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSaveManualType = async () => {
+    const sym = typeSymbol.trim().toUpperCase()
+    if (!sym || !typeValue) return
+    try {
+      setLoading(true)
+      setError(null)
+      await apiClient.updateConfig(`instrument_type_${sym}`, typeValue)
+      setConfig((c) => ({ ...c, [`instrument_type_${sym}`]: typeValue }))
+      setTypeSymbol('')
+      setSuccess(`Instrument type set for ${sym}`)
+      onConfigChanged?.()
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save instrument type')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleRemoveManualType = async (symbol: string) => {
+    try {
+      setLoading(true)
+      setError(null)
+      await apiClient.updateConfig(`instrument_type_${symbol}`, '')
+      setConfig((c) => {
+        const next = { ...c }
+        delete next[`instrument_type_${symbol}`]
+        return next
+      })
+      setSuccess(`Instrument type override removed for ${symbol}`)
+      onConfigChanged?.()
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove instrument type')
     } finally {
       setLoading(false)
     }
@@ -216,7 +285,7 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
                 <thead>
                   <tr>
                     <th>Symbol</th>
-                    <th>Price</th>
+                    <th>Price ($)</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -224,8 +293,26 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
                   {manualPrices.map(({ symbol, price }) => (
                     <tr key={symbol}>
                       <td><strong>{symbol}</strong></td>
-                      <td>${parseFloat(price).toFixed(4)}</td>
                       <td>
+                        <input
+                          type="number"
+                          min="0"
+                          step="any"
+                          value={editingPrices[symbol] ?? price}
+                          onChange={(e) => setEditingPrices((ep) => ({ ...ep, [symbol]: e.target.value }))}
+                          className="config-input"
+                          style={{ width: 100 }}
+                          disabled={loading}
+                        />
+                      </td>
+                      <td style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          className="btn btn-primary btn-small"
+                          onClick={() => handleUpdateManualPrice(symbol)}
+                          disabled={loading || !(editingPrices[symbol] ?? '').trim() && editingPrices[symbol] === undefined}
+                        >
+                          Update
+                        </button>
                         <button
                           className="btn btn-danger btn-small"
                           onClick={() => handleRemoveManualPrice(symbol)}
@@ -272,6 +359,77 @@ export default function ConfigPanel({ onLoading }: ConfigPanelProps) {
                 disabled={loading || !manualSymbol || !manualPrice}
               >
                 Set Price
+              </button>
+            </div>
+          </div>
+
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>Instrument Type Overrides</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              Override the instrument type provided by Yahoo Finance. Used to control which grid a stock appears in on the Holdings screen.
+            </p>
+
+            {manualTypes.length > 0 && (
+              <table className="holdings-table" style={{ marginBottom: 20 }}>
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Type</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {manualTypes.map(({ symbol, type }) => (
+                    <tr key={symbol}>
+                      <td><strong>{symbol}</strong></td>
+                      <td>{type}</td>
+                      <td>
+                        <button
+                          className="btn btn-danger btn-small"
+                          onClick={() => handleRemoveManualType(symbol)}
+                          disabled={loading}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            <div className="config-edit" style={{ alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Symbol</label>
+                <input
+                  type="text"
+                  value={typeSymbol}
+                  onChange={(e) => setTypeSymbol(e.target.value.toUpperCase())}
+                  placeholder="e.g. VTS.AX"
+                  className="config-input"
+                  disabled={loading}
+                  maxLength={12}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Type</label>
+                <select
+                  value={typeValue}
+                  onChange={(e) => setTypeValue(e.target.value)}
+                  className="config-input"
+                  disabled={loading}
+                >
+                  <option value="ETF">ETF</option>
+                  <option value="EQUITY">EQUITY</option>
+                  <option value="MUTUALFUND">MUTUALFUND</option>
+                </select>
+              </div>
+              <button
+                className="btn btn-primary btn-small"
+                onClick={handleSaveManualType}
+                disabled={loading || !typeSymbol}
+              >
+                Set Type
               </button>
             </div>
           </div>

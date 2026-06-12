@@ -41,14 +41,14 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       setError(null)
       onLoading(true)
 
-      const [txData, watchlistSymbols, watchlistPricesData, dividendData] = await Promise.all([
+      const [txData, watchlistSymbols, watchlistPricesData, dividendData, configData] = await Promise.all([
         apiClient.getHoldings(),
         apiClient.getWatchlistSymbols(),
         apiClient.getWatchlistPrices(),
         apiClient.getDividends(),
+        apiClient.getConfig(),
       ])
       setTransactions(txData)
-
 
       const holdingSymbols = Array.from(new Set(txData.map((tx) => tx.symbol)))
 
@@ -58,6 +58,18 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
 
       const priceMap: Record<string, number | null> = {}
       pricesData.forEach((p) => { priceMap[p.symbol] = p.price })
+
+      // Apply manual prices from config (same as HoldingsManager)
+      Object.entries(configData).forEach(([key, value]) => {
+        if (key.startsWith('manual_price_')) {
+          const symbol = key.replace('manual_price_', '')
+          const parsed = parseFloat(value)
+          if (!isNaN(parsed) && (priceMap[symbol] == null || priceMap[symbol] === 0)) {
+            priceMap[symbol] = parsed
+          }
+        }
+      })
+
       setHoldingPrices(priceMap)
 
       // Fetch SMA for holdings and watchlist in parallel
@@ -106,11 +118,23 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
 
     Object.entries(groupedBySymbol).forEach(([symbol, txs]) => {
       const sorted = [...txs].sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id)
-      const lots: Array<{ quantity: number; price: number }> = []
-      let realisedPL = 0
-      let totalSoldQty = 0
+
+      // Collect dividends the same way as HoldingsManager / SoldStocks
       let dividends = 0
       let dividendsFromTotal = 0
+      sorted.forEach((tx) => {
+        if (tx.dividends_total > 0) dividendsFromTotal = tx.dividends_total
+        else if (tx.transaction_type === 'dividend' && tx.amount) dividends += tx.amount
+      })
+      const symbolDividends = dividendsFromTotal > 0 ? dividendsFromTotal : dividends
+
+      // Total sold qty used for proportional dividend attribution (matches SoldStocks)
+      const totalSoldQty = sorted.reduce((s, tx) =>
+        tx.transaction_type === 'sale' && tx.quantity ? s + tx.quantity : s, 0)
+
+      // FIFO lots — recompute for each sale to get cost basis
+      const lots: Array<{ quantity: number; price: number }> = []
+      let symbolSoldPL = 0
 
       sorted.forEach((tx) => {
         if (tx.transaction_type === 'purchase' && tx.quantity && tx.price) {
@@ -125,34 +149,25 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
             remaining -= used
             if (lots[0].quantity <= 0) lots.shift()
           }
-          realisedPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis
-          totalSoldQty += tx.quantity
+          const saleDividends = totalSoldQty > 0 ? (tx.quantity / totalSoldQty) * symbolDividends : 0
+          symbolSoldPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis + saleDividends
         }
-        if (tx.dividends_total > 0) dividendsFromTotal = tx.dividends_total
-        else if (tx.transaction_type === 'dividend' && tx.amount) dividends += tx.amount
       })
 
-      const symbolDividends = dividendsFromTotal > 0 ? dividendsFromTotal : dividends
       const remainingShares = lots.reduce((s, l) => s + l.quantity, 0)
       const remainingCost = lots.reduce((s, l) => s + l.quantity * l.price, 0)
 
       if (remainingShares > 0) {
+        // Matches HoldingsManager: unrealised P/L on remaining shares + all dividends
         stockCount++
         const price = holdingPrices[symbol]
         const currentValue = price ? remainingShares * price : 0
         if (price) totalValue += currentValue
-        // Apportion dividends: held shares get their share, sold shares get theirs
-        const totalQty = remainingShares + totalSoldQty
-        const heldDividends = totalQty > 0 ? (remainingShares / totalQty) * symbolDividends : 0
-        const soldDividends = totalQty > 0 ? (totalSoldQty / totalQty) * symbolDividends : 0
-        holdingsPL += currentValue - remainingCost + heldDividends
-        realisedPL += soldDividends
-      } else {
-        // Fully sold — all dividends go to sold P/L
-        realisedPL += symbolDividends
+        holdingsPL += currentValue - remainingCost + symbolDividends
       }
 
-      soldPL += realisedPL
+      // All sale transactions contribute to soldPL (matches SoldStocks which shows all sales)
+      soldPL += symbolSoldPL
     })
 
     return { stockCount, totalValue, totalPL: holdingsPL + soldPL }

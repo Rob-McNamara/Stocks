@@ -27,6 +27,7 @@ interface WatchlistManagerProps {
 export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
   const [symbols, setSymbols] = useState<WatchlistSymbol[]>([])
   const [currentPrices, setCurrentPrices] = useState<CurrentPrice[]>([])
+  const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null }>>({})
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [newSymbol, setNewSymbol] = useState('')
   const [loading, setLoading] = useState(true)
@@ -41,10 +42,14 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
     try {
       setLoading(true)
       setError(null)
-      const [symbolsData, pricesData] = await Promise.all([
+      const [symbolsData, pricesData, infoData] = await Promise.all([
         apiClient.getWatchlistSymbols(),
-        apiClient.getWatchlistPrices()
+        apiClient.getWatchlistPrices(),
+        apiClient.getSymbolInfo(),
       ])
+      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null }> = {}
+      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name } })
+      setSymbolInfo(infoMap)
       
       // Fetch and calculate SMA for each symbol
       const pricesWithSMA = await Promise.all(
@@ -267,7 +272,17 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
               return (
                 <li key={id} className="symbol-item">
                   <div className="symbol-info">
-                    <span className="symbol-name">{symbol}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span className="symbol-name">{symbol}</span>
+                      {symbolInfo[symbol]?.instrument_type && (
+                        <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: symbolInfo[symbol].instrument_type === 'ETF' ? '#e3f2fd' : '#f3e5f5', color: symbolInfo[symbol].instrument_type === 'ETF' ? '#1565c0' : '#6a1b9a' }}>
+                          {symbolInfo[symbol].instrument_type}
+                        </span>
+                      )}
+                    </div>
+                    {symbolInfo[symbol]?.long_name && (
+                      <div style={{ fontSize: 11, color: '#888' }}>{symbolInfo[symbol].long_name}</div>
+                    )}
                     <span className="symbol-date">
                       Added: {new Date(added_at).toLocaleDateString()}
                     </span>

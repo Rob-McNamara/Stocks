@@ -16,11 +16,13 @@ interface HoldingTransaction {
   dividends_total: number
 }
 
-export default function HoldingsManager({ onLoading, onTransactionsChanged }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void }) {
+export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [currentPrices, setCurrentPrices] = useState<Record<string, number | null>>({})
   const [manualPriceSymbols, setManualPriceSymbols] = useState<Set<string>>(new Set())
   const [smaPrices, setSmaPrices] = useState<Record<string, number | null>>({})
+  const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null }>>({})
+  const [appConfig, setAppConfig] = useState<Record<string, string>>({})
   const [symbol, setSymbol] = useState('')
   const [transactionType, setTransactionType] = useState<HoldingTransaction['transaction_type']>('purchase')
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
@@ -36,7 +38,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged }: { 
 
   useEffect(() => {
     loadHoldings()
-  }, [])
+  }, [configVersion])
 
   const loadHoldings = async () => {
     try {
@@ -46,14 +48,25 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged }: { 
       const data = await apiClient.getHoldings()
       setTransactions(data)
 
-      // Fetch current prices for all unique symbols
-      const symbols = Array.from(new Set(data.map((tx) => tx.symbol)))
+      // Only fetch prices for symbols with net positive holdings (FIFO)
+      const netShares: Record<string, number> = {}
+      data.forEach((tx) => {
+        if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
+        if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
+        if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
+      })
+      const symbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
       if (symbols.length > 0) {
         try {
-          const [prices, config] = await Promise.all([
+          const [prices, config, infoData] = await Promise.all([
             apiClient.getCurrentPrices(symbols),
             apiClient.getConfig(),
+            apiClient.getSymbolInfo(),
           ])
+          const infoMap: Record<string, { instrument_type: string | null; long_name: string | null }> = {}
+          infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name } })
+          setSymbolInfo(infoMap)
+          setAppConfig(config)
           const priceMap = prices.reduce(
             (acc, p) => {
               acc[p.symbol] = p.price
@@ -251,7 +264,13 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged }: { 
       onLoading(true)
       setError(null)
       setSuccess(null)
-      const symbols = Array.from(new Set(transactions.map((tx) => tx.symbol)))
+      const netShares: Record<string, number> = {}
+      transactions.forEach((tx) => {
+        if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
+        if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
+        if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
+      })
+      const symbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
       const prices = await apiClient.getCurrentPrices(symbols)
       const priceMap = prices.reduce((acc, p) => {
         acc[p.symbol] = p.price
@@ -272,6 +291,12 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged }: { 
         }
       }
       setSmaPrices(smaMap)
+
+      // Reload symbol info now that fetch has populated it
+      const infoData = await apiClient.getSymbolInfo()
+      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null }> = {}
+      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name } })
+      setSymbolInfo(infoMap)
 
       const hasPrice = prices.some((item) => item.price !== null)
       const errorDetails = prices
@@ -692,10 +717,26 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged }: { 
           <p className="empty-text">No holdings configured.</p>
         ) : (
           <>
-            <div className="holdings-summary-grid">
-              {summary.map((item) => (
+            {(() => {
+              const etfTypes = new Set(['ETF', 'MUTUALFUND'])
+              const getInstrumentType = (symbol: string) =>
+                appConfig[`instrument_type_${symbol}`] || symbolInfo[symbol]?.instrument_type || ''
+              const etfs = summary.filter((i) => etfTypes.has(getInstrumentType(i.symbol)))
+              const equities = summary.filter((i) => !etfTypes.has(getInstrumentType(i.symbol)))
+
+              const renderCard = (item: typeof summary[0]) => (
                 <div key={item.symbol} className="holdings-summary-card">
-                  <strong>{item.symbol}</strong>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <strong>{item.symbol}</strong>
+                    {symbolInfo[item.symbol]?.instrument_type && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: symbolInfo[item.symbol].instrument_type === 'ETF' ? '#e3f2fd' : '#f3e5f5', color: symbolInfo[item.symbol].instrument_type === 'ETF' ? '#1565c0' : '#6a1b9a' }}>
+                        {symbolInfo[item.symbol].instrument_type}
+                      </span>
+                    )}
+                  </div>
+                  {symbolInfo[item.symbol]?.long_name && (
+                    <div style={{ fontSize: 11, color: '#888', marginBottom: 2 }}>{symbolInfo[item.symbol].long_name}</div>
+                  )}
                   <div style={{ color: manualPriceSymbols.has(item.symbol) ? '#2196f3' : undefined }}>
                     {item.shares % 1 === 0 ? item.shares.toFixed(0) : item.shares.toFixed(2)}@{item.currentPrice ? `$${item.currentPrice.toFixed(2)}` : '—'}
                     {manualPriceSymbols.has(item.symbol) && <span style={{ fontSize: 11, marginLeft: 4 }}>(manual)</span>}
@@ -716,8 +757,37 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged }: { 
                     )
                   })()}
                 </div>
-              ))}
-            </div>
+              )
+
+              const renderGroup = (items: typeof summary, label: string) => {
+                if (items.length === 0) return null
+                const inv = items.reduce((s, i) => s + i.invested, 0)
+                const val = items.reduce((s, i) => s + i.currentValue, 0)
+                const div = items.reduce((s, i) => s + i.dividends, 0)
+                const pl = val - inv + div
+                return (
+                  <div style={{ marginBottom: 24 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 8, flexWrap: 'wrap' }}>
+                      <h3 style={{ margin: 0, fontSize: 15 }}>{label}</h3>
+                      <span style={{ fontSize: 13, color: '#666' }}>Net Invested: <strong>${inv.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                      <span style={{ fontSize: 13, color: val < inv ? '#f44336' : '#666' }}>Current Value: <strong>${val.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                      <span style={{ fontSize: 13, color: '#666' }}>Dividends: <strong>${div.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                      <span style={{ fontSize: 13, color: pl >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>P/L: {pl >= 0 ? '+' : '-'}${Math.abs(pl).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                    </div>
+                    <div className="holdings-summary-grid">
+                      {items.map(renderCard)}
+                    </div>
+                  </div>
+                )
+              }
+
+              return (
+                <>
+                  {renderGroup(equities, 'Equities')}
+                  {renderGroup(etfs, 'ETFs')}
+                </>
+              )
+            })()}
 
             <div className="holdings-table-wrapper">
               <h3>Active Holdings</h3>

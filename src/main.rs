@@ -27,7 +27,16 @@ struct YahooChart {
 }
 
 #[derive(Debug, Deserialize)]
+struct YahooMeta {
+    #[serde(rename = "instrumentType")]
+    instrument_type: Option<String>,
+    #[serde(rename = "longName")]
+    long_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct YahooResult {
+    meta: YahooMeta,
     timestamp: Option<Vec<i64>>,
     indicators: YahooIndicators,
 }
@@ -259,7 +268,8 @@ async fn fetch_and_store_watchlist(
     symbol: &str,
     historical_range: Option<&DateRange>,
 ) -> anyhow::Result<usize> {
-    let prices = fetch_closing_prices(client, symbol, historical_range).await?;
+    let (prices, instrument_type, long_name) = fetch_closing_prices(client, symbol, historical_range).await?;
+    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref())?;
     store_watchlist_prices(db_path, symbol, prices)
 }
 
@@ -518,7 +528,8 @@ async fn fetch_and_store(
     symbol: &str,
     historical_range: Option<&DateRange>,
 ) -> anyhow::Result<usize> {
-    let prices = fetch_closing_prices(client, symbol, historical_range).await?;
+    let (prices, instrument_type, long_name) = fetch_closing_prices(client, symbol, historical_range).await?;
+    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref())?;
     store_prices(db_path, symbol, prices)
 }
 
@@ -526,7 +537,7 @@ async fn fetch_closing_prices(
     client: &Client,
     symbol: &str,
     historical_range: Option<&DateRange>,
-) -> anyhow::Result<Vec<PriceRecord>> {
+) -> anyhow::Result<(Vec<PriceRecord>, Option<String>, Option<String>)> {
     let url = if let Some(range) = historical_range {
         let period1 = Utc
             .from_utc_datetime(&range.start.and_hms_opt(0, 0, 0).unwrap())
@@ -554,12 +565,15 @@ async fn fetch_closing_prices(
         .as_ref()
         .and_then(|items| items.first())
         .ok_or_else(|| {
-            if let Some(error) = payload.chart.error {
+            if let Some(error) = &payload.chart.error {
                 anyhow::anyhow!("No chart result found for {}: {}", symbol, error)
             } else {
                 anyhow::anyhow!("No chart result found for {}", symbol)
             }
         })?;
+
+    let instrument_type = result.meta.instrument_type.clone();
+    let long_name = result.meta.long_name.clone();
 
     let timestamp = result.timestamp.as_ref().ok_or_else(|| {
         anyhow::anyhow!("No timestamp array in Yahoo response for {}", symbol)
@@ -591,7 +605,26 @@ async fn fetch_closing_prices(
         records.push(record);
     }
 
-    Ok(records)
+    Ok((records, instrument_type, long_name))
+}
+
+fn store_symbol_info(
+    db_path: &PathBuf,
+    symbol: &str,
+    instrument_type: Option<&str>,
+    long_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "INSERT INTO symbol_info (symbol, instrument_type, long_name, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(symbol) DO UPDATE SET
+             instrument_type = excluded.instrument_type,
+             long_name = excluded.long_name,
+             updated_at = excluded.updated_at",
+        params![symbol, instrument_type, long_name, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn store_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> anyhow::Result<usize> {

@@ -234,6 +234,34 @@ async fn get_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
     }
 }
 
+#[get("/api/symbol-info")]
+async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
+    let conn = match Connection::open(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT symbol, instrument_type, long_name FROM symbol_info ORDER BY symbol",
+    ) {
+        Ok(s) => s,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "symbol": row.get::<_, String>(0)?,
+            "instrument_type": row.get::<_, Option<String>>(1)?,
+            "long_name": row.get::<_, Option<String>>(2)?,
+        }))
+    });
+    match rows {
+        Ok(mapped) => {
+            let items: Vec<_> = mapped.filter_map(|r| r.ok()).collect();
+            HttpResponse::Ok().json(items)
+        }
+        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+    }
+}
+
 #[get("/api/dividends")]
 async fn get_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     let conn = match Connection::open(db_path.as_ref()) {
@@ -502,7 +530,14 @@ fn store_dividend_events_for_symbol(db_path: &PathBuf, symbol: &str, events: &[D
 fn load_holding_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT DISTINCT symbol FROM holdings_transactions ORDER BY symbol")
+        .prepare(
+            "SELECT symbol, SUM(CASE WHEN transaction_type='purchase' THEN quantity ELSE -quantity END) as net_qty
+             FROM holdings_transactions
+             WHERE transaction_type IN ('purchase', 'sale')
+             GROUP BY symbol
+             HAVING net_qty > 0
+             ORDER BY symbol",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -589,6 +624,7 @@ async fn main() -> std::io::Result<()> {
             .service(update_holding_transaction)
             .service(delete_holding_transaction)
             .service(get_price_history)
+            .service(get_symbol_info)
             .service(get_dividends)
             .service(get_events)
             .service(refresh_dividends)
@@ -663,6 +699,17 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp);
         ",
+    )
+    .map_err(|err| err.to_string())?;
+
+    // symbol_info table for instrument type and long name
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS symbol_info (
+            symbol TEXT PRIMARY KEY,
+            instrument_type TEXT,
+            long_name TEXT,
+            updated_at TEXT NOT NULL
+        );",
     )
     .map_err(|err| err.to_string())?;
 
@@ -1242,6 +1289,10 @@ struct YahooMeta {
     regular_market_change_percent: Option<f64>,
     #[serde(rename = "regularMarketVolume")]
     regular_market_volume: Option<i64>,
+    #[serde(rename = "instrumentType")]
+    instrument_type: Option<String>,
+    #[serde(rename = "longName")]
+    long_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1370,8 +1421,11 @@ async fn fetch_current_prices_for_symbols(
     for symbol in symbols {
         match fetch_current_price(&client, symbol).await {
             Ok(meta) => {
-                // Log successful fetch
                 let _ = insert_event_log(db_path, "info", "price_fetch", "api", Some(symbol), &format!("Fetched price from Yahoo: {:?}", meta.regular_market_price));
+                // Store instrument type and long name if available
+                if meta.instrument_type.is_some() || meta.long_name.is_some() {
+                    let _ = store_symbol_info(db_path, symbol, meta.instrument_type.as_deref(), meta.long_name.as_deref());
+                }
                 prices.push(CurrentPrice {
                     symbol: symbol.clone(),
                     price: meta.regular_market_price,
@@ -1404,6 +1458,21 @@ async fn fetch_current_prices_for_symbols(
     }
 
     Ok(prices)
+}
+
+fn store_symbol_info(db_path: &PathBuf, symbol: &str, instrument_type: Option<&str>, long_name: Option<&str>) -> Result<(), String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO symbol_info (symbol, instrument_type, long_name, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(symbol) DO UPDATE SET
+           instrument_type = COALESCE(?2, instrument_type),
+           long_name = COALESCE(?3, long_name),
+           updated_at = ?4",
+        params![symbol, instrument_type, long_name, now],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn insert_event_log(

@@ -191,6 +191,12 @@ export const apiClient = {
     return response.json()
   },
 
+  async getSymbolInfo(): Promise<{ symbol: string; instrument_type: string | null; long_name: string | null }[]> {
+    const response = await fetch(`${API_BASE_URL}/symbol-info`)
+    if (!response.ok) throw new Error('Failed to fetch symbol info')
+    return response.json()
+  },
+
   async getDividends(): Promise<{ symbol: string; ex_date: string; payment_date: string | null; amount: number }[]> {
     const response = await fetch(`${API_BASE_URL}/dividends`)
     if (!response.ok) throw new Error('Failed to fetch dividends')
