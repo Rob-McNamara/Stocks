@@ -16,7 +16,9 @@ interface CurrentPrice {
   change_percent: number | null
   volume: number | null
   last_updated: string
+  sma50?: number | null
   sma150?: number | null
+  volumeChangePct?: number | null
   error?: string
 }
 
@@ -27,7 +29,7 @@ interface WatchlistManagerProps {
 export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
   const [symbols, setSymbols] = useState<WatchlistSymbol[]>([])
   const [currentPrices, setCurrentPrices] = useState<CurrentPrice[]>([])
-  const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null }>>({})
+  const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [newSymbol, setNewSymbol] = useState('')
   const [loading, setLoading] = useState(true)
@@ -47,8 +49,8 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
         apiClient.getWatchlistPrices(),
         apiClient.getSymbolInfo(),
       ])
-      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null }> = {}
-      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name } })
+      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
+      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
       setSymbolInfo(infoMap)
       
       // Fetch and calculate SMA for each symbol
@@ -56,9 +58,18 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
         pricesData.map(async (price) => {
           try {
             const history = await apiClient.getPriceHistory(price.symbol, 300)
-            const smaArray = calculateSMA(history, 150)
-            const sma150 = getLatestSMA(smaArray)
-            return { ...price, sma150 }
+            const sma50 = getLatestSMA(calculateSMA(history, 50))
+            const sma150 = getLatestSMA(calculateSMA(history, 150))
+            const volPoints = history.filter((p) => p.volume !== null && p.volume > 0).slice(-10)
+            const last5 = volPoints.slice(-5)
+            const prev5 = volPoints.slice(-10, -5)
+            let volumeChangePct: number | null = null
+            if (last5.length === 5 && prev5.length === 5) {
+              const avg = (pts: typeof volPoints) => pts.reduce((s, p) => s + p.volume!, 0) / pts.length
+              const prevAvg = avg(prev5)
+              if (prevAvg > 0) volumeChangePct = ((avg(last5) - prevAvg) / prevAvg) * 100
+            }
+            return { ...price, sma50, sma150, volumeChangePct }
           } catch (err) {
             // If SMA calculation fails, just return price without SMA
             return price
@@ -107,9 +118,18 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
         pricesData.map(async (price) => {
           try {
             const history = await apiClient.getPriceHistory(price.symbol, 300)
-            const smaArray = calculateSMA(history, 150)
-            const sma150 = getLatestSMA(smaArray)
-            return { ...price, sma150 }
+            const sma50 = getLatestSMA(calculateSMA(history, 50))
+            const sma150 = getLatestSMA(calculateSMA(history, 150))
+            const volPoints = history.filter((p) => p.volume !== null && p.volume > 0).slice(-10)
+            const last5 = volPoints.slice(-5)
+            const prev5 = volPoints.slice(-10, -5)
+            let volumeChangePct: number | null = null
+            if (last5.length === 5 && prev5.length === 5) {
+              const avg = (pts: typeof volPoints) => pts.reduce((s, p) => s + p.volume!, 0) / pts.length
+              const prevAvg = avg(prev5)
+              if (prevAvg > 0) volumeChangePct = ((avg(last5) - prevAvg) / prevAvg) * 100
+            }
+            return { ...price, sma50, sma150, volumeChangePct }
           } catch (err) {
             return price
           }
@@ -139,9 +159,18 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
         pricesData.map(async (price) => {
           try {
             const history = await apiClient.getPriceHistory(price.symbol, 300)
-            const smaArray = calculateSMA(history, 150)
-            const sma150 = getLatestSMA(smaArray)
-            return { ...price, sma150 }
+            const sma50 = getLatestSMA(calculateSMA(history, 50))
+            const sma150 = getLatestSMA(calculateSMA(history, 150))
+            const volPoints = history.filter((p) => p.volume !== null && p.volume > 0).slice(-10)
+            const last5 = volPoints.slice(-5)
+            const prev5 = volPoints.slice(-10, -5)
+            let volumeChangePct: number | null = null
+            if (last5.length === 5 && prev5.length === 5) {
+              const avg = (pts: typeof volPoints) => pts.reduce((s, p) => s + p.volume!, 0) / pts.length
+              const prevAvg = avg(prev5)
+              if (prevAvg > 0) volumeChangePct = ((avg(last5) - prevAvg) / prevAvg) * 100
+            }
+            return { ...price, sma50, sma150, volumeChangePct }
           } catch (err) {
             return price
           }
@@ -265,81 +294,124 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
           <p className="loading-text">Loading watchlist...</p>
         ) : symbols.length === 0 ? (
           <p className="empty-text">No symbols in watchlist yet. Add one to get started.</p>
-        ) : (
-          <ul className="symbols-list">
-            {symbols.map(({ id, symbol, added_at }) => {
-              const priceData = currentPrices.find(p => p.symbol === symbol)
-              return (
-                <li key={id} className={`symbol-item${selectedSymbol === symbol ? ' symbol-item-active' : ''}`} onClick={() => setSelectedSymbol(symbol)} style={{ cursor: 'pointer' }}>
-                  <div className="symbol-info">
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span className="symbol-name">{symbol}</span>
-                      {symbolInfo[symbol]?.instrument_type && (
-                        <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: symbolInfo[symbol].instrument_type === 'ETF' ? '#e3f2fd' : '#f3e5f5', color: symbolInfo[symbol].instrument_type === 'ETF' ? '#1565c0' : '#6a1b9a' }}>
-                          {symbolInfo[symbol].instrument_type}
-                        </span>
-                      )}
-                    {symbolInfo[symbol]?.long_name === undefined && symbolInfo[symbol]?.instrument_type === undefined && !symbol.endsWith('.AX') && (
-                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: '#fff8e1', color: '#f57f17' }}>
-                        USD
+        ) : (() => {
+          const isInternational = (sym: string) => {
+            const cur = symbolInfo[sym]?.currency?.toUpperCase()
+            if (cur) return cur !== 'AUD'
+            // Fall back to suffix: ASX stocks always end with .AX
+            return !sym.endsWith('.AX')
+          }
+          const renderItem = ({ id, symbol, added_at }: { id: number; symbol: string; added_at: string }) => {
+            const priceData = currentPrices.find(p => p.symbol === symbol)
+            const symCurrency = symbolInfo[symbol]?.currency?.toUpperCase()
+            return (
+              <li key={id} className={`symbol-item${selectedSymbol === symbol ? ' symbol-item-active' : ''}`} onClick={() => setSelectedSymbol(symbol)} style={{ cursor: 'pointer' }}>
+                <div className="symbol-info">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span className="symbol-name">{symbol}</span>
+                    {symbolInfo[symbol]?.instrument_type && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: symbolInfo[symbol].instrument_type === 'ETF' ? '#e3f2fd' : '#f3e5f5', color: symbolInfo[symbol].instrument_type === 'ETF' ? '#1565c0' : '#6a1b9a' }}>
+                        {symbolInfo[symbol].instrument_type}
                       </span>
                     )}
-                    </div>
-                    {symbolInfo[symbol]?.long_name && (
-                      <div style={{ fontSize: 11, color: '#888' }}>{symbolInfo[symbol].long_name}</div>
-                    )}
-                    <span className="symbol-date">
-                      Added: {new Date(added_at).toLocaleDateString()}
-                    </span>
+                    {(symCurrency && symCurrency !== 'AUD')
+                      ? (
+                        <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: '#fff3e0', color: '#e65100' }}>
+                          {symCurrency}
+                        </span>
+                      )
+                      : (!symCurrency && !symbol.endsWith('.AX')) && (
+                        <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4, background: '#fff3e0', color: '#e65100' }}>
+                          Intl
+                        </span>
+                      )}
                   </div>
-                  <div className="price-info">
-                    {priceData ? (
-                      <div className="price-details">
-                        <div className="current-price">
-                          {priceData.price ? (
-                            <span className="price-value">${priceData.price.toFixed(2)}</span>
-                          ) : (
-                            <span className="price-unavailable">—</span>
-                          )}
-                        </div>
+                  {symbolInfo[symbol]?.long_name && (
+                    <div style={{ fontSize: 11, color: '#888' }}>{symbolInfo[symbol].long_name}</div>
+                  )}
+                  <span className="symbol-date">
+                    Added: {new Date(added_at).toLocaleDateString()}
+                  </span>
+                </div>
+                <div className="price-info">
+                  {priceData ? (
+                    <div className="price-details">
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                        {priceData.price ? (
+                          <span className="price-value">${priceData.price.toFixed(2)}</span>
+                        ) : (
+                          <span className="price-unavailable">—</span>
+                        )}
                         {priceData.change !== null && priceData.change_percent !== null && (
-                          <div className={`price-change ${priceData.change >= 0 ? 'positive' : 'negative'}`}>
-                            <span className="change-value">
-                              {priceData.change >= 0 ? '+' : ''}{priceData.change.toFixed(2)}
-                            </span>
-                            <span className="change-percent">
-                              ({priceData.change >= 0 ? '+' : ''}{priceData.change_percent.toFixed(2)}%)
-                            </span>
-                          </div>
-                        )}
-                        {priceData.volume && (
-                          <div className="volume">
-                            Vol: {priceData.volume.toLocaleString()}
-                          </div>
-                        )}
-                        {priceData.sma150 !== undefined && priceData.sma150 !== null && (
-                          <div className={`sma-value ${priceData.price !== null && priceData.sma150 > priceData.price ? 'sma-above-price' : ''}`}>
-                            150-day SMA: ${priceData.sma150.toFixed(2)}
-                          </div>
+                          <span className={`price-change ${priceData.change >= 0 ? 'positive' : 'negative'}`} style={{ fontSize: 12 }}>
+                            {priceData.change >= 0 ? '+' : ''}{priceData.change.toFixed(2)}
+                            {' '}({priceData.change >= 0 ? '+' : ''}{priceData.change_percent.toFixed(2)}%)
+                          </span>
                         )}
                       </div>
-                    ) : (
-                      <div className="price-loading">Loading...</div>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => handleRemoveSymbol(id, symbol)}
-                    className="btn btn-danger btn-small"
-                    disabled={loading}
-                    title="Remove from watchlist"
-                  >
-                    Remove
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
-        )}
+                      {priceData.volume && (
+                        <div className="volume">
+                          Vol: {priceData.volume.toLocaleString()}
+                        </div>
+                      )}
+                      {(priceData.sma50 != null || priceData.sma150 != null) && (
+                        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                          {priceData.sma50 != null && (
+                            <span className={`sma-value ${priceData.price !== null && priceData.sma50 > priceData.price ? 'sma-above-price' : ''}`}>
+                              50SMA: ${priceData.sma50.toFixed(2)}
+                            </span>
+                          )}
+                          {priceData.sma150 != null && (
+                            <span className={`sma-value ${priceData.price !== null && priceData.sma150 > priceData.price ? 'sma-above-price' : ''}`}>
+                              150SMA: ${priceData.sma150.toFixed(2)}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {priceData.volumeChangePct !== undefined && priceData.volumeChangePct !== null && (
+                        <div style={{ color: priceData.volumeChangePct < 0 ? '#f44336' : '#888', fontSize: 12 }}>
+                          Vol (5d vs prev 5d): {priceData.volumeChangePct >= 0 ? '+' : ''}{priceData.volumeChangePct.toFixed(1)}%
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="price-loading">Loading...</div>
+                  )}
+                </div>
+                <button
+                  onClick={() => handleRemoveSymbol(id, symbol)}
+                  className="btn btn-danger btn-small"
+                  disabled={loading}
+                  title="Remove from watchlist"
+                >
+                  Remove
+                </button>
+              </li>
+            )
+          }
+
+          const local = symbols.filter(s => !isInternational(s.symbol))
+          const intl = symbols.filter(s => isInternational(s.symbol))
+
+          return (
+            <>
+              {local.length > 0 && (
+                <>
+                  {intl.length > 0 && (
+                    <h3 style={{ margin: '0 0 8px', fontSize: 14, color: '#555', fontWeight: 600 }}>Local</h3>
+                  )}
+                  <ul className="symbols-list">{local.map(renderItem)}</ul>
+                </>
+              )}
+              {intl.length > 0 && (
+                <>
+                  <h3 style={{ margin: '16px 0 8px', fontSize: 14, color: '#555', fontWeight: 600 }}>International</h3>
+                  <ul className="symbols-list">{intl.map(renderItem)}</ul>
+                </>
+              )}
+            </>
+          )
+        })()}
       </div>
 
       {symbols.length > 0 && (
@@ -362,7 +434,11 @@ export default function WatchlistManager({ onLoading }: WatchlistManagerProps) {
               </select>
             </div>
           </div>
-          <PriceChart symbol={selectedSymbol} onLoading={onLoading} />
+          <PriceChart
+            symbol={selectedSymbol}
+            currency={symbolInfo[selectedSymbol]?.currency?.toUpperCase() ?? 'AUD'}
+            onLoading={onLoading}
+          />
         </div>
       )}
 

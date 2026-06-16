@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient } from '../services/api'
 
+const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
+
 interface HoldingTransaction {
   id: number
   symbol: string
@@ -13,6 +15,9 @@ interface HoldingTransaction {
   notes: string | null
   created_at: string
   dividends_total: number
+  currency: string
+  original_price: number | null
+  fx_rate: number | null
 }
 
 interface DividendEvent {
@@ -30,6 +35,8 @@ interface TransactionRow {
   date: string
   quantity: number | null
   price: number | null
+  currency: string
+  original_price: number | null
   amount: number | null
   brokerage: number | null
   notes: string | null
@@ -41,6 +48,7 @@ interface EditState {
   type: 'purchase' | 'sale' | 'dividend'
   date: string
   quantity: string
+  currency: string
   price: string
   amount: string
   brokerage: string
@@ -58,6 +66,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const [filter, setFilter] = useState<FilterType>('all')
   const [symbolFilter, setSymbolFilter] = useState('')
   const [editing, setEditing] = useState<EditState | null>(null)
+  const [editFxRate, setEditFxRate] = useState<number | null>(null)
+  const [editFxDate, setEditFxDate] = useState<string | null>(null)
+  const [editFxLoading, setEditFxLoading] = useState(false)
 
   useEffect(() => {
     const load = async () => {
@@ -81,6 +92,24 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     load()
   }, [holdingsVersion])
 
+  useEffect(() => {
+    if (!editing || editing.currency === 'AUD' || editing.type === 'dividend') {
+      setEditFxRate(null)
+      setEditFxDate(null)
+      return
+    }
+    setEditFxLoading(true)
+    apiClient.getFxRateForDate(editing.currency, editing.date).then((result) => {
+      if (result) {
+        setEditFxRate(result.rate)
+        setEditFxDate(result.date)
+      } else {
+        setEditFxRate(null)
+        setEditFxDate(null)
+      }
+    }).finally(() => setEditFxLoading(false))
+  }, [editing?.currency, editing?.date])
+
   const rows = useMemo((): TransactionRow[] => {
     // Track the earliest purchase date per symbol
     const firstPurchaseDate: Record<string, string> = {}
@@ -100,6 +129,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       date: tx.date,
       quantity: tx.quantity,
       price: tx.price,
+      currency: tx.currency || 'AUD',
+      original_price: tx.original_price ?? null,
       amount: tx.amount,
       brokerage: tx.brokerage,
       notes: tx.notes,
@@ -115,6 +146,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         date: d.ex_date,
         quantity: null,
         price: null,
+        currency: 'AUD',
+        original_price: null,
         amount: d.amount,
         brokerage: null,
         notes: d.payment_date ? `Payment: ${new Date(d.payment_date).toLocaleDateString()}` : null,
@@ -128,13 +161,21 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
 
   const startEdit = (row: TransactionRow) => {
     if (row.id === null) return
+    const tx = transactions.find((t) => t.id === row.id)
+    const currency = tx?.currency || 'AUD'
+    const displayPrice = currency !== 'AUD' && tx?.original_price != null
+      ? tx.original_price.toString()
+      : (row.price !== null ? row.price.toString() : '')
+    setEditFxRate(tx?.fx_rate ?? null)
+    setEditFxDate(currency !== 'AUD' ? row.date : null)
     setEditing({
       id: row.id,
       symbol: row.symbol,
       type: row.type,
       date: row.date,
       quantity: row.quantity !== null ? row.quantity.toString() : '',
-      price: row.price !== null ? row.price.toString() : '',
+      currency,
+      price: displayPrice,
       amount: row.amount !== null ? row.amount.toString() : '',
       brokerage: row.brokerage !== null ? row.brokerage.toString() : '',
       notes: row.notes ?? '',
@@ -145,16 +186,28 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     if (!editing) return
     try {
       setSaving(true)
-      const updated = await apiClient.updateHoldingTransaction(editing.id, {
+      const payload: Record<string, unknown> = {
         symbol: editing.symbol,
         transaction_type: editing.type,
         date: editing.date,
-        quantity: editing.quantity ? parseFloat(editing.quantity) : undefined,
-        price: editing.price ? parseFloat(editing.price) : undefined,
         amount: editing.amount ? parseFloat(editing.amount) : undefined,
         brokerage: editing.brokerage ? parseFloat(editing.brokerage) : undefined,
         notes: editing.notes || undefined,
-      })
+      }
+      if (editing.type === 'purchase' || editing.type === 'sale') {
+        payload.quantity = editing.quantity ? parseFloat(editing.quantity) : undefined
+        if (editing.currency !== 'AUD' && editFxRate) {
+          const originalPrice = parseFloat(editing.price)
+          payload.currency = editing.currency
+          payload.original_price = originalPrice
+          payload.fx_rate = editFxRate
+          payload.price = originalPrice * editFxRate
+        } else {
+          payload.currency = 'AUD'
+          payload.price = editing.price ? parseFloat(editing.price) : undefined
+        }
+      }
+      const updated = await apiClient.updateHoldingTransaction(editing.id, payload)
       setTransactions((prev) => prev.map((tx) => tx.id === editing.id ? updated : tx))
       setEditing(null)
     } catch (err) {
@@ -230,14 +283,30 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                 {rows.map((row) => (
                   <tr key={row.key}>
                     <td>{new Date(row.date).toLocaleDateString()}</td>
-                    <td><strong>{row.symbol}</strong></td>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <strong>{row.symbol}</strong>
+                        {row.currency !== 'AUD' && (
+                          <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 4px', borderRadius: 3, background: '#fff3e0', color: '#e65100' }}>
+                            {row.currency}
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td>
                       <span style={{ color: typeColor(row.type), fontWeight: 600 }}>
                         {typeLabel(row.type)}
                       </span>
                     </td>
                     <td>{row.quantity !== null ? row.quantity.toFixed(2) : '—'}</td>
-                    <td>{row.price !== null ? `$${row.price.toFixed(4)}` : '—'}</td>
+                    <td>
+                      {row.price !== null ? `$${row.price.toFixed(4)}` : '—'}
+                      {row.currency !== 'AUD' && row.original_price !== null && (
+                        <span style={{ fontSize: 10, color: '#888', marginLeft: 4 }}>
+                          ({row.currency} {row.original_price.toFixed(2)})
+                        </span>
+                      )}
+                    </td>
                     <td>
                       {row.type === 'dividend' && row.amount !== null
                         ? `$${row.amount.toFixed(4)} per share`
@@ -281,11 +350,40 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                       <label style={{ fontSize: 13, color: '#666' }}>Quantity</label>
                       <input type="number" min="0" step="any" className="config-input" value={editing.quantity} onChange={(e) => setEditing({ ...editing, quantity: e.target.value })} />
                     </div>
-                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      <label style={{ fontSize: 13, color: '#666' }}>Price per share</label>
-                      <input type="number" min="0" step="any" className="config-input" value={editing.price} onChange={(e) => setEditing({ ...editing, price: e.target.value })} />
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <label style={{ fontSize: 13, color: '#666' }}>Currency</label>
+                      <select
+                        className="config-input"
+                        style={{ minWidth: 80 }}
+                        value={editing.currency}
+                        onChange={(e) => setEditing({ ...editing, currency: e.target.value })}
+                      >
+                        {SUPPORTED_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
                     </div>
                   </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: 13, color: '#666' }}>
+                      Price per share ({editing.currency !== 'AUD' ? editing.currency : 'AUD'})
+                    </label>
+                    <input type="number" min="0" step="any" className="config-input" value={editing.price} onChange={(e) => setEditing({ ...editing, price: e.target.value })} />
+                  </div>
+                  {editing.currency !== 'AUD' && (
+                    <div style={{ fontSize: 13, color: '#666', display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {editFxLoading && <span>Fetching {editing.currency}/AUD rate…</span>}
+                      {!editFxLoading && editFxRate && editing.price && !isNaN(parseFloat(editing.price)) && (
+                        <>
+                          <span>Rate: 1 {editing.currency} = {editFxRate.toFixed(4)} AUD{editFxDate ? ` (${editFxDate})` : ''}</span>
+                          <span style={{ fontWeight: 600, color: '#333' }}>
+                            → AUD {(parseFloat(editing.price) * editFxRate).toFixed(4)} per share
+                          </span>
+                        </>
+                      )}
+                      {!editFxLoading && !editFxRate && (
+                        <span style={{ color: '#e53935' }}>Could not fetch {editing.currency}/AUD rate for {editing.date}</span>
+                      )}
+                    </div>
+                  )}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     <label style={{ fontSize: 13, color: '#666' }}>Brokerage</label>
                     <input type="number" min="0" step="0.01" className="config-input" value={editing.brokerage} onChange={(e) => setEditing({ ...editing, brokerage: e.target.value })} />

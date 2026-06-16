@@ -149,6 +149,10 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
     () => soldStocks.reduce((sum, item) => sum + item.realisedPL, 0),
     [soldStocks]
   )
+  const totalRealisedCost = useMemo(
+    () => soldStocks.reduce((sum, item) => sum + item.avgPurchasePrice * item.quantity, 0),
+    [soldStocks]
+  )
 
   return (
     <div className="sold-stocks">
@@ -159,6 +163,11 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
             {soldStocks.length > 0 && (
               <span style={{ fontWeight: 600, fontSize: 15, color: totalRealisedPL >= 0 ? '#4caf50' : '#f44336' }}>
                 Total Realised P/L: {totalRealisedPL >= 0 ? '+' : '−'}${Math.abs(totalRealisedPL).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                {totalRealisedCost > 0 && (
+                  <span style={{ fontWeight: 400, marginLeft: 4 }}>
+                    ({totalRealisedPL >= 0 ? '+' : ''}{((totalRealisedPL / totalRealisedCost) * 100).toFixed(1)}%)
+                  </span>
+                )}
               </span>
             )}
             <button
@@ -208,6 +217,11 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
                     <td>{item.dividends > 0 ? `$${item.dividends.toFixed(2)}` : '—'}</td>
                     <td style={{ color: item.realisedPL >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
                       {item.realisedPL >= 0 ? '+' : '−'}${Math.abs(item.realisedPL).toFixed(2)}
+                      {item.avgPurchasePrice > 0 && (
+                        <span style={{ fontWeight: 400, marginLeft: 4 }}>
+                          ({item.realisedPL >= 0 ? '+' : ''}{((item.realisedPL / (item.avgPurchasePrice * item.quantity)) * 100).toFixed(1)}%)
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}

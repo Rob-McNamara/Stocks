@@ -1360,11 +1360,19 @@ async fn fetch_watchlist_current_prices(db_path: &PathBuf) -> Result<Vec<Current
     for symbol_data in symbols {
         match fetch_current_price(&client, &symbol_data.symbol).await {
             Ok(price_data) => {
+                let change = price_data.regular_market_change.or_else(|| {
+                    price_data.regular_market_price.zip(price_data.chart_previous_close).map(|(p, prev)| p - prev)
+                });
+                let change_percent = price_data.regular_market_change_percent.or_else(|| {
+                    change.zip(price_data.chart_previous_close).and_then(|(ch, prev)| {
+                        if prev != 0.0 { Some(ch / prev * 100.0) } else { None }
+                    })
+                });
                 prices.push(CurrentPrice {
                     symbol: symbol_data.symbol,
                     price: price_data.regular_market_price,
-                    change: price_data.regular_market_change,
-                    change_percent: price_data.regular_market_change_percent,
+                    change,
+                    change_percent,
                     volume: price_data.regular_market_volume,
                     last_updated: last_updated.clone(),
                     error: None,
@@ -1477,6 +1485,8 @@ struct YahooMeta {
     regular_market_change_percent: Option<f64>,
     #[serde(rename = "regularMarketVolume")]
     regular_market_volume: Option<i64>,
+    #[serde(rename = "chartPreviousClose")]
+    chart_previous_close: Option<f64>,
     #[serde(rename = "instrumentType")]
     instrument_type: Option<String>,
     #[serde(rename = "longName")]
@@ -1615,11 +1625,19 @@ async fn fetch_current_prices_for_symbols(
                 if meta.instrument_type.is_some() || meta.long_name.is_some() || meta.currency.is_some() {
                     let _ = store_symbol_info(db_path, symbol, meta.instrument_type.as_deref(), meta.long_name.as_deref(), meta.currency.as_deref());
                 }
+                let change = meta.regular_market_change.or_else(|| {
+                    meta.regular_market_price.zip(meta.chart_previous_close).map(|(p, prev)| p - prev)
+                });
+                let change_percent = meta.regular_market_change_percent.or_else(|| {
+                    change.zip(meta.chart_previous_close).and_then(|(ch, prev)| {
+                        if prev != 0.0 { Some(ch / prev * 100.0) } else { None }
+                    })
+                });
                 prices.push(CurrentPrice {
                     symbol: symbol.clone(),
                     price: meta.regular_market_price,
-                    change: meta.regular_market_change,
-                    change_percent: meta.regular_market_change_percent,
+                    change,
+                    change_percent,
                     volume: meta.regular_market_volume,
                     last_updated: now.clone(),
                     error: None,

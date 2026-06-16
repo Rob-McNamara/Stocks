@@ -82,26 +82,41 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
 
       setHoldingPrices(priceMap)
 
-      // Fetch SMA for holdings and watchlist in parallel
-      const allSymbols = Array.from(new Set([...holdingSymbols, ...watchlistSymbols.map((s) => s.symbol)]))
-      const smaResults = await Promise.all(
-        allSymbols.map(async (sym) => {
+      // Fetch SMA for holdings (150-day) and watchlist (50-day) in parallel
+      const watchlistSymbolNames = watchlistSymbols.map((s) => s.symbol)
+      const holdingOnlySymbols = holdingSymbols.filter((s) => !watchlistSymbolNames.includes(s))
+      const watchlistOnlySymbols = watchlistSymbolNames.filter((s) => !holdingSymbols.includes(s))
+      const sharedSymbols = holdingSymbols.filter((s) => watchlistSymbolNames.includes(s))
+
+      const [holdingResults, watchlistResults, sharedResults] = await Promise.all([
+        Promise.all(holdingOnlySymbols.map(async (sym) => {
           try {
             const history = await apiClient.getPriceHistory(sym, 300)
-            const smaArray = calculateSMA(history, 150)
-            return { symbol: sym, sma: getLatestSMA(smaArray) }
-          } catch {
-            return { symbol: sym, sma: null }
-          }
-        })
-      )
+            return { symbol: sym, sma150: getLatestSMA(calculateSMA(history, 150)), sma50: null as number | null }
+          } catch { return { symbol: sym, sma150: null, sma50: null } }
+        })),
+        Promise.all(watchlistOnlySymbols.map(async (sym) => {
+          try {
+            const history = await apiClient.getPriceHistory(sym, 200)
+            return { symbol: sym, sma150: null as number | null, sma50: getLatestSMA(calculateSMA(history, 50)) }
+          } catch { return { symbol: sym, sma150: null, sma50: null } }
+        })),
+        Promise.all(sharedSymbols.map(async (sym) => {
+          try {
+            const history = await apiClient.getPriceHistory(sym, 300)
+            return { symbol: sym, sma150: getLatestSMA(calculateSMA(history, 150)), sma50: getLatestSMA(calculateSMA(history, 50)) }
+          } catch { return { symbol: sym, sma150: null, sma50: null } }
+        })),
+      ])
 
-      const smaMap: Record<string, number | null> = {}
-      smaResults.forEach(({ symbol, sma }) => { smaMap[symbol] = sma })
-      setHoldingSma(smaMap)
+      const sma150Map: Record<string, number | null> = {}
+      const sma50Map: Record<string, number | null> = {}
+      ;[...holdingResults, ...sharedResults].forEach(({ symbol, sma150 }) => { sma150Map[symbol] = sma150 })
+      ;[...watchlistResults, ...sharedResults].forEach(({ symbol, sma50 }) => { sma50Map[symbol] = sma50 })
+      setHoldingSma(sma150Map)
 
       const watchlistWithSma: SymbolSmaEntry[] = watchlistPricesData.map((p) => {
-        const sma = smaMap[p.symbol] ?? null
+        const sma = sma50Map[p.symbol] ?? null
         const pctDiff = p.price && sma ? ((p.price - sma) / sma) * 100 : null
         return { symbol: p.symbol, price: p.price, sma, pctDiff }
       })
@@ -139,8 +154,10 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
     let soldDividendsTotal = 0
     let soldProceeds = 0
 
-    let equityValue = 0, equityDividends = 0, equityPL = 0
-    let etfValue = 0, etfDividends = 0, etfPL = 0
+    let equityValue = 0, equityDividends = 0, equityPL = 0, equityCost = 0
+    let etfValue = 0, etfDividends = 0, etfPL = 0, etfCost = 0
+    let holdingsCost = 0
+    let soldCost = 0
 
     Object.entries(groupedBySymbol).forEach(([symbol, txs]) => {
       const sorted = [...txs].sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id)
@@ -193,21 +210,27 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
         const symPL = currentValue - remainingCost + symbolDividends
         holdingsPL += symPL
         holdingsDividends += symbolDividends
+        holdingsCost += remainingCost
 
         if (isEtf(symbol)) {
           etfCount++
           etfValue += currentValue
           etfDividends += symbolDividends
           etfPL += symPL
+          etfCost += remainingCost
         } else {
           equityCount++
           equityValue += currentValue
           equityDividends += symbolDividends
           equityPL += symPL
+          equityCost += remainingCost
         }
       }
 
-      if (symbolSoldProceeds > 0) soldCount++
+      if (symbolSoldProceeds > 0) {
+        soldCount++
+        soldCost += symbolSoldProceeds - symbolSoldPL + symbolSoldDividends
+      }
       soldPL += symbolSoldPL
       soldDividendsTotal += symbolSoldDividends
       soldProceeds += symbolSoldProceeds
@@ -216,10 +239,10 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
     return {
       stockCount, equityCount, etfCount, soldCount,
       totalValue, totalPL: holdingsPL + soldPL,
-      holdingsPL, holdingsDividends,
-      soldPL, soldDividendsTotal, soldProceeds,
-      equityValue, equityDividends, equityPL,
-      etfValue, etfDividends, etfPL,
+      holdingsPL, holdingsDividends, holdingsCost,
+      soldPL, soldDividendsTotal, soldProceeds, soldCost,
+      equityValue, equityDividends, equityPL, equityCost,
+      etfValue, etfDividends, etfPL, etfCost,
     }
   }, [transactions, holdingPrices, symbolInfo, appConfig, usdToAud])
 
@@ -283,11 +306,13 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
 
       <div className="dashboard-breakdown">
         {[
-          { label: 'Equities', count: portfolio.equityCount, value: portfolio.equityValue, dividends: portfolio.equityDividends, pl: portfolio.equityPL },
-          { label: 'ETFs', count: portfolio.etfCount, value: portfolio.etfValue, dividends: portfolio.etfDividends, pl: portfolio.etfPL },
-          { label: 'Holdings', count: portfolio.stockCount, value: portfolio.totalValue, dividends: portfolio.holdingsDividends, pl: portfolio.holdingsPL },
-          { label: 'Sold', count: portfolio.soldCount, value: portfolio.soldProceeds, dividends: portfolio.soldDividendsTotal, pl: portfolio.soldPL },
-        ].map(({ label, count, value, dividends, pl }) => (
+          { label: 'Equities', count: portfolio.equityCount, value: portfolio.equityValue, dividends: portfolio.equityDividends, pl: portfolio.equityPL, cost: portfolio.equityCost },
+          { label: 'ETFs', count: portfolio.etfCount, value: portfolio.etfValue, dividends: portfolio.etfDividends, pl: portfolio.etfPL, cost: portfolio.etfCost },
+          { label: 'Holdings', count: portfolio.stockCount, value: portfolio.totalValue, dividends: portfolio.holdingsDividends, pl: portfolio.holdingsPL, cost: portfolio.holdingsCost },
+          { label: 'Sold', count: portfolio.soldCount, value: portfolio.soldProceeds, dividends: portfolio.soldDividendsTotal, pl: portfolio.soldPL, cost: portfolio.soldCost },
+        ].map(({ label, count, value, dividends, pl, cost }) => {
+          const pct = cost > 0 ? (pl / cost) * 100 : null
+          return (
           <div key={label} className="breakdown-card">
             <div className="breakdown-label">{label} ({count})</div>
             {value !== null && (
@@ -304,10 +329,12 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
               <span className="breakdown-key">P/L</span>
               <span className={`breakdown-val ${pl >= 0 ? 'positive' : 'negative'}`}>
                 {pl >= 0 ? '+' : '−'}${Math.abs(pl).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
               </span>
             </div>
           </div>
-        ))}
+          )
+        })}
       </div>
 
       <div className="dashboard-lists">
@@ -343,8 +370,8 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
         </div>
 
         <div className="manager-card">
-          <h2>Best Watchlist — 150SMA</h2>
-          <p className="dashboard-list-desc">Watchlist stocks trading furthest above their 150-day moving average</p>
+          <h2>Best Watchlist — 50SMA</h2>
+          <p className="dashboard-list-desc">Watchlist stocks trading furthest above their 50-day moving average</p>
           {bestWatchlist.length === 0 ? (
             <p className="empty-text">No SMA data available for watchlist.</p>
           ) : (
@@ -353,7 +380,7 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
                 <tr>
                   <th>Symbol</th>
                   <th>Price</th>
-                  <th>150SMA</th>
+                  <th>50SMA</th>
                   <th>Difference</th>
                 </tr>
               </thead>

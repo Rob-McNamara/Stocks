@@ -10,23 +10,47 @@ interface PriceHistoryPoint {
 
 interface PriceChartProps {
   symbol: string
+  currency?: string   // native currency of the stock from Yahoo (e.g. 'USD', 'GBP'); omit or 'AUD' for domestic
   onLoading: (loading: boolean) => void
 }
 
-function buildPath(points: Array<{ x: number; y: number | null }>) {
-  const filtered = points.filter((point) => point.y !== null) as Array<{ x: number; y: number }>
-  if (filtered.length === 0) return ''
-  return filtered.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ')
+const CURRENCY_SYMBOL: Record<string, string> = {
+  AUD: '$', USD: 'US$', GBP: '£', EUR: '€', JPY: '¥', CAD: 'CA$', HKD: 'HK$', SGD: 'S$', NZD: 'NZ$',
 }
 
-export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
+const SMA_PERIODS = [20, 50, 100, 150, 200] as const
+type SmaPeriod = typeof SMA_PERIODS[number]
+
+const SMA_COLORS: Record<SmaPeriod, string> = {
+  20:  '#9c27b0',
+  50:  '#ff9800',
+  100: '#00bcd4',
+  150: '#f44336',
+  200: '#4caf50',
+}
+
+function buildPath(points: Array<{ x: number; y: number | null }>) {
+  const filtered = points.filter((p) => p.y !== null) as Array<{ x: number; y: number }>
+  if (filtered.length === 0) return ''
+  return filtered.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+}
+
+export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading }: PriceChartProps) {
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [smaPeriod, setSmaPeriod] = useState<20 | 50 | 100 | 150 | 200>(150)
+  const [activePeriods, setActivePeriods] = useState<Set<SmaPeriod>>(new Set([50]))
   const [timeframe, setTimeframe] = useState<'12m' | '6m' | '3m' | '1m' | '1w'>('6m')
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
+  const [showInAud, setShowInAud] = useState(false)
+  const [fxRate, setFxRate] = useState<number | null>(null)
+  const [fxLoading, setFxLoading] = useState(false)
+  // detectedCurrency is resolved from symbol info — more reliable than the prop when
+  // the parent's symbolInfo cache hasn't been populated yet for this symbol.
+  const [detectedCurrency, setDetectedCurrency] = useState<string>('AUD')
   const svgRef = useRef<SVGSVGElement>(null)
+
+  const isInternational = detectedCurrency !== 'AUD'
 
   useEffect(() => {
     if (!symbol) { setHistory([]); return }
@@ -47,6 +71,55 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
     loadHistory()
   }, [symbol])
 
+  // Resolve the true currency for this symbol, then fetch its FX rate.
+  // We fetch symbol info ourselves so this works even when the parent's cache is stale.
+  useEffect(() => {
+    if (!symbol) return
+    setShowInAud(false)
+    setFxRate(null)
+    setDetectedCurrency('AUD')
+
+    // Use the prop as an immediate hint if it looks reliable
+    const hint = currencyProp !== 'AUD' ? currencyProp : null
+
+    apiClient.getSymbolInfo().then((symbols) => {
+      const info = symbols.find((s) => s.symbol === symbol)
+      const resolved = (info?.currency?.toUpperCase() ?? hint ?? 'AUD')
+      setDetectedCurrency(resolved)
+
+      if (resolved !== 'AUD') {
+        const today = new Date().toISOString().slice(0, 10)
+        setFxLoading(true)
+        apiClient.getFxRateForDate(resolved, today)
+          .then((result) => { if (result) setFxRate(result.rate) })
+          .finally(() => setFxLoading(false))
+      }
+    }).catch(() => {
+      // If symbol info fetch fails, fall back to the prop
+      const fallback = currencyProp.toUpperCase()
+      setDetectedCurrency(fallback)
+      if (fallback !== 'AUD') {
+        const today = new Date().toISOString().slice(0, 10)
+        setFxLoading(true)
+        apiClient.getFxRateForDate(fallback, today)
+          .then((result) => { if (result) setFxRate(result.rate) })
+          .finally(() => setFxLoading(false))
+      }
+    })
+  }, [symbol, currencyProp])
+
+  const togglePeriod = (period: SmaPeriod) => {
+    setActivePeriods((prev) => {
+      const next = new Set(prev)
+      if (next.has(period)) {
+        if (next.size > 1) next.delete(period) // keep at least one active
+      } else {
+        next.add(period)
+      }
+      return next
+    })
+  }
+
   const trimmedHistory = useMemo(() => {
     if (history.length === 0) return history
     const cutoff = new Date()
@@ -60,16 +133,27 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
     return filtered.length > 0 ? filtered : history.slice(-5)
   }, [history, timeframe])
 
-  const sma = useMemo(() => calculateSMA(history, smaPeriod), [history, smaPeriod])
+  // Compute all SMA series upfront (cheap — reused across renders)
+  const allSmas = useMemo(() => {
+    const result = {} as Record<SmaPeriod, (number | null)[]>
+    for (const p of SMA_PERIODS) {
+      result[p] = calculateSMA(history, p)
+    }
+    return result
+  }, [history])
+
+  // Multiplier converts native prices to AUD when toggled on
+  const fxMultiplier = showInAud && fxRate ? fxRate : 1
+  const displayCurrency = showInAud ? 'AUD' : detectedCurrency
+  const currSym = CURRENCY_SYMBOL[displayCurrency] ?? displayCurrency
 
   const priceValues = trimmedHistory.map((item) => item.close).filter((v): v is number => v !== null)
-  const latestPrice = priceValues[priceValues.length - 1]
-  const latestSma = sma[history.length - 1]
+  const latestPrice = priceValues.length > 0 ? priceValues[priceValues.length - 1] * fxMultiplier : null
 
   const chartData = useMemo(() => {
     const width = 1040
     const height = 260
-    const left = 72   // wider left margin for Y-axis labels
+    const left = 72
     const right = 20
     const top = 20
     const bottom = 20
@@ -77,7 +161,7 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
     const plotHeight = height - top - bottom
 
     const closeValues = trimmedHistory.map((item) => item.close)
-    const validValues = closeValues.filter((val): val is number => val !== null)
+    const validValues = closeValues.filter((val): val is number => val !== null).map((v) => v * fxMultiplier)
     const rawMin = Math.min(...validValues)
     const rawMax = Math.max(...validValues)
     const padding = (rawMax - rawMin) * 0.05 || 1
@@ -89,17 +173,21 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
 
     const points = trimmedHistory.map((item, index) => ({
       x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
-      y: item.close !== null ? toY(item.close) : null,
+      y: item.close !== null ? toY(item.close * fxMultiplier) : null,
     }))
 
-    const smaPoints = trimmedHistory.map((_, index) => {
-      const globalIndex = history.length - trimmedHistory.length + index
-      const value = sma[globalIndex]
-      return {
-        x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
-        y: value !== null ? toY(value) : null,
-      }
-    })
+    const smaLines = SMA_PERIODS.map((period) => ({
+      period,
+      color: SMA_COLORS[period],
+      points: trimmedHistory.map((_, index) => {
+        const globalIndex = history.length - trimmedHistory.length + index
+        const value = allSmas[period][globalIndex]
+        return {
+          x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
+          y: value !== null ? toY(value * fxMultiplier) : null,
+        }
+      }),
+    }))
 
     const volumeValues = trimmedHistory.map((item) => item.volume ?? 0)
     const maxVolume = Math.max(...volumeValues, 1)
@@ -122,11 +210,10 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
       return { x: x - barWidth / 2, y, width: barWidth, height: barHeight, color }
     })
 
-    // Y-axis gridlines and labels (5 levels)
     const yLabelCount = 5
     const yLabels = Array.from({ length: yLabelCount }, (_, i) => {
       const value = minValue + (priceRange * i) / (yLabelCount - 1)
-      return { y: toY(value), label: `$${value.toFixed(2)}` }
+      return { y: toY(value), label: `${currSym}${value.toFixed(2)}` }
     })
 
     const axisY = top + plotHeight
@@ -149,13 +236,12 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
 
     return {
       width: 1100, height: volumeTop + volumeHeight,
-      points, smaPoints, volumeBars, yLabels, xLabels,
+      points, smaLines, volumeBars, yLabels, xLabels,
       left, right, top, bottom, plotWidth, plotHeight,
       pricePlotHeight: plotHeight, axisY, labelY,
     }
-  }, [trimmedHistory, history.length, sma])
+  }, [trimmedHistory, history.length, allSmas, fxMultiplier, currSym])
 
-  // Convert SVG mouse position to nearest data index
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current
     if (!svg || trimmedHistory.length === 0) return
@@ -166,41 +252,57 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
     setHoverIndex(Math.max(0, Math.min(trimmedHistory.length - 1, idx)))
   }
 
-  // Tooltip data for hovered point
   const hoverData = useMemo(() => {
     if (hoverIndex === null) return null
     const item = trimmedHistory[hoverIndex]
     if (!item) return null
     const globalIndex = history.length - trimmedHistory.length + hoverIndex
-    const smaValue = sma[globalIndex] ?? null
     const x = chartData.points[hoverIndex]?.x ?? 0
     const priceY = chartData.points[hoverIndex]?.y ?? null
-    const smaY = chartData.smaPoints[hoverIndex]?.y ?? null
-    return { date: item.date, price: item.close, smaValue, x, priceY, smaY }
-  }, [hoverIndex, trimmedHistory, history.length, sma, chartData])
+    const smaValues = SMA_PERIODS.filter((p) => activePeriods.has(p)).map((p) => {
+      const raw = allSmas[p][globalIndex] ?? null
+      return {
+        period: p,
+        color: SMA_COLORS[p],
+        value: raw !== null ? raw * fxMultiplier : null,
+        y: chartData.smaLines.find((l) => l.period === p)?.points[hoverIndex]?.y ?? null,
+      }
+    })
+    const displayPrice = item.close !== null ? item.close * fxMultiplier : null
+    return { date: item.date, price: displayPrice, x, priceY, smaValues }
+  }, [hoverIndex, trimmedHistory, history.length, allSmas, chartData, activePeriods, fxMultiplier])
 
   if (!symbol) return <p className="chart-message">Select a watchlist symbol to display the Simple Moving Average chart.</p>
   if (loading) return <p className="chart-message">Loading chart for {symbol}...</p>
   if (error) return <div className="alert alert-error">{error}</div>
   if (trimmedHistory.length === 0) return <p className="chart-message">No historical price data available for {symbol}.</p>
 
-  // Tooltip box position — keep it within the chart
-  const tooltipWidth = 160
+  const tooltipWidth = 170
   const tooltipX = hoverData
     ? hoverData.x + 10 + tooltipWidth > chartData.width - chartData.right
       ? hoverData.x - tooltipWidth - 10
       : hoverData.x + 10
     : 0
+  const activeSmaValues = hoverData?.smaValues ?? []
+  const tooltipHeight = 38 + (hoverData?.price !== null ? 18 : 0) + activeSmaValues.length * 18 + 4
+
+  const activePeriodsArray = Array.from(activePeriods).sort((a, b) => a - b)
 
   return (
     <div className="price-chart-card">
       <div className="chart-summary">
         <div>
           <span className="chart-symbol">{symbol}</span>
-          <span className="chart-value">{latestPrice ? `$${latestPrice.toFixed(2)}` : 'Price unavailable'}</span>
+          <span className="chart-value">{latestPrice !== null ? `${currSym}${latestPrice.toFixed(2)}` : 'Price unavailable'}</span>
+          <span style={{ fontSize: 12, marginLeft: 8, color: '#888' }}>
+            {isInternational
+              ? showInAud
+                ? `AUD${fxRate ? ` (1 ${detectedCurrency} = ${fxRate.toFixed(4)} AUD)` : ''}`
+                : detectedCurrency
+              : 'AUD'}
+          </span>
         </div>
         <div>
-          <span className="chart-detail">{smaPeriod}-day SMA: {latestSma ? `$${latestSma.toFixed(2)}` : 'N/A'}</span>
           <span className="chart-detail">Last: {trimmedHistory[trimmedHistory.length - 1]?.date}</span>
           <div className="sma-selector">
             {(['1w', '1m', '3m', '6m', '12m'] as const).map((tf) => (
@@ -209,11 +311,35 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
               </button>
             ))}
             <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
-            {([20, 50, 100, 150, 200] as const).map((p) => (
-              <button key={p} className={`sma-button ${smaPeriod === p ? 'active' : ''}`} onClick={() => setSmaPeriod(p)}>
+            {SMA_PERIODS.map((p) => (
+              <button
+                key={p}
+                className={`sma-button ${activePeriods.has(p) ? 'active' : ''}`}
+                style={activePeriods.has(p) ? { borderColor: SMA_COLORS[p], color: SMA_COLORS[p] } : {}}
+                onClick={() => togglePeriod(p)}
+                title={activePeriods.has(p) ? `Hide SMA ${p}` : `Show SMA ${p}`}
+              >
                 SMA {p}
               </button>
             ))}
+            {isInternational && (
+              <>
+                <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
+                <button
+                  className={`sma-button ${showInAud ? 'active' : ''}`}
+                  onClick={() => setShowInAud((v) => !v)}
+                  disabled={fxLoading || (!fxRate && !showInAud)}
+                  title={
+                    fxLoading ? 'Fetching exchange rate…'
+                    : !fxRate ? 'Exchange rate unavailable'
+                    : showInAud ? `Switch to ${detectedCurrency}`
+                    : 'Switch to AUD'
+                  }
+                >
+                  {fxLoading ? '…' : showInAud ? 'AUD' : detectedCurrency}
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -228,7 +354,6 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
         >
           <rect x="0" y="0" width={chartData.width} height={chartData.height} fill="#ffffff" rx="18" />
 
-          {/* Y-axis gridlines and labels */}
           {chartData.yLabels.map(({ y, label }) => (
             <g key={label}>
               <line x1={chartData.left} y1={y} x2={chartData.width - chartData.right} y2={y} stroke="#e8edf5" strokeWidth="1" strokeDasharray="4 3" />
@@ -236,11 +361,9 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
             </g>
           ))}
 
-          {/* Axes */}
           <line x1={chartData.left} y1={chartData.top} x2={chartData.left} y2={chartData.top + chartData.pricePlotHeight} stroke="#e1e7f1" strokeWidth="1" />
           <line x1={chartData.left} y1={chartData.top + chartData.pricePlotHeight} x2={chartData.width - chartData.right} y2={chartData.top + chartData.pricePlotHeight} stroke="#e1e7f1" strokeWidth="1" />
 
-          {/* X-axis labels */}
           {chartData.xLabels.map(({ x, label }) => (
             <g key={label}>
               <line x1={x} y1={chartData.axisY} x2={x} y2={chartData.axisY + 5} stroke="#aaa" strokeWidth="1" />
@@ -248,9 +371,23 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
             </g>
           ))}
 
-          {/* Price and SMA lines */}
+          {/* SMA lines — rendered behind price line */}
+          {chartData.smaLines
+            .filter((line) => activePeriods.has(line.period as SmaPeriod))
+            .map((line) => (
+              <path
+                key={line.period}
+                d={buildPath(line.points)}
+                fill="none"
+                stroke={line.color}
+                strokeWidth="2"
+                strokeDasharray="8 6"
+                opacity="0.9"
+              />
+            ))}
+
+          {/* Price line */}
           <path d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
-          <path d={buildPath(chartData.smaPoints)} fill="none" stroke="#ff9800" strokeWidth="2" strokeDasharray="8 6" />
 
           {/* Volume bars */}
           {chartData.volumeBars.map((bar, index) => (
@@ -260,32 +397,32 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
           {/* Crosshair and tooltip */}
           {hoverData && (
             <g>
-              {/* Vertical crosshair */}
               <line
                 x1={hoverData.x} y1={chartData.top}
                 x2={hoverData.x} y2={chartData.top + chartData.pricePlotHeight}
                 stroke="#aaa" strokeWidth="1" strokeDasharray="4 3"
               />
-              {/* Dot on price line */}
               {hoverData.priceY !== null && (
                 <circle cx={hoverData.x} cy={hoverData.priceY} r="4" fill="#2f5ce4" stroke="#fff" strokeWidth="1.5" />
               )}
-              {/* Dot on SMA line */}
-              {hoverData.smaY !== null && (
-                <circle cx={hoverData.x} cy={hoverData.smaY} r="4" fill="#ff9800" stroke="#fff" strokeWidth="1.5" />
+              {hoverData.smaValues.map(({ period, color, y }) =>
+                y !== null ? (
+                  <circle key={period} cx={hoverData.x} cy={y} r="4" fill={color} stroke="#fff" strokeWidth="1.5" />
+                ) : null
               )}
-              {/* Tooltip box */}
-              <rect x={tooltipX} y={chartData.top + 4} width={tooltipWidth} height={hoverData.smaValue !== null ? 68 : 50} rx="6" fill="#1e2a3a" opacity="0.92" />
+              <rect x={tooltipX} y={chartData.top + 4} width={tooltipWidth} height={tooltipHeight} rx="6" fill="#1e2a3a" opacity="0.92" />
               <text x={tooltipX + 10} y={chartData.top + 20} fontSize="11" fill="#aac" fontFamily="inherit">{hoverData.date}</text>
               {hoverData.price !== null && (
                 <text x={tooltipX + 10} y={chartData.top + 38} fontSize="13" fill="#fff" fontFamily="inherit" fontWeight="600">
-                  Price: ${hoverData.price.toFixed(2)}
+                  Price: {currSym}{hoverData.price.toFixed(2)}
                 </text>
               )}
-              {hoverData.smaValue !== null && (
-                <text x={tooltipX + 10} y={chartData.top + 58} fontSize="12" fill="#ff9800" fontFamily="inherit">
-                  SMA {smaPeriod}: ${hoverData.smaValue.toFixed(2)}
-                </text>
+              {hoverData.smaValues.map(({ period, color, value }, i) =>
+                value !== null ? (
+                  <text key={period} x={tooltipX + 10} y={chartData.top + 56 + i * 18} fontSize="12" fill={color} fontFamily="inherit">
+                    SMA {period}: {currSym}{value.toFixed(2)}
+                  </text>
+                ) : null
               )}
             </g>
           )}
@@ -293,7 +430,12 @@ export default function PriceChart({ symbol, onLoading }: PriceChartProps) {
       </div>
       <div className="chart-legend">
         <span className="legend-item"><span className="legend-swatch price-line" /> Closing Price</span>
-        <span className="legend-item"><span className="legend-swatch sma-line" /> {smaPeriod}-day SMA</span>
+        {activePeriodsArray.map((p) => (
+          <span key={p} className="legend-item">
+            <span className="legend-swatch" style={{ background: SMA_COLORS[p as SmaPeriod], opacity: 0.9 }} />
+            {p}-day SMA
+          </span>
+        ))}
         <span className="legend-item"><span className="legend-swatch" style={{ background: '#4caf50' }} /> Volume Up</span>
         <span className="legend-item"><span className="legend-swatch" style={{ background: '#f44336' }} /> Volume Down</span>
       </div>

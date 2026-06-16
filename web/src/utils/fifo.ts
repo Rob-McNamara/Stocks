@@ -4,10 +4,17 @@ export interface Transaction {
   transaction_type: 'purchase' | 'sale' | 'dividend'
   date: string
   quantity: number | null
+  /** Always stored in AUD, even for international stocks */
   price: number | null
   amount: number | null
   brokerage: number | null
   dividends_total: number
+  /** ISO currency code of the stock's native currency, e.g. 'USD'. Defaults to 'AUD'. */
+  currency?: string
+  /** Price in the stock's native currency before FX conversion */
+  original_price?: number | null
+  /** Exchange rate used at transaction time (native → AUD) */
+  fx_rate?: number | null
 }
 
 export interface FifoLot {
@@ -145,4 +152,48 @@ export function calcPortfolioPL(
   }
 
   return { holdingsPL, soldPL, totalPL: holdingsPL + soldPL, totalValue, stockCount }
+}
+
+/**
+ * For each purchase transaction, compute how many of its shares remain unsold
+ * after FIFO matching against all subsequent sales.
+ *
+ * Returns a map of { [transaction.id]: remainingQuantity }.
+ * Only purchase transactions appear as keys. A value of 0 means fully consumed by sales.
+ *
+ * This drives the "Active Holdings" table — a transaction is shown if its remaining > 0.
+ * International stocks (currency !== 'AUD') are handled identically; `price` is always AUD.
+ */
+export function calcRemainingByLot(transactions: Transaction[]): Record<number, number> {
+  const bySymbol: Record<string, Transaction[]> = {}
+  for (const tx of transactions) {
+    if (!bySymbol[tx.symbol]) bySymbol[tx.symbol] = []
+    bySymbol[tx.symbol].push(tx)
+  }
+
+  const result: Record<number, number> = {}
+
+  for (const group of Object.values(bySymbol)) {
+    const sorted = sortTransactions(group)
+    const lots: Array<{ id: number; quantity: number }> = []
+
+    for (const tx of sorted) {
+      if (tx.transaction_type === 'purchase' && tx.quantity != null) {
+        lots.push({ id: tx.id, quantity: tx.quantity })
+        result[tx.id] = tx.quantity
+      } else if (tx.transaction_type === 'sale' && tx.quantity != null) {
+        let remaining = tx.quantity
+        while (remaining > 0 && lots.length > 0) {
+          const lot = lots[0]
+          const used = Math.min(remaining, lot.quantity)
+          lot.quantity -= used
+          result[lot.id] = lot.quantity
+          remaining -= used
+          if (lot.quantity <= 0) lots.shift()
+        }
+      }
+    }
+  }
+
+  return result
 }
