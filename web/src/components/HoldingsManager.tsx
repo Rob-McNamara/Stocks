@@ -26,6 +26,7 @@ const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', '
 export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [currentPrices, setCurrentPrices] = useState<Record<string, number | null>>({})
+  const [currentPriceDates, setCurrentPriceDates] = useState<Record<string, string | null>>({})
   const [priceChanges, setPriceChanges] = useState<Record<string, { change: number | null; change_percent: number | null }>>({})
   const [manualPriceSymbols, setManualPriceSymbols] = useState<Set<string>>(new Set())
   const [smaPrices, setSmaPrices] = useState<Record<string, number | null>>({})
@@ -52,6 +53,17 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   useEffect(() => {
     loadHoldings()
   }, [configVersion])
+
+  // Auto-detect currency from symbolInfo when adding a new transaction
+  useEffect(() => {
+    if (editingId !== null) return // don't override currency when editing
+    const detected = symbolInfo[symbol]?.currency?.toUpperCase()
+    if (detected && detected !== 'AUD' && SUPPORTED_CURRENCIES.includes(detected)) {
+      setCurrency(detected)
+    } else if (detected === 'AUD') {
+      setCurrency('AUD')
+    }
+  }, [symbol, symbolInfo])
 
   useEffect(() => {
     if (currency === 'AUD') {
@@ -102,9 +114,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
           if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
           setAppConfig(config)
           const priceMap: Record<string, number | null> = {}
+          const priceDateMap: Record<string, string | null> = {}
           const changeMap: Record<string, { change: number | null; change_percent: number | null }> = {}
           prices.forEach((p) => {
             priceMap[p.symbol] = p.price
+            priceDateMap[p.symbol] = p.price_date ?? null
             changeMap[p.symbol] = { change: p.change, change_percent: p.change_percent }
           })
           // Fill in manual prices for symbols with no auto-fetched price
@@ -119,6 +133,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
             }
           })
           setCurrentPrices(priceMap)
+          setCurrentPriceDates(priceDateMap)
           setPriceChanges(changeMap)
           setManualPriceSymbols(manualSymbols)
           
@@ -178,6 +193,22 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       if (Number.isNaN(parsedPrice) || parsedPrice <= 0) {
         setError('Price must be a positive number')
         return
+      }
+
+      if (transactionType === 'sale' && editingId === null) {
+        const sym = symbol.trim().toUpperCase()
+        const netShares: Record<string, number> = {}
+        transactions.forEach((tx) => {
+          if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
+          if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
+          if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
+        })
+        const held = netShares[sym] ?? 0
+        if (held <= 0) {
+          if (!confirm(`You don't currently hold any ${sym}. Record this sale anyway?`)) return
+        } else if (parsedQuantity > held) {
+          if (!confirm(`You're selling ${parsedQuantity} shares but only hold ${held.toFixed(2)} ${sym}. Record anyway?`)) return
+        }
       }
 
       payload.quantity = parsedQuantity
@@ -329,9 +360,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       const symbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
       const prices = await apiClient.getCurrentPrices(symbols)
       const priceMap: Record<string, number | null> = {}
+      const priceDateMap2: Record<string, string | null> = {}
       const changeMap: Record<string, { change: number | null; change_percent: number | null }> = {}
       prices.forEach((p) => {
         priceMap[p.symbol] = p.price
+        priceDateMap2[p.symbol] = p.price_date ?? null
         changeMap[p.symbol] = { change: p.change, change_percent: p.change_percent }
       })
       // Apply manual price fallback for symbols that failed to fetch
@@ -346,6 +379,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         }
       })
       setCurrentPrices(priceMap)
+      setCurrentPriceDates(priceDateMap2)
       setPriceChanges(changeMap)
       setManualPriceSymbols(newManualSymbols)
       
@@ -806,6 +840,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
               const getInstrumentType = (symbol: string) =>
                 appConfig[`instrument_type_${symbol}`] || symbolInfo[symbol]?.instrument_type || ''
               const isInternational = (symbol: string) => {
+                // If the user purchased in AUD, treat as domestic regardless of Yahoo's currency
+                const purchases = transactions.filter((tx) => tx.symbol === symbol && tx.transaction_type === 'purchase')
+                if (purchases.length > 0 && purchases.every((tx) => tx.currency === 'AUD')) return false
                 const cur = symbolInfo[symbol]?.currency?.toUpperCase()
                 return !!cur && cur !== 'AUD'
               }
@@ -816,7 +853,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
 
               const renderCard = (item: typeof summary[0]) => {
                 const symCurrency = symbolInfo[item.symbol]?.currency?.toUpperCase()
-                const isForeign = !!symCurrency && symCurrency !== 'AUD'
+                const isForeign = isInternational(item.symbol)
                 const isSelected = selectedChartSymbol === item.symbol
                 return (
                 <div
@@ -843,6 +880,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   )}
                   <div style={{ color: manualPriceSymbols.has(item.symbol) ? '#2196f3' : undefined }}>
                     {item.shares % 1 === 0 ? item.shares.toFixed(0) : item.shares.toFixed(2)}@{item.currentPrice ? `$${item.currentPrice.toFixed(2)}` : '—'}
+                    {isForeign && currentPrices[item.symbol] != null && (
+                      <span style={{ fontSize: 11, color: '#888', marginLeft: 6 }}>
+                        ({symCurrency} {currentPrices[item.symbol]!.toFixed(2)})
+                      </span>
+                    )}
                     {manualPriceSymbols.has(item.symbol) && <span style={{ fontSize: 11, marginLeft: 4 }}>(manual)</span>}
                   </div>
                   {(() => {
@@ -934,6 +976,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   symbol={selectedChartSymbol}
                   currency={symbolInfo[selectedChartSymbol]?.currency?.toUpperCase() ?? 'AUD'}
                   onLoading={onLoading}
+                  purchasePrice={summary.find((s) => s.symbol === selectedChartSymbol)?.avgCost ?? null}
+                  currentPrice={currentPrices[selectedChartSymbol] ?? null}
+                  currentPriceDate={currentPriceDates[selectedChartSymbol] ?? null}
                 />
               </div>
             )}

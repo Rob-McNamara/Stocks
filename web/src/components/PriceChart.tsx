@@ -12,6 +12,10 @@ interface PriceChartProps {
   symbol: string
   currency?: string   // native currency of the stock from Yahoo (e.g. 'USD', 'GBP'); omit or 'AUD' for domestic
   onLoading: (loading: boolean) => void
+  currentPrice?: number | null   // live price to inject if newer than history
+  currentVolume?: number | null  // live volume to use alongside injected price
+  currentPriceDate?: string | null  // actual trading date for the live price (may differ from today)
+  purchasePrice?: number | null  // avg cost per share (AUD) — shown in Holdings chart header
 }
 
 const CURRENCY_SYMBOL: Record<string, string> = {
@@ -32,10 +36,12 @@ const SMA_COLORS: Record<SmaPeriod, string> = {
 function buildPath(points: Array<{ x: number; y: number | null }>) {
   const filtered = points.filter((p) => p.y !== null) as Array<{ x: number; y: number }>
   if (filtered.length === 0) return ''
+  // Single point: draw a tiny horizontal stub so the point is visible
+  if (filtered.length === 1) return `M ${filtered[0].x - 4} ${filtered[0].y} L ${filtered[0].x + 4} ${filtered[0].y}`
   return filtered.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
 }
 
-export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading }: PriceChartProps) {
+export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading, currentPrice, currentVolume, currentPriceDate, purchasePrice }: PriceChartProps) {
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -120,8 +126,29 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     })
   }
 
+  // Always use the live current price for today's data point — it's more up-to-date than
+  // whatever daily close Yahoo or the daemon stored (which can be a stale intraday snapshot).
+  const effectiveHistory = useMemo(() => {
+    if (!currentPrice) return history
+    // Use the actual trading date from the price response; fall back to today
+    const priceDate = currentPriceDate ?? new Date().toISOString().slice(0, 10)
+    const liveVol = currentVolume ?? null
+    if (history.length === 0) {
+      return [{ date: priceDate, close: currentPrice, volume: liveVol }]
+    }
+    const last = history[history.length - 1]
+    if (priceDate === last.date) {
+      // Replace stored close with live price; prefer live volume over stored
+      return [...history.slice(0, -1), { date: priceDate, close: currentPrice, volume: liveVol ?? last.volume }]
+    }
+    if (priceDate > last.date) {
+      return [...history, { date: priceDate, close: currentPrice, volume: liveVol }]
+    }
+    return history
+  }, [history, currentPrice, currentPriceDate, currentVolume])
+
   const trimmedHistory = useMemo(() => {
-    if (history.length === 0) return history
+    if (effectiveHistory.length === 0) return effectiveHistory
     const cutoff = new Date()
     if (timeframe === '12m') cutoff.setFullYear(cutoff.getFullYear() - 1)
     else if (timeframe === '6m') cutoff.setMonth(cutoff.getMonth() - 6)
@@ -129,18 +156,18 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     else if (timeframe === '1m') cutoff.setMonth(cutoff.getMonth() - 1)
     else cutoff.setDate(cutoff.getDate() - 7)
     const cutoffStr = cutoff.toISOString().slice(0, 10)
-    const filtered = history.filter((item) => item.date >= cutoffStr)
-    return filtered.length > 0 ? filtered : history.slice(-5)
-  }, [history, timeframe])
+    const filtered = effectiveHistory.filter((item) => item.date >= cutoffStr)
+    return filtered.length > 0 ? filtered : effectiveHistory.slice(-5)
+  }, [effectiveHistory, timeframe])
 
   // Compute all SMA series upfront (cheap — reused across renders)
   const allSmas = useMemo(() => {
     const result = {} as Record<SmaPeriod, (number | null)[]>
     for (const p of SMA_PERIODS) {
-      result[p] = calculateSMA(history, p)
+      result[p] = calculateSMA(effectiveHistory, p)
     }
     return result
-  }, [history])
+  }, [effectiveHistory])
 
   // Multiplier converts native prices to AUD when toggled on
   const fxMultiplier = showInAud && fxRate ? fxRate : 1
@@ -180,7 +207,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       period,
       color: SMA_COLORS[period],
       points: trimmedHistory.map((_, index) => {
-        const globalIndex = history.length - trimmedHistory.length + index
+        const globalIndex = effectiveHistory.length - trimmedHistory.length + index
         const value = allSmas[period][globalIndex]
         return {
           x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
@@ -197,7 +224,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
 
     const volumeBars = trimmedHistory.map((item, index) => {
       const x = left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1)
-      const barWidth = Math.max(4, plotWidth / trimmedHistory.length - 2)
+      const barWidth = Math.min(20, Math.max(4, plotWidth / trimmedHistory.length - 2))
       const volume = item.volume ?? 0
       const barHeight = (volume / maxVolume) * volumePlotHeight
       const y = volumeTop + volumePlotHeight - barHeight
@@ -240,7 +267,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       left, right, top, bottom, plotWidth, plotHeight,
       pricePlotHeight: plotHeight, axisY, labelY,
     }
-  }, [trimmedHistory, history.length, allSmas, fxMultiplier, currSym])
+  }, [trimmedHistory, effectiveHistory.length, allSmas, fxMultiplier, currSym])
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current
@@ -256,7 +283,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     if (hoverIndex === null) return null
     const item = trimmedHistory[hoverIndex]
     if (!item) return null
-    const globalIndex = history.length - trimmedHistory.length + hoverIndex
+    const globalIndex = effectiveHistory.length - trimmedHistory.length + hoverIndex
     const x = chartData.points[hoverIndex]?.x ?? 0
     const priceY = chartData.points[hoverIndex]?.y ?? null
     const smaValues = SMA_PERIODS.filter((p) => activePeriods.has(p)).map((p) => {
@@ -270,7 +297,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     })
     const displayPrice = item.close !== null ? item.close * fxMultiplier : null
     return { date: item.date, price: displayPrice, x, priceY, smaValues }
-  }, [hoverIndex, trimmedHistory, history.length, allSmas, chartData, activePeriods, fxMultiplier])
+  }, [hoverIndex, trimmedHistory, effectiveHistory.length, allSmas, chartData, activePeriods, fxMultiplier])
 
   if (!symbol) return <p className="chart-message">Select a watchlist symbol to display the Simple Moving Average chart.</p>
   if (loading) return <p className="chart-message">Loading chart for {symbol}...</p>
@@ -294,6 +321,21 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         <div>
           <span className="chart-symbol">{symbol}</span>
           <span className="chart-value">{latestPrice !== null ? `${currSym}${latestPrice.toFixed(2)}` : 'Price unavailable'}</span>
+          {purchasePrice != null && latestPrice !== null && (() => {
+            // purchasePrice is always in AUD; convert to native currency when chart is in native mode
+            const displayPurchase = (isInternational && !showInAud && fxRate)
+              ? purchasePrice / fxRate
+              : purchasePrice
+            const pl = ((latestPrice - displayPurchase) / displayPurchase) * 100
+            return (
+              <>
+                <span style={{ fontSize: 12, marginLeft: 10, color: '#888' }}>avg cost {currSym}{displayPurchase.toFixed(2)}</span>
+                <span style={{ fontSize: 12, marginLeft: 6, fontWeight: 600, color: pl >= 0 ? '#2e7d32' : '#c62828' }}>
+                  {pl >= 0 ? '+' : ''}{pl.toFixed(1)}%
+                </span>
+              </>
+            )
+          })()}
           <span style={{ fontSize: 12, marginLeft: 8, color: '#888' }}>
             {isInternational
               ? showInAud

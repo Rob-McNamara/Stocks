@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient } from '../services/api'
-import { calculateSMA, getLatestSMA } from '../utils/sma'
+import { calculateSMA, crossoverStats, getLatestSMA } from '../utils/sma'
 
 interface HoldingTransaction {
   id: number
@@ -21,9 +21,11 @@ interface SymbolSmaEntry {
   price: number | null
   sma: number | null
   pctDiff: number | null
+  daysSince50SMA: number | null
+  volumePct50SMA: number | null
 }
 
-export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (loading: boolean) => void; holdingsVersion?: number }) {
+export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatchlist }: { onLoading: (loading: boolean) => void; holdingsVersion?: number; onNavigateToWatchlist?: (symbol: string) => void }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [holdingPrices, setHoldingPrices] = useState<Record<string, number | null>>({})
   const [holdingSma, setHoldingSma] = useState<Record<string, number | null>>({})
@@ -83,7 +85,7 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       setHoldingPrices(priceMap)
 
       // Fetch SMA for holdings (150-day) and watchlist (50-day) in parallel
-      const watchlistSymbolNames = watchlistSymbols.map((s) => s.symbol)
+      const watchlistSymbolNames = Array.from(new Set(watchlistSymbols.map((s) => s.symbol)))
       const holdingOnlySymbols = holdingSymbols.filter((s) => !watchlistSymbolNames.includes(s))
       const watchlistOnlySymbols = watchlistSymbolNames.filter((s) => !holdingSymbols.includes(s))
       const sharedSymbols = holdingSymbols.filter((s) => watchlistSymbolNames.includes(s))
@@ -97,28 +99,51 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
         })),
         Promise.all(watchlistOnlySymbols.map(async (sym) => {
           try {
-            const history = await apiClient.getPriceHistory(sym, 200)
-            return { symbol: sym, sma150: null as number | null, sma50: getLatestSMA(calculateSMA(history, 50)) }
-          } catch { return { symbol: sym, sma150: null, sma50: null } }
+            const history = await apiClient.getPriceHistory(sym, 300)
+            const sma50Array = calculateSMA(history, 50)
+            return { symbol: sym, sma150: null as number | null, sma50: getLatestSMA(sma50Array), history, sma50Array }
+          } catch { return { symbol: sym, sma150: null, sma50: null, history: [], sma50Array: [] } }
         })),
         Promise.all(sharedSymbols.map(async (sym) => {
           try {
             const history = await apiClient.getPriceHistory(sym, 300)
-            return { symbol: sym, sma150: getLatestSMA(calculateSMA(history, 150)), sma50: getLatestSMA(calculateSMA(history, 50)) }
-          } catch { return { symbol: sym, sma150: null, sma50: null } }
+            const sma50Array = calculateSMA(history, 50)
+            return { symbol: sym, sma150: getLatestSMA(calculateSMA(history, 150)), sma50: getLatestSMA(sma50Array), history, sma50Array }
+          } catch { return { symbol: sym, sma150: null, sma50: null, history: [], sma50Array: [] } }
         })),
       ])
 
       const sma150Map: Record<string, number | null> = {}
       const sma50Map: Record<string, number | null> = {}
+      const historyMap: Record<string, { close: number | null; volume: number | null }[]> = {}
+      const sma50ArrayMap: Record<string, Array<number | null>> = {}
       ;[...holdingResults, ...sharedResults].forEach(({ symbol, sma150 }) => { sma150Map[symbol] = sma150 })
-      ;[...watchlistResults, ...sharedResults].forEach(({ symbol, sma50 }) => { sma50Map[symbol] = sma50 })
+      ;[...watchlistResults, ...sharedResults].forEach(({ symbol, sma50, history, sma50Array }) => {
+        sma50Map[symbol] = sma50
+        historyMap[symbol] = history
+        sma50ArrayMap[symbol] = sma50Array
+      })
       setHoldingSma(sma150Map)
 
-      const watchlistWithSma: SymbolSmaEntry[] = watchlistPricesData.map((p) => {
+      // Deduplicate by symbol (a symbol can appear in multiple lists)
+      const uniqueWatchlistPrices = Array.from(
+        watchlistPricesData.reduce((m, p) => { if (!m.has(p.symbol)) m.set(p.symbol, p); return m }, new Map()).values()
+      )
+      const watchlistWithSma: SymbolSmaEntry[] = uniqueWatchlistPrices.map((p) => {
         const sma = sma50Map[p.symbol] ?? null
         const pctDiff = p.price && sma ? ((p.price - sma) / sma) * 100 : null
-        return { symbol: p.symbol, price: p.price, sma, pctDiff }
+        let daysSince50SMA: number | null = null
+        let volumePct50SMA: number | null = null
+        if (p.price !== null && sma !== null && p.price > sma) {
+          const hist = historyMap[p.symbol]
+          const arr = sma50ArrayMap[p.symbol]
+          if (hist?.length && arr?.length) {
+            const stats = crossoverStats(hist, arr, p.volume)
+            daysSince50SMA = stats.days
+            volumePct50SMA = stats.volumePct
+          }
+        }
+        return { symbol: p.symbol, price: p.price, sma, pctDiff, daysSince50SMA, volumePct50SMA }
       })
       setWatchlistEntries(watchlistWithSma)
     } catch (err) {
@@ -271,14 +296,14 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
       })
       .filter((item): item is SymbolSmaEntry & { pctDiff: number } => item.pctDiff !== null)
       .sort((a, b) => a.pctDiff - b.pctDiff)
-      .slice(0, 10)
+      .slice(0, 15)
   }, [transactions, holdingPrices, holdingSma, symbolInfo, usdToAud])
 
   const bestWatchlist = useMemo(() => {
     return [...watchlistEntries]
-      .filter((item): item is SymbolSmaEntry & { pctDiff: number } => item.pctDiff !== null)
-      .sort((a, b) => b.pctDiff - a.pctDiff)
-      .slice(0, 10)
+      .filter((item) => item.daysSince50SMA !== null)
+      .sort((a, b) => (a.daysSince50SMA as number) - (b.daysSince50SMA as number))
+      .slice(0, 15)
   }, [watchlistEntries])
 
   if (loading) return <p className="loading-text">Loading dashboard...</p>
@@ -371,9 +396,9 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
 
         <div className="manager-card">
           <h2>Best Watchlist — 50SMA</h2>
-          <p className="dashboard-list-desc">Watchlist stocks trading furthest above their 50-day moving average</p>
+          <p className="dashboard-list-desc">Watchlist stocks most recently above their 50-day moving average</p>
           {bestWatchlist.length === 0 ? (
-            <p className="empty-text">No SMA data available for watchlist.</p>
+            <p className="empty-text">No stocks currently above their 50SMA.</p>
           ) : (
             <table className="holdings-table compact">
               <thead>
@@ -381,17 +406,30 @@ export default function Dashboard({ onLoading, holdingsVersion }: { onLoading: (
                   <th>Symbol</th>
                   <th>Price</th>
                   <th>50SMA</th>
-                  <th>Difference</th>
+                  <th>Days Above</th>
+                  <th>Vol on Cross</th>
                 </tr>
               </thead>
               <tbody>
                 {bestWatchlist.map((item) => (
                   <tr key={item.symbol}>
-                    <td><strong>{item.symbol}</strong></td>
+                    <td>
+                      {onNavigateToWatchlist ? (
+                        <button
+                          onClick={() => onNavigateToWatchlist(item.symbol)}
+                          style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontWeight: 700, color: '#1565c0', textDecoration: 'underline', fontSize: 'inherit' }}
+                        >
+                          {item.symbol}
+                        </button>
+                      ) : (
+                        <strong>{item.symbol}</strong>
+                      )}
+                    </td>
                     <td>{item.price !== null ? `$${item.price.toFixed(2)}` : '—'}</td>
                     <td>{item.sma !== null ? `$${item.sma.toFixed(2)}` : '—'}</td>
-                    <td style={{ color: (item.pctDiff as number) >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
-                      {(item.pctDiff as number) >= 0 ? '+' : ''}{(item.pctDiff as number).toFixed(2)}%
+                    <td style={{ color: '#2e7d32', fontWeight: 600 }}>{item.daysSince50SMA}d</td>
+                    <td style={{ color: item.volumePct50SMA === null ? undefined : item.volumePct50SMA >= 0 ? '#2e7d32' : '#c62828', fontWeight: 600 }}>
+                      {item.volumePct50SMA !== null ? `${item.volumePct50SMA >= 0 ? '+' : ''}${item.volumePct50SMA.toFixed(0)}%` : '—'}
                     </td>
                   </tr>
                 ))}

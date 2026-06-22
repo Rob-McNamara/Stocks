@@ -46,6 +46,9 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [editingPrices, setEditingPrices] = useState<Record<string, string>>({})
   const [typeSymbol, setTypeSymbol] = useState('')
   const [typeValue, setTypeValue] = useState('ETF')
+  const [customFieldDefs, setCustomFieldDefs] = useState<{ key: string; label: string; type: 'text' | 'number' | 'date' }[]>([])
+  const [newFieldLabel, setNewFieldLabel] = useState('')
+  const [newFieldType, setNewFieldType] = useState<'text' | 'number' | 'date'>('text')
 
   useEffect(() => {
     loadConfig()
@@ -57,6 +60,9 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       setError(null)
       const data = await apiClient.getConfig()
       setConfig(data)
+      try {
+        setCustomFieldDefs(JSON.parse(data['watchlist_custom_fields'] ?? '[]'))
+      } catch { setCustomFieldDefs([]) }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load configuration')
     } finally {
@@ -430,6 +436,85 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                 disabled={loading || !typeSymbol}
               >
                 Set Type
+              </button>
+            </div>
+          </div>
+
+          <div className="config-card">
+            <h2>Watchlist Custom Fields</h2>
+            <p style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
+              Define extra fields to record against each watchlist symbol. These appear automatically when adding or editing a symbol.
+            </p>
+            {customFieldDefs.length > 0 && (
+              <table className="holdings-table" style={{ marginBottom: 16 }}>
+                <thead>
+                  <tr>
+                    <th>Label</th>
+                    <th>Type</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {customFieldDefs.map((def, i) => (
+                    <tr key={def.key}>
+                      <td>{def.label}</td>
+                      <td style={{ color: '#888' }}>{def.type}</td>
+                      <td>
+                        <button
+                          className="btn btn-danger btn-small"
+                          onClick={async () => {
+                            const next = customFieldDefs.filter((_, j) => j !== i)
+                            setCustomFieldDefs(next)
+                            await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
+                            onConfigChanged?.()
+                          }}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Field label</label>
+                <input
+                  type="text"
+                  value={newFieldLabel}
+                  onChange={(e) => setNewFieldLabel(e.target.value)}
+                  placeholder="e.g. Target Price"
+                  className="config-input"
+                  style={{ width: 180 }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Type</label>
+                <select
+                  value={newFieldType}
+                  onChange={(e) => setNewFieldType(e.target.value as 'text' | 'number' | 'date')}
+                  className="config-input"
+                >
+                  <option value="text">Text</option>
+                  <option value="number">Number</option>
+                  <option value="date">Date</option>
+                </select>
+              </div>
+              <button
+                className="btn btn-primary"
+                disabled={!newFieldLabel.trim()}
+                onClick={async () => {
+                  const key = newFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+                  if (!key || customFieldDefs.some((d) => d.key === key)) return
+                  const next = [...customFieldDefs, { key, label: newFieldLabel.trim(), type: newFieldType }]
+                  setCustomFieldDefs(next)
+                  setNewFieldLabel('')
+                  await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
+                  onConfigChanged?.()
+                }}
+              >
+                Add Field
               </button>
             </div>
           </div>

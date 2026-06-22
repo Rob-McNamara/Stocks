@@ -16,6 +16,12 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [holdingsVersion, setHoldingsVersion] = useState(0)
   const [configVersion, setConfigVersion] = useState(0)
+  const [watchlistFocusSymbol, setWatchlistFocusSymbol] = useState<string | null>(null)
+
+  const handleNavigateToWatchlist = (symbol: string) => {
+    setWatchlistFocusSymbol(symbol)
+    setActiveTab('watchlist')
+  }
 
   useEffect(() => {
     // Test connection to backend on mount
@@ -100,10 +106,10 @@ function App() {
 
       <main className="app-content">
         <div style={{ display: activeTab === 'dashboard' ? 'block' : 'none' }}>
-          <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} />
+          <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} onNavigateToWatchlist={handleNavigateToWatchlist} />
         </div>
         <div style={{ display: activeTab === 'watchlist' ? 'block' : 'none' }}>
-          <WatchlistManager onLoading={setLoading} />
+          <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} />
         </div>
         <div style={{ display: activeTab === 'holdings' ? 'block' : 'none' }}>
           <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} />

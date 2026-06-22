@@ -182,6 +182,20 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     })
   }
 
+  const handleDelete = async (id: number) => {
+    if (!confirm('Delete this transaction?')) return
+    try {
+      setSaving(true)
+      await apiClient.removeHoldingTransaction(id)
+      setTransactions((prev) => prev.filter((tx) => tx.id !== id))
+      if (editing?.id === id) setEditing(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete transaction')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const handleSave = async () => {
     if (!editing) return
     try {
@@ -316,14 +330,24 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                     </td>
                     <td>{row.brokerage !== null ? `$${row.brokerage.toFixed(2)}` : '—'}</td>
                     <td style={{ color: '#888' }}>{row.notes || '—'}</td>
-                    <td>
+                    <td style={{ display: 'flex', gap: 6 }}>
                       {row.id !== null && (
-                        <button
-                          className="btn btn-secondary btn-small"
-                          onClick={() => startEdit(row)}
-                        >
-                          Edit
-                        </button>
+                        <>
+                          <button
+                            className="btn btn-secondary btn-small"
+                            onClick={() => startEdit(row)}
+                            disabled={saving}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            className="btn btn-danger btn-small"
+                            onClick={() => handleDelete(row.id!)}
+                            disabled={saving}
+                          >
+                            Delete
+                          </button>
+                        </>
                       )}
                     </td>
                   </tr>
