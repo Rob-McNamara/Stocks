@@ -3,7 +3,10 @@ const API_BASE_URL = 'http://localhost:3001/api'
 interface WatchlistSymbol {
   id: number
   symbol: string
+  list_name: string
   added_at: string
+  notes: string | null
+  custom_fields: Record<string, string>
 }
 
 interface AppConfig {
@@ -18,6 +21,7 @@ interface CurrentPrice {
   change_percent: number | null
   volume: number | null
   last_updated: string
+  price_date?: string | null
   error?: string
 }
 
@@ -52,6 +56,7 @@ interface HoldingTransaction {
   currency: string
   original_price: number | null
   fx_rate: number | null
+  custom_fields: Record<string, string>
 }
 
 interface HoldingTransactionPayload {
@@ -66,25 +71,43 @@ interface HoldingTransactionPayload {
   currency?: string
   original_price?: number
   fx_rate?: number
+  custom_fields?: Record<string, string>
 }
 
 export const apiClient = {
-  async getWatchlistSymbols(): Promise<WatchlistSymbol[]> {
-    const response = await fetch(`${API_BASE_URL}/watchlist`)
+  async getWatchlistLists(): Promise<string[]> {
+    const response = await fetch(`${API_BASE_URL}/watchlist/lists`)
+    if (!response.ok) throw new Error('Failed to fetch watchlist lists')
+    return response.json()
+  },
+
+  async getWatchlistSymbols(list?: string): Promise<WatchlistSymbol[]> {
+    const url = list ? `${API_BASE_URL}/watchlist?list=${encodeURIComponent(list)}` : `${API_BASE_URL}/watchlist`
+    const response = await fetch(url)
     if (!response.ok) throw new Error('Failed to fetch watchlist symbols')
     return response.json()
   },
 
-  async addWatchlistSymbol(symbol: string): Promise<WatchlistSymbol> {
+  async addWatchlistSymbol(symbol: string, listName?: string, notes?: string, customFields?: Record<string, string>): Promise<WatchlistSymbol> {
     const response = await fetch(`${API_BASE_URL}/watchlist`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol: symbol.toUpperCase() })
+      body: JSON.stringify({ symbol: symbol.toUpperCase(), list_name: listName ?? 'Default', notes: notes || null, custom_fields: customFields ?? {} })
     })
     if (!response.ok) {
-      const error = await response.json()
-      throw new Error(error.error || 'Failed to add symbol')
+      const error = await response.text()
+      throw new Error(error || 'Failed to add symbol')
     }
+    return response.json()
+  },
+
+  async updateWatchlistSymbol(id: number, notes: string | null, customFields?: Record<string, string>): Promise<WatchlistSymbol> {
+    const response = await fetch(`${API_BASE_URL}/watchlist/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes, custom_fields: customFields ?? {} })
+    })
+    if (!response.ok) throw new Error('Failed to update symbol')
     return response.json()
   },
 
@@ -95,9 +118,17 @@ export const apiClient = {
     if (!response.ok) throw new Error('Failed to remove symbol')
   },
 
-  async getWatchlistPrices(): Promise<CurrentPrice[]> {
-    const response = await fetch(`${API_BASE_URL}/watchlist/prices`)
+  async getWatchlistPrices(list?: string): Promise<CurrentPrice[]> {
+    const url = list ? `${API_BASE_URL}/watchlist/prices?list=${encodeURIComponent(list)}` : `${API_BASE_URL}/watchlist/prices`
+    const response = await fetch(url)
     if (!response.ok) throw new Error('Failed to fetch current prices')
+    return response.json()
+  },
+
+  async getWatchlistCachedPrices(list?: string): Promise<CurrentPrice[]> {
+    const url = list ? `${API_BASE_URL}/watchlist/cached-prices?list=${encodeURIComponent(list)}` : `${API_BASE_URL}/watchlist/cached-prices`
+    const response = await fetch(url)
+    if (!response.ok) throw new Error('Failed to fetch cached prices')
     return response.json()
   },
 
@@ -107,6 +138,15 @@ export const apiClient = {
       `${API_BASE_URL}/current-prices?symbols=${symbols.map(encodeURIComponent).join(',')}`
     )
     if (!response.ok) throw new Error('Failed to fetch current prices')
+    return response.json()
+  },
+
+  async getCachedPrices(symbols: string[]): Promise<CurrentPrice[]> {
+    if (symbols.length === 0) return []
+    const response = await fetch(
+      `${API_BASE_URL}/cached-prices?symbols=${symbols.map(encodeURIComponent).join(',')}`
+    )
+    if (!response.ok) throw new Error('Failed to fetch cached prices')
     return response.json()
   },
 
@@ -120,6 +160,21 @@ export const apiClient = {
       throw new Error(message || 'Failed to fetch holdings')
     }
     return response.json()
+  },
+
+  async getHoldingsSymbolFields(): Promise<Record<string, Record<string, string>>> {
+    const response = await fetch(`${API_BASE_URL}/holdings/symbol-fields`)
+    if (!response.ok) throw new Error('Failed to fetch holdings symbol fields')
+    return response.json()
+  },
+
+  async updateHoldingsSymbolFields(symbol: string, notes: string | null, customFields: Record<string, string>): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/holdings/symbol-fields/${encodeURIComponent(symbol)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes, custom_fields: customFields }),
+    })
+    if (!response.ok) throw new Error('Failed to update holdings symbol fields')
   },
 
   async addHoldingTransaction(payload: HoldingTransactionPayload): Promise<HoldingTransaction> {

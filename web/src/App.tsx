@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import './App.css'
+import { apiClient } from './services/api'
+import { getActiveHoldingSymbols } from './utils/holdings'
 import WatchlistManager from './components/WatchlistManager'
 import ConfigPanel from './components/ConfigPanel'
 import HoldingsManager from './components/HoldingsManager'
@@ -16,10 +18,48 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [holdingsVersion, setHoldingsVersion] = useState(0)
   const [configVersion, setConfigVersion] = useState(0)
+  const [watchlistFocusSymbol, setWatchlistFocusSymbol] = useState<string | null>(null)
+  const [holdingsPrefill, setHoldingsPrefill] = useState<{ symbol: string; price?: number; notes?: string; customFields?: Record<string, string> } | null>(null)
+  const startupRefreshTriggered = useRef(false)
+
+  const handleNavigateToWatchlist = (symbol: string) => {
+    setWatchlistFocusSymbol(symbol)
+    setActiveTab('watchlist')
+  }
+
+  const handleMoveToHoldings = (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string> }) => {
+    setHoldingsPrefill(data)
+    setActiveTab('holdings')
+  }
 
   useEffect(() => {
-    // Test connection to backend on mount
     testBackendConnection()
+  }, [])
+
+  // On first load, refresh all prices and dividends in the background
+  useEffect(() => {
+    if (startupRefreshTriggered.current) return
+    startupRefreshTriggered.current = true
+
+    const doStartupRefresh = async () => {
+      try {
+        const holdings = await apiClient.getHoldings()
+        const holdingSymbols = getActiveHoldingSymbols(holdings)
+
+        // Run all refreshes in parallel, bump version once when all complete
+        const refreshes = [
+          apiClient.getWatchlistPrices().catch((err) => console.error('Watchlist price refresh failed:', err)),
+          apiClient.refreshDividends().catch((err) => console.error('Dividend refresh failed:', err)),
+        ]
+        if (holdingSymbols.length > 0) {
+          refreshes.push(apiClient.getCurrentPrices(holdingSymbols).catch((err) => console.error('Holdings price refresh failed:', err)))
+        }
+        Promise.allSettled(refreshes).then(() => setHoldingsVersion((v) => v + 1))
+      } catch (err) {
+        console.error('Startup refresh failed:', err)
+      }
+    }
+    doStartupRefresh()
   }, [])
 
   const testBackendConnection = async () => {
@@ -100,13 +140,13 @@ function App() {
 
       <main className="app-content">
         <div style={{ display: activeTab === 'dashboard' ? 'block' : 'none' }}>
-          <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} />
+          <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} onNavigateToWatchlist={handleNavigateToWatchlist} />
         </div>
         <div style={{ display: activeTab === 'watchlist' ? 'block' : 'none' }}>
-          <WatchlistManager onLoading={setLoading} />
+          <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} onMoveToHoldings={handleMoveToHoldings} />
         </div>
         <div style={{ display: activeTab === 'holdings' ? 'block' : 'none' }}>
-          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} />
+          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} prefill={holdingsPrefill} onPrefillConsumed={() => setHoldingsPrefill(null)} />
         </div>
         <div style={{ display: activeTab === 'sold' ? 'block' : 'none' }}>
           <SoldStocks onLoading={setLoading} holdingsVersion={holdingsVersion} />
