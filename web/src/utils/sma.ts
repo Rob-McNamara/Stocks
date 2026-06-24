@@ -42,11 +42,13 @@ export function getLatestSMA(smaArray: Array<number | null>): number | null {
 export function smaTrend(smaArray: Array<number | null>, lookback: number = 5): 'up' | 'down' | null {
   let latest: number | null = null
   let earlier: number | null = null
+  let nonNullCount = 0
   for (let i = smaArray.length - 1; i >= 0; i--) {
     if (smaArray[i] !== null) {
+      nonNullCount++
       if (latest === null) {
         latest = smaArray[i]
-      } else if (smaArray.length - 1 - i >= lookback) {
+      } else if (nonNullCount > lookback) {
         earlier = smaArray[i]
         break
       }

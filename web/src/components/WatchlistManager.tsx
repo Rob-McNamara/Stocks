@@ -46,46 +46,56 @@ interface WatchlistManagerProps {
 }
 
 
+async function enrichOne(price: CurrentPrice): Promise<CurrentPrice> {
+  try {
+    const history = await apiClient.getPriceHistory(price.symbol, 300)
+    const sma50Array = calculateSMA(history, 50)
+    const sma150Array = calculateSMA(history, 150)
+    const sma50 = getLatestSMA(sma50Array)
+    const sma150 = getLatestSMA(sma150Array)
+    const volPoints = history.filter((p) => p.volume !== null && p.volume > 0).slice(-10)
+    const last5 = volPoints.slice(-5)
+    const prev5 = volPoints.slice(-10, -5)
+    let volumeChangePct: number | null = null
+    if (last5.length === 5 && prev5.length === 5) {
+      const avg = (pts: typeof volPoints) => pts.reduce((s, p) => s + p.volume!, 0) / pts.length
+      const prevAvg = avg(prev5)
+      if (prevAvg > 0) volumeChangePct = ((avg(last5) - prevAvg) / prevAvg) * 100
+    }
+    let daysSince50SMA: number | null = null
+    let volumePct50SMA: number | null = null
+    if (price.price !== null && sma50 !== null && price.price > sma50) {
+      const stats = crossoverStats(history, sma50Array, price.volume)
+      daysSince50SMA = stats.days
+      volumePct50SMA = stats.volumePct
+    }
+    let daysSince150SMA: number | null = null
+    let volumePct150SMA: number | null = null
+    if (price.price !== null && sma150 !== null && price.price > sma150) {
+      const stats = crossoverStats(history, sma150Array, price.volume)
+      daysSince150SMA = stats.days
+      volumePct150SMA = stats.volumePct
+    }
+    const sma50Trend = smaTrend(sma50Array)
+    const sma150Trend = smaTrend(sma150Array)
+    return { ...price, sma50, sma150, volumeChangePct, daysSince50SMA, volumePct50SMA, daysSince150SMA, volumePct150SMA, sma50Trend, sma150Trend }
+  } catch {
+    return price
+  }
+}
+
 async function enrichWithSMA(pricesData: CurrentPrice[]): Promise<CurrentPrice[]> {
-  return Promise.all(
-    pricesData.map(async (price) => {
-      try {
-        const history = await apiClient.getPriceHistory(price.symbol, 300)
-        const sma50Array = calculateSMA(history, 50)
-        const sma150Array = calculateSMA(history, 150)
-        const sma50 = getLatestSMA(sma50Array)
-        const sma150 = getLatestSMA(sma150Array)
-        const volPoints = history.filter((p) => p.volume !== null && p.volume > 0).slice(-10)
-        const last5 = volPoints.slice(-5)
-        const prev5 = volPoints.slice(-10, -5)
-        let volumeChangePct: number | null = null
-        if (last5.length === 5 && prev5.length === 5) {
-          const avg = (pts: typeof volPoints) => pts.reduce((s, p) => s + p.volume!, 0) / pts.length
-          const prevAvg = avg(prev5)
-          if (prevAvg > 0) volumeChangePct = ((avg(last5) - prevAvg) / prevAvg) * 100
-        }
-        let daysSince50SMA: number | null = null
-        let volumePct50SMA: number | null = null
-        if (price.price !== null && sma50 !== null && price.price > sma50) {
-          const stats = crossoverStats(history, sma50Array, price.volume)
-          daysSince50SMA = stats.days
-          volumePct50SMA = stats.volumePct
-        }
-        let daysSince150SMA: number | null = null
-        let volumePct150SMA: number | null = null
-        if (price.price !== null && sma150 !== null && price.price > sma150) {
-          const stats = crossoverStats(history, sma150Array, price.volume)
-          daysSince150SMA = stats.days
-          volumePct150SMA = stats.volumePct
-        }
-        const sma50Trend = smaTrend(sma50Array)
-        const sma150Trend = smaTrend(sma150Array)
-        return { ...price, sma50, sma150, volumeChangePct, daysSince50SMA, volumePct50SMA, daysSince150SMA, volumePct150SMA, sma50Trend, sma150Trend }
-      } catch {
-        return price
-      }
-    })
-  )
+  const results = [...pricesData]
+  const concurrency = 6
+  let index = 0
+  async function worker() {
+    while (index < pricesData.length) {
+      const i = index++
+      results[i] = await enrichOne(pricesData[i])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, pricesData.length) }, () => worker()))
+  return results
 }
 
 export default function WatchlistManager({ onLoading, initialSymbol, onInitialSymbolConsumed, onMoveToHoldings }: WatchlistManagerProps) {
@@ -438,14 +448,18 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                 })
                 // Remove all watchlist memberships for this symbol
                 const allEntries = symbols.filter((s) => s.symbol === symbol)
-                for (const entry of allEntries) {
-                  try { await apiClient.removeWatchlistSymbol(entry.id) } catch {}
+                try {
+                  for (const entry of allEntries) {
+                    await apiClient.removeWatchlistSymbol(entry.id)
+                  }
+                  const remaining = symbols.filter((s) => s.symbol !== symbol)
+                  setSymbols(remaining)
+                  if (selectedSymbol === symbol) setSelectedSymbol(remaining[0]?.symbol || '')
+                  const listsData = await apiClient.getWatchlistLists()
+                  setLists(listsData.length > 0 ? listsData : ['Default'])
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : 'Failed to remove from watchlist')
                 }
-                const remaining = symbols.filter((s) => s.symbol !== symbol)
-                setSymbols(remaining)
-                if (selectedSymbol === symbol) setSelectedSymbol(remaining[0]?.symbol || '')
-                const listsData = await apiClient.getWatchlistLists()
-                setLists(listsData.length > 0 ? listsData : ['Default'])
               }}
               className="btn btn-outline btn-small"
               disabled={loading}

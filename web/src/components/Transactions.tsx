@@ -18,6 +18,7 @@ interface HoldingTransaction {
   currency: string
   original_price: number | null
   fx_rate: number | null
+  custom_fields: Record<string, string>
 }
 
 interface DividendEvent {
@@ -220,6 +221,11 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           payload.currency = 'AUD'
           payload.price = editing.price ? parseFloat(editing.price) : undefined
         }
+      }
+      // Preserve existing custom_fields so they aren't deleted by the backend
+      const existingTx = transactions.find((tx) => tx.id === editing.id)
+      if (existingTx?.custom_fields && Object.keys(existingTx.custom_fields).length > 0) {
+        payload.custom_fields = existingTx.custom_fields
       }
       const updated = await apiClient.updateHoldingTransaction(editing.id, payload)
       setTransactions((prev) => prev.map((tx) => tx.id === editing.id ? updated : tx))

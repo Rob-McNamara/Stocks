@@ -289,10 +289,16 @@ async fn get_watchlist_cached_prices(db_path: web::Data<PathBuf>, query: web::Qu
             let sym_names: Vec<String> = symbols.into_iter().map(|s| s.symbol).collect();
             match load_cached_prices_with_fallback(&db_path, &sym_names) {
                 Ok(prices) => HttpResponse::Ok().json(prices),
-                Err(err) => HttpResponse::InternalServerError().body(err),
+                Err(err) => {
+                    let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
+                    HttpResponse::InternalServerError().body(err)
+                }
             }
         }
-        Err(err) => HttpResponse::InternalServerError().body(err),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
+            HttpResponse::InternalServerError().body(err)
+        }
     }
 }
 
@@ -305,7 +311,10 @@ async fn get_cached_prices(db_path: web::Data<PathBuf>, query: web::Query<Curren
         .collect();
     match load_cached_prices_with_fallback(&db_path, &symbols) {
         Ok(prices) => HttpResponse::Ok().json(prices),
-        Err(err) => HttpResponse::InternalServerError().body(err),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
+            HttpResponse::InternalServerError().body(err)
+        }
     }
 }
 
@@ -569,10 +578,13 @@ async fn update_holdings_symbol_fields(
     };
     // Save notes as a special field
     if let Some(ref notes) = payload.notes {
-        let _ = conn.execute(
+        if let Err(err) = conn.execute(
             "INSERT OR REPLACE INTO holdings_symbol_fields (symbol, field_key, value) VALUES (?1, '_notes', ?2)",
             params![symbol, notes],
-        );
+        ) {
+            let _ = insert_event_log(&db_path, "error", "holdings_symbol_fields_update", "api", Some(&symbol), &format!("Failed to save notes: {}", err));
+            return HttpResponse::InternalServerError().body(err.to_string());
+        }
     }
     if let Some(ref fields) = payload.custom_fields {
         if let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
@@ -2024,28 +2036,28 @@ fn cache_current_price(conn: &Connection, price: &CurrentPrice) -> Result<(), St
 }
 
 fn load_cached_prices(db_path: &PathBuf, symbols: &[String]) -> Result<Vec<CurrentPrice>, String> {
+    if symbols.is_empty() { return Ok(Vec::new()); }
     let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
-    let mut results = Vec::new();
-    for sym in symbols {
-        let row = conn.query_row(
-            "SELECT symbol, price, change, change_percent, volume, last_updated, price_date FROM cached_current_prices WHERE symbol = ?1",
-            params![sym],
-            |row| Ok(CurrentPrice {
-                symbol: row.get(0)?,
-                price: row.get(1)?,
-                change: row.get(2)?,
-                change_percent: row.get(3)?,
-                volume: row.get(4)?,
-                last_updated: row.get(5)?,
-                price_date: row.get(6)?,
-                error: None,
-            }),
-        ).optional().map_err(|err| err.to_string())?;
-        if let Some(p) = row {
-            results.push(p);
-        }
-    }
-    Ok(results)
+    let placeholders: Vec<String> = symbols.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+    let sql = format!(
+        "SELECT symbol, price, change, change_percent, volume, last_updated, price_date FROM cached_current_prices WHERE symbol IN ({})",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = symbols.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(CurrentPrice {
+            symbol: row.get(0)?,
+            price: row.get(1)?,
+            change: row.get(2)?,
+            change_percent: row.get(3)?,
+            volume: row.get(4)?,
+            last_updated: row.get(5)?,
+            price_date: row.get(6)?,
+            error: None,
+        })
+    }).map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
 }
 
 fn load_cached_prices_with_fallback(db_path: &PathBuf, symbols: &[String]) -> Result<Vec<CurrentPrice>, String> {
@@ -2067,24 +2079,6 @@ fn load_cached_prices_with_fallback(db_path: &PathBuf, symbols: &[String]) -> Re
         }
     }
     Ok(results)
-}
-
-fn load_all_cached_prices(db_path: &PathBuf) -> Result<Vec<CurrentPrice>, String> {
-    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
-    let mut stmt = conn.prepare(
-        "SELECT symbol, price, change, change_percent, volume, last_updated, price_date FROM cached_current_prices"
-    ).map_err(|err| err.to_string())?;
-    let rows = stmt.query_map([], |row| Ok(CurrentPrice {
-        symbol: row.get(0)?,
-        price: row.get(1)?,
-        change: row.get(2)?,
-        change_percent: row.get(3)?,
-        volume: row.get(4)?,
-        last_updated: row.get(5)?,
-        price_date: row.get(6)?,
-        error: None,
-    })).map_err(|err| err.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
 }
 
 fn load_holdings_symbol_fields(db_path: &PathBuf) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>, String> {
@@ -2156,24 +2150,28 @@ fn persist_price_history(conn: &Connection, symbol: &str, records: &[PriceHistor
     let now = Utc::now().to_rfc3339();
     for r in records {
         if let Some(close) = r.close {
-            let _ = conn.execute(
+            if let Err(err) = conn.execute(
                 "INSERT INTO prices (symbol, date, close, volume, fetched_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
                 params![symbol, r.date, close, r.volume, now],
-            );
+            ) {
+                eprintln!("Failed to persist price history for {}: {}", symbol, err);
+            }
         }
     }
 }
 
 fn persist_price_to_history(conn: &Connection, symbol: &str, price: &CurrentPrice, fetched_at: &str) {
     if let (Some(close), Some(date)) = (price.price, &price.price_date) {
-        let _ = conn.execute(
+        if let Err(err) = conn.execute(
             "INSERT INTO prices (symbol, date, close, volume, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
             params![symbol, date, close, price.volume, fetched_at],
-        );
+        ) {
+            eprintln!("Failed to persist price for {}: {}", symbol, err);
+        }
     }
 }
 
@@ -2244,14 +2242,20 @@ async fn fetch_watchlist_current_prices(db_path: &PathBuf, list: Option<&str>) -
         let now = Utc::now().to_rfc3339();
         for p in &prices {
             if p.price.is_some() {
-                let _ = cache_current_price(&conn, p);
+                if let Err(err) = cache_current_price(&conn, p) {
+                    eprintln!("Failed to cache price for {}: {}", p.symbol, err);
+                }
                 persist_price_to_history(&conn, &p.symbol, p, &now);
             }
         }
-        let _ = conn.execute(
+        if let Err(err) = conn.execute(
             "INSERT OR REPLACE INTO app_config (key, value) VALUES ('watchlist_prices_updated_at', ?1)",
             params![now],
-        );
+        ) {
+            eprintln!("Failed to update watchlist_prices_updated_at: {}", err);
+        }
+    } else {
+        let _ = insert_event_log(db_path, "error", "price_cache", "api", None, "Failed to open DB for caching watchlist prices");
     }
 
     Ok(prices)
@@ -2574,14 +2578,20 @@ async fn fetch_current_prices_for_symbols(
         let now = Utc::now().to_rfc3339();
         for p in &prices {
             if p.price.is_some() {
-                let _ = cache_current_price(&conn, p);
+                if let Err(err) = cache_current_price(&conn, p) {
+                    eprintln!("Failed to cache price for {}: {}", p.symbol, err);
+                }
                 persist_price_to_history(&conn, &p.symbol, p, &now);
             }
         }
-        let _ = conn.execute(
+        if let Err(err) = conn.execute(
             "INSERT OR REPLACE INTO app_config (key, value) VALUES ('holdings_prices_updated_at', ?1)",
             params![now],
-        );
+        ) {
+            eprintln!("Failed to update holdings_prices_updated_at: {}", err);
+        }
+    } else {
+        let _ = insert_event_log(db_path, "error", "price_cache", "api", None, "Failed to open DB for caching holdings prices");
     }
 
     Ok(prices)

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
 import { apiClient } from './services/api'
+import { getActiveHoldingSymbols } from './utils/holdings'
 import WatchlistManager from './components/WatchlistManager'
 import ConfigPanel from './components/ConfigPanel'
 import HoldingsManager from './components/HoldingsManager'
@@ -19,7 +20,6 @@ function App() {
   const [configVersion, setConfigVersion] = useState(0)
   const [watchlistFocusSymbol, setWatchlistFocusSymbol] = useState<string | null>(null)
   const [holdingsPrefill, setHoldingsPrefill] = useState<{ symbol: string; price?: number; notes?: string; customFields?: Record<string, string> } | null>(null)
-  const [startupRefreshDone, setStartupRefreshDone] = useState(false)
   const startupRefreshTriggered = useRef(false)
 
   const handleNavigateToWatchlist = (symbol: string) => {
@@ -44,30 +44,19 @@ function App() {
     const doStartupRefresh = async () => {
       try {
         const holdings = await apiClient.getHoldings()
-        const netShares: Record<string, number> = {}
-        holdings.forEach((tx) => {
-          if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
-          if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
-          if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
-        })
-        const holdingSymbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
+        const holdingSymbols = getActiveHoldingSymbols(holdings)
 
-        // Run each refresh independently so one doesn't block the others
+        // Run all refreshes in parallel, bump version once when all complete
+        const refreshes = [
+          apiClient.getWatchlistPrices().catch((err) => console.error('Watchlist price refresh failed:', err)),
+          apiClient.refreshDividends().catch((err) => console.error('Dividend refresh failed:', err)),
+        ]
         if (holdingSymbols.length > 0) {
-          apiClient.getCurrentPrices(holdingSymbols)
-            .then(() => setHoldingsVersion((v) => v + 1))
-            .catch((err) => console.error('Holdings price refresh failed:', err))
+          refreshes.push(apiClient.getCurrentPrices(holdingSymbols).catch((err) => console.error('Holdings price refresh failed:', err)))
         }
-        apiClient.getWatchlistPrices()
-          .then(() => setHoldingsVersion((v) => v + 1))
-          .catch((err) => console.error('Watchlist price refresh failed:', err))
-        apiClient.refreshDividends()
-          .then(() => setHoldingsVersion((v) => v + 1))
-          .catch((err) => console.error('Dividend refresh failed:', err))
+        Promise.allSettled(refreshes).then(() => setHoldingsVersion((v) => v + 1))
       } catch (err) {
         console.error('Startup refresh failed:', err)
-      } finally {
-        setStartupRefreshDone(true)
       }
     }
     doStartupRefresh()

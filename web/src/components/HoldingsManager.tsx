@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { apiClient } from '../services/api'
+import { getActiveHoldingSymbols } from '../utils/holdings'
 import { calculateSMA, getLatestSMA } from '../utils/sma'
 import { calcRemainingByLot } from '../utils/fifo'
 import PriceChart from './PriceChart'
@@ -62,6 +63,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [fxLoading, setFxLoading] = useState(false)
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, string>>({})
   const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
+  const prefillJustApplied = useRef(false)
   const [editingSymbolCard, setEditingSymbolCard] = useState<string | null>(null)
   const [editCardNotes, setEditCardNotes] = useState('')
   const [editCardFields, setEditCardFields] = useState<Record<string, string>>({})
@@ -101,6 +103,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       }
     }
     setCustomFieldValues(mappedFields)
+    prefillJustApplied.current = true
     onPrefillConsumed?.()
   }, [prefill])
 
@@ -118,6 +121,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   // Pre-populate custom fields from per-symbol values when entering a new transaction
   useEffect(() => {
     if (editingId !== null) return
+    if (prefillJustApplied.current) {
+      prefillJustApplied.current = false
+      return
+    }
     const symFields = holdingsSymbolFields[symbol.trim().toUpperCase()]
     if (symFields) {
       setCustomFieldValues(symFields)
@@ -152,14 +159,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       const data = await apiClient.getHoldings()
       setTransactions(data)
 
-      // Only fetch prices for symbols with net positive holdings (FIFO)
-      const netShares: Record<string, number> = {}
-      data.forEach((tx) => {
-        if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
-        if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
-        if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
-      })
-      const symbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
+      const symbols = getActiveHoldingSymbols(data)
       setSelectedChartSymbol((prev) => prev || symbols[0] || '')
       if (symbols.length > 0) {
         try {
@@ -418,13 +418,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       onLoading(true)
       setError(null)
       setSuccess(null)
-      const netShares: Record<string, number> = {}
-      transactions.forEach((tx) => {
-        if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
-        if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
-        if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
-      })
-      const symbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
+      const symbols = getActiveHoldingSymbols(transactions)
       const prices = await apiClient.getCurrentPrices(symbols)
       const priceMap: Record<string, number | null> = {}
       const priceDateMap2: Record<string, string | null> = {}

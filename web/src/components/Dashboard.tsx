@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient } from '../services/api'
 import { calculateSMA, crossoverStats, getLatestSMA, smaTrend } from '../utils/sma'
+import { getActiveHoldingSymbols } from '../utils/holdings'
 
 interface HoldingTransaction {
   id: number
@@ -307,21 +308,15 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   }, [transactions, holdingPrices, symbolInfo, appConfig, usdToAud])
 
   const worstHoldings = useMemo((): SymbolSmaEntry[] => {
-    const bySymbol: Record<string, number> = {}
-    transactions.forEach((tx) => {
-      if (!bySymbol[tx.symbol]) bySymbol[tx.symbol] = 0
-      if (tx.transaction_type === 'purchase' && tx.quantity) bySymbol[tx.symbol] += tx.quantity
-      if (tx.transaction_type === 'sale' && tx.quantity) bySymbol[tx.symbol] -= tx.quantity
-    })
+    const activeSyms = new Set(getActiveHoldingSymbols(transactions))
 
     const toAud = (price: number, symbol: string) => {
       const currency = symbolInfo[symbol]?.currency?.toUpperCase()
       if (currency && currency !== 'AUD' && usdToAud) return price * usdToAud
       return price
     }
-    return Object.entries(bySymbol)
-      .filter(([, shares]) => shares > 0)
-      .map(([symbol]) => {
+    return Array.from(activeSyms)
+      .map((symbol) => {
         const rawPrice = holdingPrices[symbol] ?? null
         const price = rawPrice !== null ? toAud(rawPrice, symbol) : null
         const rawSma = holdingSma[symbol] ?? null
@@ -358,13 +353,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       const [fieldSource, fieldKey] = def.field_key.includes(':') ? def.field_key.split(':', 2) : ['', '']
 
       if ((def.source === 'holdings' || def.source === 'both') && fieldSource === 'holdings') {
-        const bySymbol: Record<string, number> = {}
-        transactions.forEach((tx) => {
-          if (!bySymbol[tx.symbol]) bySymbol[tx.symbol] = 0
-          if (tx.transaction_type === 'purchase' && tx.quantity) bySymbol[tx.symbol] += tx.quantity
-          if (tx.transaction_type === 'sale' && tx.quantity) bySymbol[tx.symbol] -= tx.quantity
-        })
-        const activeSymbols = Object.entries(bySymbol).filter(([, shares]) => shares > 0).map(([s]) => s)
+        const activeSymbols = getActiveHoldingSymbols(transactions)
 
         activeSymbols.forEach((symbol) => {
           const price = holdingPrices[symbol] ?? null
