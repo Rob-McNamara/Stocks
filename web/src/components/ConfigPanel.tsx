@@ -49,6 +49,20 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [customFieldDefs, setCustomFieldDefs] = useState<{ key: string; label: string; type: 'text' | 'number' | 'date' }[]>([])
   const [newFieldLabel, setNewFieldLabel] = useState('')
   const [newFieldType, setNewFieldType] = useState<'text' | 'number' | 'date'>('text')
+  const [holdingsFieldDefs, setHoldingsFieldDefs] = useState<{ key: string; label: string; type: 'text' | 'number' | 'date'; actions: string[] }[]>([])
+  const [newHoldingsFieldLabel, setNewHoldingsFieldLabel] = useState('')
+  const [newHoldingsFieldType, setNewHoldingsFieldType] = useState<'text' | 'number' | 'date'>('text')
+  const [newHoldingsFieldActions, setNewHoldingsFieldActions] = useState<string[]>(['purchase'])
+  const [dashboardLists, setDashboardLists] = useState<{ key: string; label: string; source: 'holdings' | 'watchlist' | 'both'; field_key: string; operator: 'above' | 'below'; limit: number }[]>([])
+  const [editingWatchlistFieldIndex, setEditingWatchlistFieldIndex] = useState<number | null>(null)
+  const [editingHoldingsFieldIndex, setEditingHoldingsFieldIndex] = useState<number | null>(null)
+  const [newDashListLabel, setNewDashListLabel] = useState('')
+  const [newDashListSource, setNewDashListSource] = useState<'holdings' | 'watchlist' | 'both'>('holdings')
+  const [newDashListField, setNewDashListField] = useState('')
+  const [newDashListOperator, setNewDashListOperator] = useState<'above' | 'below' | 'pct_above' | 'pct_below'>('above')
+  const [newDashListLimit, setNewDashListLimit] = useState('15')
+  const [newDashListSort, setNewDashListSort] = useState<'asc' | 'desc'>('asc')
+  const [editingDashListIndex, setEditingDashListIndex] = useState<number | null>(null)
 
   useEffect(() => {
     loadConfig()
@@ -63,6 +77,12 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       try {
         setCustomFieldDefs(JSON.parse(data['watchlist_custom_fields'] ?? '[]'))
       } catch { setCustomFieldDefs([]) }
+      try {
+        setHoldingsFieldDefs(JSON.parse(data['holdings_custom_fields'] ?? '[]'))
+      } catch { setHoldingsFieldDefs([]) }
+      try {
+        setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
+      } catch { setDashboardLists([]) }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load configuration')
     } finally {
@@ -459,12 +479,23 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     <tr key={def.key}>
                       <td>{def.label}</td>
                       <td style={{ color: '#888' }}>{def.type}</td>
-                      <td>
+                      <td style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          className="btn btn-outline btn-small"
+                          onClick={() => {
+                            setEditingWatchlistFieldIndex(i)
+                            setNewFieldLabel(def.label)
+                            setNewFieldType(def.type)
+                          }}
+                        >
+                          Edit
+                        </button>
                         <button
                           className="btn btn-danger btn-small"
                           onClick={async () => {
                             const next = customFieldDefs.filter((_, j) => j !== i)
                             setCustomFieldDefs(next)
+                            setEditingWatchlistFieldIndex(null)
                             await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
                             onConfigChanged?.()
                           }}
@@ -505,17 +536,356 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                 className="btn btn-primary"
                 disabled={!newFieldLabel.trim()}
                 onClick={async () => {
-                  const key = newFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
-                  if (!key || customFieldDefs.some((d) => d.key === key)) return
-                  const next = [...customFieldDefs, { key, label: newFieldLabel.trim(), type: newFieldType }]
-                  setCustomFieldDefs(next)
-                  setNewFieldLabel('')
-                  await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
-                  onConfigChanged?.()
+                  if (editingWatchlistFieldIndex !== null) {
+                    const next = customFieldDefs.map((d, j) =>
+                      j === editingWatchlistFieldIndex ? { ...d, label: newFieldLabel.trim(), type: newFieldType } : d
+                    )
+                    setCustomFieldDefs(next)
+                    setEditingWatchlistFieldIndex(null)
+                    setNewFieldLabel('')
+                    await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
+                    onConfigChanged?.()
+                  } else {
+                    const key = newFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+                    if (!key || customFieldDefs.some((d) => d.key === key)) return
+                    const next = [...customFieldDefs, { key, label: newFieldLabel.trim(), type: newFieldType }]
+                    setCustomFieldDefs(next)
+                    setNewFieldLabel('')
+                    await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
+                    onConfigChanged?.()
+                  }
                 }}
               >
-                Add Field
+                {editingWatchlistFieldIndex !== null ? 'Save' : 'Add Field'}
               </button>
+              {editingWatchlistFieldIndex !== null && (
+                <button
+                  className="btn btn-outline"
+                  onClick={() => { setEditingWatchlistFieldIndex(null); setNewFieldLabel('') }}
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="config-card">
+            <h2>Holdings Custom Fields</h2>
+            <p style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
+              Define extra fields to record against each holdings transaction. Choose which transaction types each field applies to.
+            </p>
+            {holdingsFieldDefs.length > 0 && (
+              <table className="holdings-table" style={{ marginBottom: 16 }}>
+                <thead>
+                  <tr>
+                    <th>Label</th>
+                    <th>Type</th>
+                    <th>Actions</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {holdingsFieldDefs.map((def, i) => (
+                    <tr key={def.key}>
+                      <td>{def.label}</td>
+                      <td style={{ color: '#888' }}>{def.type}</td>
+                      <td style={{ color: '#555' }}>{def.actions.join(', ')}</td>
+                      <td style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          className="btn btn-outline btn-small"
+                          onClick={() => {
+                            setEditingHoldingsFieldIndex(i)
+                            setNewHoldingsFieldLabel(def.label)
+                            setNewHoldingsFieldType(def.type)
+                            setNewHoldingsFieldActions([...def.actions])
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="btn btn-danger btn-small"
+                          onClick={async () => {
+                            const next = holdingsFieldDefs.filter((_, j) => j !== i)
+                            setHoldingsFieldDefs(next)
+                            setEditingHoldingsFieldIndex(null)
+                            await apiClient.updateConfig('holdings_custom_fields', JSON.stringify(next))
+                            onConfigChanged?.()
+                          }}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Field label</label>
+                <input
+                  type="text"
+                  value={newHoldingsFieldLabel}
+                  onChange={(e) => setNewHoldingsFieldLabel(e.target.value)}
+                  placeholder="e.g. Target Price"
+                  className="config-input"
+                  style={{ width: 180 }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Type</label>
+                <select
+                  value={newHoldingsFieldType}
+                  onChange={(e) => setNewHoldingsFieldType(e.target.value as 'text' | 'number' | 'date')}
+                  className="config-input"
+                >
+                  <option value="text">Text</option>
+                  <option value="number">Number</option>
+                  <option value="date">Date</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Actions</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {['purchase', 'sale', 'dividend'].map((action) => (
+                    <label key={action} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 13, cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={newHoldingsFieldActions.includes(action)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setNewHoldingsFieldActions((prev) => [...prev, action])
+                          } else {
+                            setNewHoldingsFieldActions((prev) => prev.filter((a) => a !== action))
+                          }
+                        }}
+                      />
+                      {action}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <button
+                className="btn btn-primary"
+                disabled={!newHoldingsFieldLabel.trim() || newHoldingsFieldActions.length === 0}
+                onClick={async () => {
+                  if (editingHoldingsFieldIndex !== null) {
+                    const next = holdingsFieldDefs.map((d, j) =>
+                      j === editingHoldingsFieldIndex ? { ...d, label: newHoldingsFieldLabel.trim(), type: newHoldingsFieldType, actions: [...newHoldingsFieldActions] } : d
+                    )
+                    setHoldingsFieldDefs(next)
+                    setEditingHoldingsFieldIndex(null)
+                    setNewHoldingsFieldLabel('')
+                    setNewHoldingsFieldActions(['purchase'])
+                    await apiClient.updateConfig('holdings_custom_fields', JSON.stringify(next))
+                    onConfigChanged?.()
+                  } else {
+                    const key = newHoldingsFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+                    if (!key || holdingsFieldDefs.some((d) => d.key === key)) return
+                    const next = [...holdingsFieldDefs, { key, label: newHoldingsFieldLabel.trim(), type: newHoldingsFieldType, actions: [...newHoldingsFieldActions] }]
+                    setHoldingsFieldDefs(next)
+                    setNewHoldingsFieldLabel('')
+                    setNewHoldingsFieldActions(['purchase'])
+                    await apiClient.updateConfig('holdings_custom_fields', JSON.stringify(next))
+                    onConfigChanged?.()
+                  }
+                }}
+              >
+                {editingHoldingsFieldIndex !== null ? 'Save' : 'Add Field'}
+              </button>
+              {editingHoldingsFieldIndex !== null && (
+                <button
+                  className="btn btn-outline"
+                  onClick={() => { setEditingHoldingsFieldIndex(null); setNewHoldingsFieldLabel(''); setNewHoldingsFieldActions(['purchase']) }}
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="config-card">
+            <h2>Dashboard Lists</h2>
+            <p style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
+              Define custom lists for the Dashboard that compare current stock price against a custom field value.
+            </p>
+            {dashboardLists.length > 0 && (
+              <table className="holdings-table" style={{ marginBottom: 16 }}>
+                <thead>
+                  <tr>
+                    <th>Label</th>
+                    <th>Source</th>
+                    <th>Field</th>
+                    <th>Condition</th>
+                    <th>Sort</th>
+                    <th>Limit</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {dashboardLists.map((dl, i) => (
+                    <tr key={dl.key}>
+                      <td>{dl.label}</td>
+                      <td style={{ color: '#888' }}>{dl.source}</td>
+                      <td style={{ color: '#555' }}>{dl.field_key}</td>
+                      <td>{{ above: 'Price above field', below: 'Price below field', pct_above: '% above price', pct_below: '% below price' }[dl.operator] ?? dl.operator}</td>
+                      <td style={{ color: '#888' }}>{(dl as any).sort === 'desc' ? 'Desc' : 'Asc'}</td>
+                      <td>{dl.limit}</td>
+                      <td style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          className="btn btn-outline btn-small"
+                          onClick={() => {
+                            setEditingDashListIndex(i)
+                            setNewDashListLabel(dl.label)
+                            setNewDashListSource(dl.source)
+                            setNewDashListField(dl.field_key)
+                            setNewDashListOperator(dl.operator)
+                            setNewDashListLimit(dl.limit.toString())
+                            setNewDashListSort((dl as any).sort ?? 'asc')
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="btn btn-danger btn-small"
+                          onClick={async () => {
+                            const next = dashboardLists.filter((_, j) => j !== i)
+                            setDashboardLists(next)
+                            setEditingDashListIndex(null)
+                            await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
+                            onConfigChanged?.()
+                          }}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Label</label>
+                <input
+                  type="text"
+                  value={newDashListLabel}
+                  onChange={(e) => setNewDashListLabel(e.target.value)}
+                  placeholder="e.g. Above Target"
+                  className="config-input"
+                  style={{ width: 160 }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Source</label>
+                <select
+                  value={newDashListSource}
+                  onChange={(e) => setNewDashListSource(e.target.value as 'holdings' | 'watchlist' | 'both')}
+                  className="config-input"
+                >
+                  <option value="holdings">Holdings</option>
+                  <option value="watchlist">Watchlist</option>
+                  <option value="both">Both</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Custom Field</label>
+                <select
+                  value={newDashListField}
+                  onChange={(e) => setNewDashListField(e.target.value)}
+                  className="config-input"
+                >
+                  <option value="">Select field...</option>
+                  {holdingsFieldDefs.map((f) => (
+                    <option key={`h_${f.key}`} value={`holdings:${f.key}`}>Holdings: {f.label}</option>
+                  ))}
+                  {customFieldDefs.map((f) => (
+                    <option key={`w_${f.key}`} value={`watchlist:${f.key}`}>Watchlist: {f.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Condition</label>
+                <select
+                  value={newDashListOperator}
+                  onChange={(e) => setNewDashListOperator(e.target.value as 'above' | 'below' | 'pct_above' | 'pct_below')}
+                  className="config-input"
+                >
+                  <option value="above">Price above field</option>
+                  <option value="below">Price below field</option>
+                  <option value="pct_above">% above price</option>
+                  <option value="pct_below">% below price</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Sort</label>
+                <select
+                  value={newDashListSort}
+                  onChange={(e) => setNewDashListSort(e.target.value as 'asc' | 'desc')}
+                  className="config-input"
+                >
+                  <option value="asc">Ascending</option>
+                  <option value="desc">Descending</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Limit</label>
+                <input
+                  type="number"
+                  value={newDashListLimit}
+                  onChange={(e) => setNewDashListLimit(e.target.value)}
+                  min="1"
+                  max="50"
+                  className="config-input"
+                  style={{ width: 60 }}
+                />
+              </div>
+              <button
+                className="btn btn-primary"
+                disabled={!newDashListLabel.trim() || !newDashListField}
+                onClick={async () => {
+                  if (editingDashListIndex !== null) {
+                    const next = dashboardLists.map((d, j) =>
+                      j === editingDashListIndex ? { ...d, label: newDashListLabel.trim(), source: newDashListSource, field_key: newDashListField, operator: newDashListOperator, limit: parseInt(newDashListLimit) || 15, sort: newDashListSort } : d
+                    )
+                    setDashboardLists(next)
+                    setEditingDashListIndex(null)
+                    setNewDashListLabel('')
+                    setNewDashListField('')
+                    setNewDashListSort('asc')
+                    await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
+                    onConfigChanged?.()
+                  } else {
+                    const key = newDashListLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+                    if (!key || dashboardLists.some((d) => d.key === key)) return
+                    const next = [...dashboardLists, {
+                      key,
+                      label: newDashListLabel.trim(),
+                      source: newDashListSource,
+                      field_key: newDashListField,
+                      operator: newDashListOperator,
+                      limit: parseInt(newDashListLimit) || 15,
+                      sort: newDashListSort,
+                    }]
+                    setDashboardLists(next)
+                    setNewDashListLabel('')
+                    setNewDashListField('')
+                    setNewDashListSort('asc')
+                    await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
+                    onConfigChanged?.()
+                  }
+                }}
+              >
+                {editingDashListIndex !== null ? 'Save' : 'Add List'}
+              </button>
+              {editingDashListIndex !== null && (
+                <button
+                  className="btn btn-outline"
+                  onClick={() => { setEditingDashListIndex(null); setNewDashListLabel(''); setNewDashListField(''); setNewDashListSort('asc') }}
+                >
+                  Cancel
+                </button>
+              )}
             </div>
           </div>
 

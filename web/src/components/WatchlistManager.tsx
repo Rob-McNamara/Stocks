@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { apiClient } from '../services/api'
-import { calculateSMA, crossoverStats, getLatestSMA } from '../utils/sma'
+import { calculateSMA, crossoverStats, getLatestSMA, smaTrend } from '../utils/sma'
 import PriceChart from './PriceChart'
 
 interface WatchlistSymbol {
@@ -33,6 +33,8 @@ interface CurrentPrice {
   volumePct50SMA?: number | null
   daysSince150SMA?: number | null
   volumePct150SMA?: number | null
+  sma50Trend?: 'up' | 'down' | null
+  sma150Trend?: 'up' | 'down' | null
   error?: string
 }
 
@@ -40,6 +42,7 @@ interface WatchlistManagerProps {
   onLoading: (loading: boolean) => void
   initialSymbol?: string | null
   onInitialSymbolConsumed?: () => void
+  onMoveToHoldings?: (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string> }) => void
 }
 
 
@@ -75,7 +78,9 @@ async function enrichWithSMA(pricesData: CurrentPrice[]): Promise<CurrentPrice[]
           daysSince150SMA = stats.days
           volumePct150SMA = stats.volumePct
         }
-        return { ...price, sma50, sma150, volumeChangePct, daysSince50SMA, volumePct50SMA, daysSince150SMA, volumePct150SMA }
+        const sma50Trend = smaTrend(sma50Array)
+        const sma150Trend = smaTrend(sma150Array)
+        return { ...price, sma50, sma150, volumeChangePct, daysSince50SMA, volumePct50SMA, daysSince150SMA, volumePct150SMA, sma50Trend, sma150Trend }
       } catch {
         return price
       }
@@ -83,7 +88,7 @@ async function enrichWithSMA(pricesData: CurrentPrice[]): Promise<CurrentPrice[]
   )
 }
 
-export default function WatchlistManager({ onLoading, initialSymbol, onInitialSymbolConsumed }: WatchlistManagerProps) {
+export default function WatchlistManager({ onLoading, initialSymbol, onInitialSymbolConsumed, onMoveToHoldings }: WatchlistManagerProps) {
   const [lists, setLists] = useState<string[]>(['Default'])
   const [selectedList, setSelectedList] = useState('Default')
   const [creatingList, setCreatingList] = useState(false)
@@ -97,6 +102,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [pricesUpdatedAt, setPricesUpdatedAt] = useState<string | null>(null)
   const [editingSymbol, setEditingSymbol] = useState<string | null>(null)
   const [editListChecks, setEditListChecks] = useState<Record<string, boolean>>({})
   const [editNotes, setEditNotes] = useState('')
@@ -125,7 +131,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       const [listsData, symbolsData, pricesData, infoData, configData] = await Promise.all([
         apiClient.getWatchlistLists(),
         apiClient.getWatchlistSymbols(),
-        apiClient.getWatchlistPrices(),
+        apiClient.getWatchlistCachedPrices(),
         apiClient.getSymbolInfo(),
         apiClient.getConfig(),
       ])
@@ -133,16 +139,21 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
         const defs = JSON.parse(configData['watchlist_custom_fields'] ?? '[]') as CustomFieldDef[]
         setCustomFieldDefs(defs)
       } catch { setCustomFieldDefs([]) }
+      setPricesUpdatedAt(configData['watchlist_prices_updated_at'] ?? null)
       const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
       infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
       setSymbolInfo(infoMap)
       setLists(listsData.length > 0 ? listsData : ['Default'])
       setSymbols(symbolsData)
-      const pricesWithSMA = await enrichWithSMA(pricesData)
-      setAllPrices(pricesWithSMA)
+      setAllPrices(pricesData)
       if (symbolsData.length && !selectedSymbol) {
         setSelectedSymbol(symbolsData[0].symbol)
       }
+      // Show UI immediately, then enrich with SMA data in the background
+      setLoading(false)
+      onLoading(false)
+      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
+      return
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load watchlist')
     } finally {
@@ -178,15 +189,21 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       setNewSymbolFields({})
       if (!selectedSymbol) setSelectedSymbol(result.symbol)
       setSuccess(`Added ${result.symbol} to "${selectedList}"`)
-      // Reload all symbols so notes/custom_fields are consistent across all list memberships
-      const [listsData, symbolsData, pricesData] = await Promise.all([
+      // Fetch live price for just the new symbol, use cache for the rest
+      const [listsData, symbolsData, cachedPrices, newSymbolPrices] = await Promise.all([
         apiClient.getWatchlistLists(),
         apiClient.getWatchlistSymbols(),
-        apiClient.getWatchlistPrices(),
+        apiClient.getWatchlistCachedPrices(),
+        apiClient.getCurrentPrices([result.symbol]),
       ])
+      // Merge: replace cached entry for the new symbol with live data
+      const priceMap = new Map(cachedPrices.map((p) => [p.symbol, p]))
+      newSymbolPrices.forEach((p) => priceMap.set(p.symbol, p))
+      const pricesData = Array.from(priceMap.values())
       setLists(listsData)
       setSymbols(symbolsData)
-      setAllPrices(await enrichWithSMA(pricesData))
+      setAllPrices(pricesData)
+      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add symbol')
@@ -202,7 +219,10 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       setError(null)
       setSuccess(null)
       const pricesData = await apiClient.getWatchlistPrices()
-      setAllPrices(await enrichWithSMA(pricesData))
+      setAllPrices(pricesData)
+      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
+      // Reload config to get updated timestamp
+      apiClient.getConfig().then((cfg) => setPricesUpdatedAt(cfg['watchlist_prices_updated_at'] ?? null))
       const hasPrice = pricesData.some((item) => item.price !== null)
       const errorDetails = pricesData.filter((item) => item.error).map((item) => `${item.symbol}: ${item.error}`).join(' | ')
       if (!hasPrice) {
@@ -234,10 +254,11 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       // Refresh lists (list may now be empty and removed from DB)
       const [listsData, pricesData] = await Promise.all([
         apiClient.getWatchlistLists(),
-        apiClient.getWatchlistPrices(),
+        apiClient.getWatchlistCachedPrices(),
       ])
       setLists(listsData.length > 0 ? listsData : ['Default'])
-      setAllPrices(await enrichWithSMA(pricesData))
+      setAllPrices(pricesData)
+      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to remove symbol')
@@ -354,9 +375,14 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                   {priceData.sma50 != null && (
                     <span className={`sma-value ${priceData.price !== null && priceData.sma50 > priceData.price ? 'sma-above-price' : ''}`}>
                       50SMA: ${priceData.sma50.toFixed(2)}
+                      {priceData.sma50Trend != null && (
+                        <span style={{ marginLeft: 4, fontSize: 10, color: priceData.sma50Trend === 'down' ? '#c62828' : '#2e7d32', fontWeight: 600 }}>
+                          {priceData.sma50Trend === 'down' ? '↓' : '↑'}
+                        </span>
+                      )}
                       {priceData.daysSince50SMA != null && (
-                        <span style={{ marginLeft: 4, fontSize: 10, color: '#2e7d32', fontWeight: 600 }}>
-                          ↑{priceData.daysSince50SMA}d
+                        <span style={{ marginLeft: 2, fontSize: 10, color: '#2e7d32', fontWeight: 600 }}>
+                          {priceData.daysSince50SMA}d
                           {priceData.volumePct50SMA != null && (
                             <span style={{ marginLeft: 3, color: priceData.volumePct50SMA >= 0 ? '#2e7d32' : '#c62828' }}>
                               (vol {priceData.volumePct50SMA >= 0 ? '+' : ''}{priceData.volumePct50SMA.toFixed(0)}%)
@@ -369,9 +395,14 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                   {priceData.sma150 != null && (
                     <span className={`sma-value ${priceData.price !== null && priceData.sma150 > priceData.price ? 'sma-above-price' : ''}`}>
                       150SMA: ${priceData.sma150.toFixed(2)}
+                      {priceData.sma150Trend != null && (
+                        <span style={{ marginLeft: 4, fontSize: 10, color: priceData.sma150Trend === 'down' ? '#c62828' : '#2e7d32', fontWeight: 600 }}>
+                          {priceData.sma150Trend === 'down' ? '↓' : '↑'}
+                        </span>
+                      )}
                       {priceData.daysSince150SMA != null && (
-                        <span style={{ marginLeft: 4, fontSize: 10, color: '#2e7d32', fontWeight: 600 }}>
-                          ↑{priceData.daysSince150SMA}d
+                        <span style={{ marginLeft: 2, fontSize: 10, color: '#2e7d32', fontWeight: 600 }}>
+                          {priceData.daysSince150SMA}d
                           {priceData.volumePct150SMA != null && (
                             <span style={{ marginLeft: 3, color: priceData.volumePct150SMA >= 0 ? '#2e7d32' : '#c62828' }}>
                               (vol {priceData.volumePct150SMA >= 0 ? '+' : ''}{priceData.volumePct150SMA.toFixed(0)}%)
@@ -394,6 +425,36 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
           )}
         </div>
         <div style={{ position: 'absolute', top: 6, right: 8, display: 'flex', gap: 4 }}>
+          {onMoveToHoldings && (
+            <button
+              onClick={async (e) => {
+                e.stopPropagation()
+                const priceData = listPrices.find((p) => p.symbol === symbol)
+                onMoveToHoldings({
+                  symbol,
+                  price: priceData?.price ?? undefined,
+                  notes: notes ?? undefined,
+                  customFields: custom_fields,
+                })
+                // Remove all watchlist memberships for this symbol
+                const allEntries = symbols.filter((s) => s.symbol === symbol)
+                for (const entry of allEntries) {
+                  try { await apiClient.removeWatchlistSymbol(entry.id) } catch {}
+                }
+                const remaining = symbols.filter((s) => s.symbol !== symbol)
+                setSymbols(remaining)
+                if (selectedSymbol === symbol) setSelectedSymbol(remaining[0]?.symbol || '')
+                const listsData = await apiClient.getWatchlistLists()
+                setLists(listsData.length > 0 ? listsData : ['Default'])
+              }}
+              className="btn btn-outline btn-small"
+              disabled={loading}
+              title="Move to Holdings"
+              style={{ padding: '2px 6px', fontSize: 13, lineHeight: 1 }}
+            >
+              📥
+            </button>
+          )}
           <button
             onClick={(e) => { e.stopPropagation(); handleOpenEdit(symbol) }}
             className="btn btn-outline btn-small"
@@ -510,7 +571,15 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
 
       <div className="manager-card">
         <div className="card-header">
-          <h2>{selectedList} ({listSymbols.length})</h2>
+          <h2>
+            {selectedList} ({listSymbols.length})
+            {pricesUpdatedAt && (
+              <span style={{ fontSize: 12, fontWeight: 400, color: '#888', marginLeft: 10 }}>
+                Prices updated: {new Date(pricesUpdatedAt).toLocaleString()}
+                {listPrices.some((p) => p.last_updated && pricesUpdatedAt && p.last_updated > pricesUpdatedAt) ? ' *' : ''}
+              </span>
+            )}
+          </h2>
           <button
             onClick={handleRefreshPrices}
             className="btn btn-outline"

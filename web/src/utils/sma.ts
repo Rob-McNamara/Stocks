@@ -39,6 +39,23 @@ export function getLatestSMA(smaArray: Array<number | null>): number | null {
   return null
 }
 
+export function smaTrend(smaArray: Array<number | null>, lookback: number = 5): 'up' | 'down' | null {
+  let latest: number | null = null
+  let earlier: number | null = null
+  for (let i = smaArray.length - 1; i >= 0; i--) {
+    if (smaArray[i] !== null) {
+      if (latest === null) {
+        latest = smaArray[i]
+      } else if (smaArray.length - 1 - i >= lookback) {
+        earlier = smaArray[i]
+        break
+      }
+    }
+  }
+  if (latest === null || earlier === null) return null
+  return latest >= earlier ? 'up' : 'down'
+}
+
 export function crossoverStats(
   history: { close: number | null; volume: number | null }[],
   smaArray: Array<number | null>,

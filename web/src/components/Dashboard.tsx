@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient } from '../services/api'
-import { calculateSMA, crossoverStats, getLatestSMA } from '../utils/sma'
+import { calculateSMA, crossoverStats, getLatestSMA, smaTrend } from '../utils/sma'
 
 interface HoldingTransaction {
   id: number
@@ -14,6 +14,7 @@ interface HoldingTransaction {
   notes: string | null
   created_at: string
   dividends_total: number
+  custom_fields?: Record<string, string>
 }
 
 interface SymbolSmaEntry {
@@ -23,6 +24,25 @@ interface SymbolSmaEntry {
   pctDiff: number | null
   daysSince50SMA: number | null
   volumePct50SMA: number | null
+  sma50Trend?: 'up' | 'down' | null
+}
+
+interface DashboardListDef {
+  key: string
+  label: string
+  source: 'holdings' | 'watchlist' | 'both'
+  field_key: string
+  operator: 'above' | 'below' | 'pct_above' | 'pct_below'
+  limit: number
+  sort?: 'asc' | 'desc'
+}
+
+interface CustomListEntry {
+  symbol: string
+  price: number | null
+  fieldValue: number
+  diff: number
+  pctDiff: number
 }
 
 export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatchlist }: { onLoading: (loading: boolean) => void; holdingsVersion?: number; onNavigateToWatchlist?: (symbol: string) => void }) {
@@ -33,6 +53,8 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; currency: string | null }>>({})
   const [appConfig, setAppConfig] = useState<Record<string, string>>({})
   const [usdToAud, setUsdToAud] = useState<number | null>(null)
+  const [watchlistFieldValues, setWatchlistFieldValues] = useState<Record<string, Record<string, string>>>({})
+  const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -46,16 +68,27 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       setError(null)
       onLoading(true)
 
-      const [txData, watchlistSymbols, watchlistPricesData, , configData, infoData, fxData] = await Promise.all([
+      const [txData, watchlistSymbols, watchlistPricesData, , configData, infoData, fxData, hSymFields] = await Promise.all([
         apiClient.getHoldings(),
         apiClient.getWatchlistSymbols(),
-        apiClient.getWatchlistPrices(),
+        apiClient.getWatchlistCachedPrices(),
         apiClient.getDividends(),
         apiClient.getConfig(),
         apiClient.getSymbolInfo(),
         apiClient.getFxRates(),
+        apiClient.getHoldingsSymbolFields(),
       ])
       setTransactions(txData)
+      setHoldingsSymbolFields(hSymFields)
+      // Build watchlist custom field map: symbol -> { field_key: value }
+      const wfMap: Record<string, Record<string, string>> = {}
+      watchlistSymbols.forEach((s) => {
+        if (s.custom_fields) {
+          if (!wfMap[s.symbol]) wfMap[s.symbol] = {}
+          Object.assign(wfMap[s.symbol], s.custom_fields)
+        }
+      })
+      setWatchlistFieldValues(wfMap)
       setAppConfig(configData)
       if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
       const infoMap: Record<string, { instrument_type: string | null; currency: string | null }> = {}
@@ -65,7 +98,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       const holdingSymbols = Array.from(new Set(txData.map((tx) => tx.symbol)))
 
       const [pricesData] = await Promise.all([
-        holdingSymbols.length > 0 ? apiClient.getCurrentPrices(holdingSymbols) : Promise.resolve([]),
+        holdingSymbols.length > 0 ? apiClient.getCachedPrices(holdingSymbols) : Promise.resolve([]),
       ])
 
       const priceMap: Record<string, number | null> = {}
@@ -143,7 +176,9 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
             volumePct50SMA = stats.volumePct
           }
         }
-        return { symbol: p.symbol, price: p.price, sma, pctDiff, daysSince50SMA, volumePct50SMA }
+        const arr = sma50ArrayMap[p.symbol]
+        const sma50Trend = arr?.length ? smaTrend(arr) : null
+        return { symbol: p.symbol, price: p.price, sma, pctDiff, daysSince50SMA, volumePct50SMA, sma50Trend }
       })
       setWatchlistEntries(watchlistWithSma)
     } catch (err) {
@@ -306,6 +341,84 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       .slice(0, 15)
   }, [watchlistEntries])
 
+  const dashboardListDefs: DashboardListDef[] = useMemo(() => {
+    try { return JSON.parse(appConfig['dashboard_custom_lists'] ?? '[]') }
+    catch { return [] }
+  }, [appConfig])
+
+  const customDashboardLists = useMemo(() => {
+    const toAud = (price: number, symbol: string) => {
+      const currency = symbolInfo[symbol]?.currency?.toUpperCase()
+      if (currency && currency !== 'AUD' && usdToAud) return price * usdToAud
+      return price
+    }
+
+    return dashboardListDefs.map((def) => {
+      const entries: CustomListEntry[] = []
+      const [fieldSource, fieldKey] = def.field_key.includes(':') ? def.field_key.split(':', 2) : ['', '']
+
+      if ((def.source === 'holdings' || def.source === 'both') && fieldSource === 'holdings') {
+        const bySymbol: Record<string, number> = {}
+        transactions.forEach((tx) => {
+          if (!bySymbol[tx.symbol]) bySymbol[tx.symbol] = 0
+          if (tx.transaction_type === 'purchase' && tx.quantity) bySymbol[tx.symbol] += tx.quantity
+          if (tx.transaction_type === 'sale' && tx.quantity) bySymbol[tx.symbol] -= tx.quantity
+        })
+        const activeSymbols = Object.entries(bySymbol).filter(([, shares]) => shares > 0).map(([s]) => s)
+
+        activeSymbols.forEach((symbol) => {
+          const price = holdingPrices[symbol] ?? null
+          const fieldVal = holdingsSymbolFields[symbol]?.[fieldKey]
+          if (price !== null && fieldVal) {
+            const fv = parseFloat(fieldVal)
+            if (!isNaN(fv) && fv > 0) {
+              const diff = price - fv
+              const pctDiff = (diff / fv) * 100
+              const matches = (def.operator === 'above' || def.operator === 'pct_below') ? diff > 0
+                : (def.operator === 'below' || def.operator === 'pct_above') ? diff < 0
+                : false
+              if (matches) {
+                entries.push({ symbol, price, fieldValue: fv, diff, pctDiff })
+              }
+            }
+          }
+        })
+      }
+
+      if ((def.source === 'watchlist' || def.source === 'both') && fieldSource === 'watchlist') {
+        watchlistEntries.forEach((entry) => {
+          const fieldVal = watchlistFieldValues[entry.symbol]?.[fieldKey]
+          if (entry.price !== null && fieldVal) {
+            const fv = parseFloat(fieldVal)
+            if (!isNaN(fv) && fv > 0) {
+              const diff = entry.price - fv
+              const pctDiff = (diff / fv) * 100
+              const matches = (def.operator === 'above' || def.operator === 'pct_below') ? diff > 0
+                : (def.operator === 'below' || def.operator === 'pct_above') ? diff < 0
+                : false
+              if (matches) {
+                const existing = entries.find((e) => e.symbol === entry.symbol)
+                if (!existing) {
+                  entries.push({ symbol: entry.symbol, price: entry.price, fieldValue: fv, diff, pctDiff })
+                }
+              }
+            }
+          }
+        })
+      }
+
+      const sortDir = def.sort ?? 'asc'
+      entries.sort((a, b) => {
+        const cmp = (def.operator === 'pct_above' || def.operator === 'pct_below')
+          ? Math.abs(a.pctDiff) - Math.abs(b.pctDiff)
+          : a.pctDiff - b.pctDiff
+        return sortDir === 'desc' ? -cmp : cmp
+      })
+
+      return { def, entries: entries.slice(0, def.limit) }
+    })
+  }, [dashboardListDefs, transactions, holdingPrices, holdingsSymbolFields, watchlistEntries, watchlistFieldValues, symbolInfo, usdToAud])
+
   if (loading) return <p className="loading-text">Loading dashboard...</p>
   if (error) return <div className="alert alert-error">❌ {error}</div>
 
@@ -426,8 +539,17 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
                       )}
                     </td>
                     <td>{item.price !== null ? `$${item.price.toFixed(2)}` : '—'}</td>
-                    <td>{item.sma !== null ? `$${item.sma.toFixed(2)}` : '—'}</td>
-                    <td style={{ color: '#2e7d32', fontWeight: 600 }}>{item.daysSince50SMA}d</td>
+                    <td>
+                      {item.sma !== null ? `$${item.sma.toFixed(2)}` : '—'}
+                      {item.sma50Trend != null && (
+                        <span style={{ marginLeft: 4, fontSize: 10, color: item.sma50Trend === 'down' ? '#c62828' : '#2e7d32', fontWeight: 600 }}>
+                          {item.sma50Trend === 'down' ? '↓' : '↑'}
+                        </span>
+                      )}
+                    </td>
+                    <td style={{ color: '#2e7d32', fontWeight: 600 }}>
+                      {item.daysSince50SMA}d
+                    </td>
                     <td style={{ color: item.volumePct50SMA === null ? undefined : item.volumePct50SMA >= 0 ? '#2e7d32' : '#c62828', fontWeight: 600 }}>
                       {item.volumePct50SMA !== null ? `${item.volumePct50SMA >= 0 ? '+' : ''}${item.volumePct50SMA.toFixed(0)}%` : '—'}
                     </td>
@@ -437,6 +559,66 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
             </table>
           )}
         </div>
+
+        {customDashboardLists.map(({ def, entries }) => {
+          const [fieldSrc, fieldKey] = def.field_key.includes(':') ? def.field_key.split(':', 2) : ['', '']
+          const fieldDefs: { key: string; label: string }[] = (() => { try { return JSON.parse(appConfig[fieldSrc === 'holdings' ? 'holdings_custom_fields' : 'watchlist_custom_fields'] ?? '[]') } catch { return [] } })()
+          const fieldLabel = fieldDefs.find((f) => f.key === fieldKey)?.label ?? fieldKey
+          return (
+          <div key={def.key} className="manager-card">
+            <h2>{def.label}</h2>
+            <p className="dashboard-list-desc">
+              {def.source === 'both' ? 'Holdings & Watchlist' : def.source === 'holdings' ? 'Holdings' : 'Watchlist'} stocks where {
+                def.operator === 'above' ? `price is above ${fieldLabel}` :
+                def.operator === 'below' ? `price is below ${fieldLabel}` :
+                def.operator === 'pct_below' ? `${fieldLabel} is % below price` :
+                def.operator === 'pct_above' ? `${fieldLabel} is % above price` : ''
+              }
+            </p>
+            {entries.length === 0 ? (
+              <p className="empty-text">No matching stocks found.</p>
+            ) : (
+              <table className="holdings-table compact">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Price</th>
+                    <th>{fieldLabel}</th>
+                    <th>Difference</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entries.map((item) => (
+                    <tr key={item.symbol}>
+                      <td>
+                        {onNavigateToWatchlist ? (
+                          <button
+                            onClick={() => onNavigateToWatchlist(item.symbol)}
+                            style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontWeight: 700, color: '#1565c0', textDecoration: 'underline', fontSize: 'inherit' }}
+                          >
+                            {item.symbol}
+                          </button>
+                        ) : (
+                          <strong>{item.symbol}</strong>
+                        )}
+                      </td>
+                      <td>
+                        {item.price !== null ? `$${item.price.toFixed(2)}` : '—'}
+                        {symbolInfo[item.symbol]?.currency && symbolInfo[item.symbol].currency !== 'AUD' && (
+                          <span style={{ fontSize: 10, color: '#e65100', marginLeft: 4 }}>{symbolInfo[item.symbol].currency}</span>
+                        )}
+                      </td>
+                      <td>${item.fieldValue.toFixed(2)}</td>
+                      <td style={{ color: item.pctDiff >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
+                        {item.pctDiff >= 0 ? '+' : ''}{item.pctDiff.toFixed(2)}%
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )})}
       </div>
 
     </div>

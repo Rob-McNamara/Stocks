@@ -56,6 +56,7 @@ interface HoldingTransaction {
   currency: string
   original_price: number | null
   fx_rate: number | null
+  custom_fields: Record<string, string>
 }
 
 interface HoldingTransactionPayload {
@@ -70,6 +71,7 @@ interface HoldingTransactionPayload {
   currency?: string
   original_price?: number
   fx_rate?: number
+  custom_fields?: Record<string, string>
 }
 
 export const apiClient = {
@@ -123,12 +125,28 @@ export const apiClient = {
     return response.json()
   },
 
+  async getWatchlistCachedPrices(list?: string): Promise<CurrentPrice[]> {
+    const url = list ? `${API_BASE_URL}/watchlist/cached-prices?list=${encodeURIComponent(list)}` : `${API_BASE_URL}/watchlist/cached-prices`
+    const response = await fetch(url)
+    if (!response.ok) throw new Error('Failed to fetch cached prices')
+    return response.json()
+  },
+
   async getCurrentPrices(symbols: string[]): Promise<CurrentPrice[]> {
     if (symbols.length === 0) return []
     const response = await fetch(
       `${API_BASE_URL}/current-prices?symbols=${symbols.map(encodeURIComponent).join(',')}`
     )
     if (!response.ok) throw new Error('Failed to fetch current prices')
+    return response.json()
+  },
+
+  async getCachedPrices(symbols: string[]): Promise<CurrentPrice[]> {
+    if (symbols.length === 0) return []
+    const response = await fetch(
+      `${API_BASE_URL}/cached-prices?symbols=${symbols.map(encodeURIComponent).join(',')}`
+    )
+    if (!response.ok) throw new Error('Failed to fetch cached prices')
     return response.json()
   },
 
@@ -142,6 +160,21 @@ export const apiClient = {
       throw new Error(message || 'Failed to fetch holdings')
     }
     return response.json()
+  },
+
+  async getHoldingsSymbolFields(): Promise<Record<string, Record<string, string>>> {
+    const response = await fetch(`${API_BASE_URL}/holdings/symbol-fields`)
+    if (!response.ok) throw new Error('Failed to fetch holdings symbol fields')
+    return response.json()
+  },
+
+  async updateHoldingsSymbolFields(symbol: string, notes: string | null, customFields: Record<string, string>): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/holdings/symbol-fields/${encodeURIComponent(symbol)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes, custom_fields: customFields }),
+    })
+    if (!response.ok) throw new Error('Failed to update holdings symbol fields')
   },
 
   async addHoldingTransaction(payload: HoldingTransactionPayload): Promise<HoldingTransaction> {

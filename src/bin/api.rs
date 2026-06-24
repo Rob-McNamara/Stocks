@@ -103,6 +103,8 @@ struct HoldingTransaction {
     currency: String,
     original_price: Option<f64>,
     fx_rate: Option<f64>,
+    #[serde(default)]
+    custom_fields: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +140,7 @@ struct NewHoldingTransaction {
     currency: Option<String>,
     original_price: Option<f64>,
     fx_rate: Option<f64>,
+    custom_fields: Option<std::collections::HashMap<String, String>>,
 }
 
 #[get("/api/health")]
@@ -276,6 +279,34 @@ async fn get_watchlist_prices(db_path: web::Data<PathBuf>, query: web::Query<Wat
 #[derive(Deserialize)]
 struct CurrentPricesQuery {
     symbols: String,
+}
+
+#[get("/api/watchlist/cached-prices")]
+async fn get_watchlist_cached_prices(db_path: web::Data<PathBuf>, query: web::Query<WatchlistQuery>) -> impl Responder {
+    let symbols_result = load_watchlist_symbols(&db_path, query.list.as_deref());
+    match symbols_result {
+        Ok(symbols) => {
+            let sym_names: Vec<String> = symbols.into_iter().map(|s| s.symbol).collect();
+            match load_cached_prices_with_fallback(&db_path, &sym_names) {
+                Ok(prices) => HttpResponse::Ok().json(prices),
+                Err(err) => HttpResponse::InternalServerError().body(err),
+            }
+        }
+        Err(err) => HttpResponse::InternalServerError().body(err),
+    }
+}
+
+#[get("/api/cached-prices")]
+async fn get_cached_prices(db_path: web::Data<PathBuf>, query: web::Query<CurrentPricesQuery>) -> impl Responder {
+    let symbols: Vec<String> = query.symbols.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| normalize_symbol(&s))
+        .collect();
+    match load_cached_prices_with_fallback(&db_path, &symbols) {
+        Ok(prices) => HttpResponse::Ok().json(prices),
+        Err(err) => HttpResponse::InternalServerError().body(err),
+    }
 }
 
 #[get("/api/current-prices")]
@@ -514,6 +545,49 @@ async fn delete_holding_transaction(
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holding_delete", "api", None, &err);
+            HttpResponse::InternalServerError().body(err)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct HoldingsSymbolFieldsPayload {
+    notes: Option<String>,
+    custom_fields: Option<std::collections::HashMap<String, String>>,
+}
+
+#[put("/api/holdings/symbol-fields/{symbol}")]
+async fn update_holdings_symbol_fields(
+    db_path: web::Data<PathBuf>,
+    path: web::Path<String>,
+    payload: web::Json<HoldingsSymbolFieldsPayload>,
+) -> impl Responder {
+    let symbol = normalize_symbol(&path.into_inner());
+    let conn = match Connection::open(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+    // Save notes as a special field
+    if let Some(ref notes) = payload.notes {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO holdings_symbol_fields (symbol, field_key, value) VALUES (?1, '_notes', ?2)",
+            params![symbol, notes],
+        );
+    }
+    if let Some(ref fields) = payload.custom_fields {
+        if let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
+            return HttpResponse::InternalServerError().body(err);
+        }
+    }
+    HttpResponse::Ok().json("ok")
+}
+
+#[get("/api/holdings/symbol-fields")]
+async fn get_holdings_symbol_fields(db_path: web::Data<PathBuf>) -> impl Responder {
+    match load_holdings_symbol_fields(&db_path) {
+        Ok(fields) => HttpResponse::Ok().json(fields),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "holdings_symbol_fields_fetch", "api", None, &err);
             HttpResponse::InternalServerError().body(err)
         }
     }
@@ -841,8 +915,12 @@ async fn main() -> std::io::Result<()> {
             .service(delete_watchlist_symbol)
             .service(get_config)
             .service(update_config)
+            .service(get_watchlist_cached_prices)
             .service(get_watchlist_prices)
+            .service(get_cached_prices)
             .service(get_current_prices)
+            .service(update_holdings_symbol_fields)
+            .service(get_holdings_symbol_fields)
             .service(get_holdings)
             .service(add_holding_transaction)
             .service(update_holding_transaction)
@@ -967,6 +1045,52 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
+    // cached_current_prices: stores the most recent fetched price per symbol
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cached_current_prices (
+            symbol TEXT PRIMARY KEY,
+            price REAL,
+            change REAL,
+            change_percent REAL,
+            volume INTEGER,
+            last_updated TEXT NOT NULL,
+            price_date TEXT
+        );",
+    )
+    .map_err(|err| err.to_string())?;
+
+    // Seed cache from historical prices for any symbol not yet cached
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO cached_current_prices (symbol, price, change, change_percent, volume, last_updated, price_date)
+         SELECT p.symbol, p.close, NULL, NULL, p.volume, p.fetched_at, p.date
+         FROM prices p
+         INNER JOIN (SELECT symbol, MAX(date) as max_date FROM prices WHERE close IS NOT NULL GROUP BY symbol) latest
+         ON p.symbol = latest.symbol AND p.date = latest.max_date
+         WHERE p.symbol NOT IN (SELECT symbol FROM cached_current_prices);"
+    ).map_err(|err| err.to_string())?;
+
+    // holdings_custom_fields: per-transaction values for user-defined custom fields
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS holdings_custom_fields (
+            transaction_id INTEGER NOT NULL,
+            field_key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (transaction_id, field_key)
+        );",
+    )
+    .map_err(|err| err.to_string())?;
+
+    // holdings_symbol_fields: per-symbol master values for user-defined custom fields
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS holdings_symbol_fields (
+            symbol TEXT NOT NULL,
+            field_key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (symbol, field_key)
+        );",
+    )
+    .map_err(|err| err.to_string())?;
+
     // Migrate: add columns if they don't exist
     add_column_if_missing(&conn, "holdings_transactions", "brokerage", "REAL")?;
     add_column_if_missing(&conn, "holdings_transactions", "currency", "TEXT NOT NULL DEFAULT 'AUD'")?;
@@ -1059,6 +1183,224 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
 
     // Ensure notes column exists (safety net for any remaining edge cases)
     add_column_if_missing(&conn, "watchlist_symbols", "notes", "TEXT")?;
+
+    // Audit table: records every change to any tracked table
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            row_id TEXT,
+            old_values TEXT,
+            new_values TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_table ON audit_log(table_name, timestamp);",
+    )
+    .map_err(|err| err.to_string())?;
+
+    // Create triggers for all tracked tables.
+    // Each trigger captures old/new values as JSON.
+    let trigger_sql = "
+        -- watchlist_symbols
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbols_insert AFTER INSERT ON watchlist_symbols
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbols', 'INSERT', NEW.symbol, NULL,
+                json_object('symbol', NEW.symbol, 'notes', NEW.notes, 'updated_at', NEW.updated_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbols_update AFTER UPDATE ON watchlist_symbols
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbols', 'UPDATE', NEW.symbol,
+                json_object('symbol', OLD.symbol, 'notes', OLD.notes, 'updated_at', OLD.updated_at),
+                json_object('symbol', NEW.symbol, 'notes', NEW.notes, 'updated_at', NEW.updated_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbols_delete AFTER DELETE ON watchlist_symbols
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbols', 'DELETE', OLD.symbol,
+                json_object('symbol', OLD.symbol, 'notes', OLD.notes, 'updated_at', OLD.updated_at), NULL);
+        END;
+
+        -- watchlist_memberships
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_memberships_insert AFTER INSERT ON watchlist_memberships
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_memberships', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'list_name', NEW.list_name, 'added_at', NEW.added_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_memberships_update AFTER UPDATE ON watchlist_memberships
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_memberships', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'list_name', OLD.list_name, 'added_at', OLD.added_at),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'list_name', NEW.list_name, 'added_at', NEW.added_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_memberships_delete AFTER DELETE ON watchlist_memberships
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_memberships', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'list_name', OLD.list_name, 'added_at', OLD.added_at), NULL);
+        END;
+
+        -- watchlist_symbol_fields
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbol_fields_insert AFTER INSERT ON watchlist_symbol_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbol_fields', 'INSERT', NEW.symbol || ':' || NEW.field_key, NULL,
+                json_object('symbol', NEW.symbol, 'field_key', NEW.field_key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbol_fields_update AFTER UPDATE ON watchlist_symbol_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbol_fields', 'UPDATE', NEW.symbol || ':' || NEW.field_key,
+                json_object('symbol', OLD.symbol, 'field_key', OLD.field_key, 'value', OLD.value),
+                json_object('symbol', NEW.symbol, 'field_key', NEW.field_key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbol_fields_delete AFTER DELETE ON watchlist_symbol_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbol_fields', 'DELETE', OLD.symbol || ':' || OLD.field_key,
+                json_object('symbol', OLD.symbol, 'field_key', OLD.field_key, 'value', OLD.value), NULL);
+        END;
+
+        -- holdings_transactions
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_insert AFTER INSERT ON holdings_transactions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
+                    'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_update AFTER UPDATE ON holdings_transactions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
+                    'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
+                    'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_delete AFTER DELETE ON holdings_transactions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
+                    'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate), NULL);
+        END;
+
+        -- holdings_custom_fields
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_custom_fields_insert AFTER INSERT ON holdings_custom_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_custom_fields', 'INSERT', CAST(NEW.transaction_id AS TEXT) || ':' || NEW.field_key, NULL,
+                json_object('transaction_id', NEW.transaction_id, 'field_key', NEW.field_key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_custom_fields_update AFTER UPDATE ON holdings_custom_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_custom_fields', 'UPDATE', CAST(NEW.transaction_id AS TEXT) || ':' || NEW.field_key,
+                json_object('transaction_id', OLD.transaction_id, 'field_key', OLD.field_key, 'value', OLD.value),
+                json_object('transaction_id', NEW.transaction_id, 'field_key', NEW.field_key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_custom_fields_delete AFTER DELETE ON holdings_custom_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_custom_fields', 'DELETE', CAST(OLD.transaction_id AS TEXT) || ':' || OLD.field_key,
+                json_object('transaction_id', OLD.transaction_id, 'field_key', OLD.field_key, 'value', OLD.value), NULL);
+        END;
+
+        -- holdings_symbol_fields
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_symbol_fields_insert AFTER INSERT ON holdings_symbol_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_symbol_fields', 'INSERT', NEW.symbol || ':' || NEW.field_key, NULL,
+                json_object('symbol', NEW.symbol, 'field_key', NEW.field_key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_symbol_fields_update AFTER UPDATE ON holdings_symbol_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_symbol_fields', 'UPDATE', NEW.symbol || ':' || NEW.field_key,
+                json_object('symbol', OLD.symbol, 'field_key', OLD.field_key, 'value', OLD.value),
+                json_object('symbol', NEW.symbol, 'field_key', NEW.field_key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_holdings_symbol_fields_delete AFTER DELETE ON holdings_symbol_fields
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_symbol_fields', 'DELETE', OLD.symbol || ':' || OLD.field_key,
+                json_object('symbol', OLD.symbol, 'field_key', OLD.field_key, 'value', OLD.value), NULL);
+        END;
+
+        -- app_config
+        CREATE TRIGGER IF NOT EXISTS audit_app_config_insert AFTER INSERT ON app_config
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app_config', 'INSERT', NEW.key, NULL,
+                json_object('key', NEW.key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_app_config_update AFTER UPDATE ON app_config
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app_config', 'UPDATE', NEW.key,
+                json_object('key', OLD.key, 'value', OLD.value),
+                json_object('key', NEW.key, 'value', NEW.value));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_app_config_delete AFTER DELETE ON app_config
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app_config', 'DELETE', OLD.key,
+                json_object('key', OLD.key, 'value', OLD.value), NULL);
+        END;
+
+        -- dividend_events
+        CREATE TRIGGER IF NOT EXISTS audit_dividend_events_insert AFTER INSERT ON dividend_events
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_dividend_events_update AFTER UPDATE ON dividend_events
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_dividend_events_delete AFTER DELETE ON dividend_events
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount), NULL);
+        END;
+
+        -- symbol_info
+        CREATE TRIGGER IF NOT EXISTS audit_symbol_info_insert AFTER INSERT ON symbol_info
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'INSERT', NEW.symbol, NULL,
+                json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name, 'currency', NEW.currency));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_symbol_info_update AFTER UPDATE ON symbol_info
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'UPDATE', NEW.symbol,
+                json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name, 'currency', OLD.currency),
+                json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name, 'currency', NEW.currency));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_symbol_info_delete AFTER DELETE ON symbol_info
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'DELETE', OLD.symbol,
+                json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name, 'currency', OLD.currency), NULL);
+        END;
+    ";
+    conn.execute_batch(trigger_sql).map_err(|err| err.to_string())?;
 
     Ok(())
 }
@@ -1293,12 +1635,35 @@ fn fetch_holdings(db_path: &PathBuf) -> Result<Vec<HoldingTransaction>, String> 
                 currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
                 original_price: row.get(11)?,
                 fx_rate: row.get(12)?,
+                custom_fields: std::collections::HashMap::new(),
             })
         })
         .map_err(|err| err.to_string())?;
 
     let mut transactions = rows.collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
+
+    // Load custom fields for all transactions
+    {
+        let mut cf_stmt = conn
+            .prepare("SELECT transaction_id, field_key, value FROM holdings_custom_fields")
+            .map_err(|err| err.to_string())?;
+        let cf_rows = cf_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(|err| err.to_string())?;
+        let mut cf_map: std::collections::HashMap<i64, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+        for row in cf_rows {
+            let (tid, key, val) = row.map_err(|err| err.to_string())?;
+            cf_map.entry(tid).or_default().insert(key, val);
+        }
+        for tx in &mut transactions {
+            if let Some(fields) = cf_map.remove(&tx.id) {
+                tx.custom_fields = fields;
+            }
+        }
+    }
 
     let dividend_totals = calculate_dividend_totals(db_path, &transactions)?;
     for tx in &mut transactions {
@@ -1474,6 +1839,27 @@ fn insert_holding_transaction(
     .map_err(|err| err.to_string())?;
 
     let id = conn.last_insert_rowid();
+
+    // Save custom fields (per-transaction and per-symbol)
+    if let Some(ref fields) = transaction.custom_fields {
+        for (key, value) in fields {
+            if !value.is_empty() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO holdings_custom_fields (transaction_id, field_key, value) VALUES (?1, ?2, ?3)",
+                    params![id, key, value],
+                ).map_err(|err| err.to_string())?;
+            }
+        }
+        upsert_holdings_symbol_fields(&conn, symbol, fields)?;
+    }
+
+    let mut custom_fields = std::collections::HashMap::new();
+    if let Some(fields) = transaction.custom_fields {
+        for (k, v) in fields {
+            if !v.is_empty() { custom_fields.insert(k, v); }
+        }
+    }
+
     let mut stmt = conn
         .prepare(
             "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
@@ -1499,14 +1885,17 @@ fn insert_holding_transaction(
                 currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
                 original_price: row.get(11)?,
                 fx_rate: row.get(12)?,
+                custom_fields: std::collections::HashMap::new(),
             })
         })
         .map_err(|err| err.to_string())?;
 
-    rows.next()
+    let mut result = rows.next()
         .transpose()
         .map_err(|err| err.to_string())?
-        .ok_or_else(|| "Failed to retrieve holding transaction".to_string())
+        .ok_or_else(|| "Failed to retrieve holding transaction".to_string())?;
+    result.custom_fields = custom_fields;
+    Ok(result)
 }
 
 fn modify_holding_transaction(
@@ -1557,6 +1946,23 @@ fn modify_holding_transaction(
     )
     .map_err(|err| err.to_string())?;
 
+    // Update custom fields: delete all then re-insert (per-transaction and per-symbol)
+    conn.execute("DELETE FROM holdings_custom_fields WHERE transaction_id = ?1", params![id])
+        .map_err(|err| err.to_string())?;
+    let mut custom_fields = std::collections::HashMap::new();
+    if let Some(ref fields) = transaction.custom_fields {
+        for (key, value) in fields {
+            if !value.is_empty() {
+                conn.execute(
+                    "INSERT INTO holdings_custom_fields (transaction_id, field_key, value) VALUES (?1, ?2, ?3)",
+                    params![id, key, value],
+                ).map_err(|err| err.to_string())?;
+                custom_fields.insert(key.clone(), value.clone());
+            }
+        }
+        upsert_holdings_symbol_fields(&conn, symbol, fields)?;
+    }
+
     let mut stmt = conn
         .prepare(
             "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
@@ -1582,22 +1988,138 @@ fn modify_holding_transaction(
                 currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
                 original_price: row.get(11)?,
                 fx_rate: row.get(12)?,
+                custom_fields: std::collections::HashMap::new(),
             })
         })
         .map_err(|err| err.to_string())?;
 
-    rows.next()
+    let mut result = rows.next()
         .transpose()
         .map_err(|err| err.to_string())?
-        .ok_or_else(|| "Failed to retrieve updated holding transaction".to_string())
+        .ok_or_else(|| "Failed to retrieve updated holding transaction".to_string())?;
+    result.custom_fields = custom_fields;
+    Ok(result)
 }
 
 fn remove_holding_transaction(db_path: &PathBuf, id: i64) -> Result<bool, String> {
     let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    conn.execute("DELETE FROM holdings_custom_fields WHERE transaction_id = ?1", params![id])
+        .map_err(|err| err.to_string())?;
     let affected = conn
         .execute("DELETE FROM holdings_transactions WHERE id = ?1", params![id])
         .map_err(|err| err.to_string())?;
     Ok(affected > 0)
+}
+
+fn cache_current_price(conn: &Connection, price: &CurrentPrice) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO cached_current_prices (symbol, price, change, change_percent, volume, last_updated, price_date)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            price.symbol, price.price, price.change, price.change_percent,
+            price.volume, price.last_updated, price.price_date,
+        ],
+    ).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn load_cached_prices(db_path: &PathBuf, symbols: &[String]) -> Result<Vec<CurrentPrice>, String> {
+    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let mut results = Vec::new();
+    for sym in symbols {
+        let row = conn.query_row(
+            "SELECT symbol, price, change, change_percent, volume, last_updated, price_date FROM cached_current_prices WHERE symbol = ?1",
+            params![sym],
+            |row| Ok(CurrentPrice {
+                symbol: row.get(0)?,
+                price: row.get(1)?,
+                change: row.get(2)?,
+                change_percent: row.get(3)?,
+                volume: row.get(4)?,
+                last_updated: row.get(5)?,
+                price_date: row.get(6)?,
+                error: None,
+            }),
+        ).optional().map_err(|err| err.to_string())?;
+        if let Some(p) = row {
+            results.push(p);
+        }
+    }
+    Ok(results)
+}
+
+fn load_cached_prices_with_fallback(db_path: &PathBuf, symbols: &[String]) -> Result<Vec<CurrentPrice>, String> {
+    let cached = load_cached_prices(db_path, symbols)?;
+    let cached_set: std::collections::HashSet<String> = cached.iter().map(|p| p.symbol.clone()).collect();
+    let mut results = cached;
+    for sym in symbols {
+        if !cached_set.contains(sym.as_str()) {
+            results.push(CurrentPrice {
+                symbol: sym.clone(),
+                price: None,
+                change: None,
+                change_percent: None,
+                volume: None,
+                last_updated: String::new(),
+                price_date: None,
+                error: None,
+            });
+        }
+    }
+    Ok(results)
+}
+
+fn load_all_cached_prices(db_path: &PathBuf) -> Result<Vec<CurrentPrice>, String> {
+    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let mut stmt = conn.prepare(
+        "SELECT symbol, price, change, change_percent, volume, last_updated, price_date FROM cached_current_prices"
+    ).map_err(|err| err.to_string())?;
+    let rows = stmt.query_map([], |row| Ok(CurrentPrice {
+        symbol: row.get(0)?,
+        price: row.get(1)?,
+        change: row.get(2)?,
+        change_percent: row.get(3)?,
+        volume: row.get(4)?,
+        last_updated: row.get(5)?,
+        price_date: row.get(6)?,
+        error: None,
+    })).map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())
+}
+
+fn load_holdings_symbol_fields(db_path: &PathBuf) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>, String> {
+    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT symbol, field_key, value FROM holdings_symbol_fields")
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|err| err.to_string())?;
+    let mut result: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+    for row in rows {
+        let (symbol, key, val) = row.map_err(|err| err.to_string())?;
+        result.entry(symbol).or_default().insert(key, val);
+    }
+    Ok(result)
+}
+
+fn upsert_holdings_symbol_fields(conn: &Connection, symbol: &str, fields: &std::collections::HashMap<String, String>) -> Result<(), String> {
+    for (key, value) in fields {
+        if value.is_empty() {
+            conn.execute(
+                "DELETE FROM holdings_symbol_fields WHERE symbol = ?1 AND field_key = ?2",
+                params![symbol, key],
+            ).map_err(|err| err.to_string())?;
+        } else {
+            conn.execute(
+                "INSERT OR REPLACE INTO holdings_symbol_fields (symbol, field_key, value) VALUES (?1, ?2, ?3)",
+                params![symbol, key, value],
+            ).map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn load_config(db_path: &PathBuf) -> Result<Vec<ConfigItem>, String> {
@@ -1628,6 +2150,31 @@ fn upsert_config(db_path: &PathBuf, key: &str, value: &str) -> Result<(), String
     )
     .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn persist_price_history(conn: &Connection, symbol: &str, records: &[PriceHistoryPoint]) {
+    let now = Utc::now().to_rfc3339();
+    for r in records {
+        if let Some(close) = r.close {
+            let _ = conn.execute(
+                "INSERT INTO prices (symbol, date, close, volume, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
+                params![symbol, r.date, close, r.volume, now],
+            );
+        }
+    }
+}
+
+fn persist_price_to_history(conn: &Connection, symbol: &str, price: &CurrentPrice, fetched_at: &str) {
+    if let (Some(close), Some(date)) = (price.price, &price.price_date) {
+        let _ = conn.execute(
+            "INSERT INTO prices (symbol, date, close, volume, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
+            params![symbol, date, close, price.volume, fetched_at],
+        );
+    }
 }
 
 async fn fetch_watchlist_current_prices(db_path: &PathBuf, list: Option<&str>) -> Result<Vec<CurrentPrice>, String> {
@@ -1692,6 +2239,21 @@ async fn fetch_watchlist_current_prices(db_path: &PathBuf, list: Option<&str>) -
         }
     }
 
+    // Persist fetched prices to cache and history
+    if let Ok(conn) = Connection::open(db_path) {
+        let now = Utc::now().to_rfc3339();
+        for p in &prices {
+            if p.price.is_some() {
+                let _ = cache_current_price(&conn, p);
+                persist_price_to_history(&conn, &p.symbol, p, &now);
+            }
+        }
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO app_config (key, value) VALUES ('watchlist_prices_updated_at', ?1)",
+            params![now],
+        );
+    }
+
     Ok(prices)
 }
 
@@ -1734,20 +2296,25 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
 
     let last_stored = history.last().map(|h| h.date.as_str()).unwrap_or("").to_string();
     let needs_supplement = last_stored < last_trading_day;
+    let has_enough_data = history.len() as i64 >= days / 2;
 
     let client = Client::builder()
         .user_agent("stocks-api/1.0")
         .build()
         .map_err(|err| err.to_string())?;
 
-    if history.is_empty() {
+    if history.is_empty() || !has_enough_data {
         if let Ok(records) = fetch_price_history_from_yahoo(&client, symbol, days).await {
-            return Ok(records);
+            if records.len() > history.len() {
+                persist_price_history(&conn, symbol, &records);
+                return Ok(records);
+            }
         }
     } else if needs_supplement {
         // Stored data is behind the last trading day — fetch from Yahoo and append missing records
         if let Ok(yahoo) = fetch_price_history_from_yahoo(&client, symbol, days).await {
             let new_records: Vec<_> = yahoo.into_iter().filter(|r| r.date > last_stored).collect();
+            persist_price_history(&conn, symbol, &new_records);
             history.extend(new_records);
         }
     }
@@ -2000,6 +2567,21 @@ async fn fetch_current_prices_for_symbols(
                 });
             }
         }
+    }
+
+    // Persist fetched prices to cache and history
+    if let Ok(conn) = Connection::open(db_path) {
+        let now = Utc::now().to_rfc3339();
+        for p in &prices {
+            if p.price.is_some() {
+                let _ = cache_current_price(&conn, p);
+                persist_price_to_history(&conn, &p.symbol, p, &now);
+            }
+        }
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO app_config (key, value) VALUES ('holdings_prices_updated_at', ?1)",
+            params![now],
+        );
     }
 
     Ok(prices)

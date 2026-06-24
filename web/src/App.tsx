@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import './App.css'
+import { apiClient } from './services/api'
 import WatchlistManager from './components/WatchlistManager'
 import ConfigPanel from './components/ConfigPanel'
 import HoldingsManager from './components/HoldingsManager'
@@ -17,15 +18,59 @@ function App() {
   const [holdingsVersion, setHoldingsVersion] = useState(0)
   const [configVersion, setConfigVersion] = useState(0)
   const [watchlistFocusSymbol, setWatchlistFocusSymbol] = useState<string | null>(null)
+  const [holdingsPrefill, setHoldingsPrefill] = useState<{ symbol: string; price?: number; notes?: string; customFields?: Record<string, string> } | null>(null)
+  const [startupRefreshDone, setStartupRefreshDone] = useState(false)
+  const startupRefreshTriggered = useRef(false)
 
   const handleNavigateToWatchlist = (symbol: string) => {
     setWatchlistFocusSymbol(symbol)
     setActiveTab('watchlist')
   }
 
+  const handleMoveToHoldings = (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string> }) => {
+    setHoldingsPrefill(data)
+    setActiveTab('holdings')
+  }
+
   useEffect(() => {
-    // Test connection to backend on mount
     testBackendConnection()
+  }, [])
+
+  // On first load, refresh all prices and dividends in the background
+  useEffect(() => {
+    if (startupRefreshTriggered.current) return
+    startupRefreshTriggered.current = true
+
+    const doStartupRefresh = async () => {
+      try {
+        const holdings = await apiClient.getHoldings()
+        const netShares: Record<string, number> = {}
+        holdings.forEach((tx) => {
+          if (!netShares[tx.symbol]) netShares[tx.symbol] = 0
+          if (tx.transaction_type === 'purchase' && tx.quantity) netShares[tx.symbol] += tx.quantity
+          if (tx.transaction_type === 'sale' && tx.quantity) netShares[tx.symbol] -= tx.quantity
+        })
+        const holdingSymbols = Object.keys(netShares).filter((s) => netShares[s] > 0)
+
+        // Run each refresh independently so one doesn't block the others
+        if (holdingSymbols.length > 0) {
+          apiClient.getCurrentPrices(holdingSymbols)
+            .then(() => setHoldingsVersion((v) => v + 1))
+            .catch((err) => console.error('Holdings price refresh failed:', err))
+        }
+        apiClient.getWatchlistPrices()
+          .then(() => setHoldingsVersion((v) => v + 1))
+          .catch((err) => console.error('Watchlist price refresh failed:', err))
+        apiClient.refreshDividends()
+          .then(() => setHoldingsVersion((v) => v + 1))
+          .catch((err) => console.error('Dividend refresh failed:', err))
+      } catch (err) {
+        console.error('Startup refresh failed:', err)
+      } finally {
+        setStartupRefreshDone(true)
+      }
+    }
+    doStartupRefresh()
   }, [])
 
   const testBackendConnection = async () => {
@@ -109,10 +154,10 @@ function App() {
           <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} onNavigateToWatchlist={handleNavigateToWatchlist} />
         </div>
         <div style={{ display: activeTab === 'watchlist' ? 'block' : 'none' }}>
-          <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} />
+          <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} onMoveToHoldings={handleMoveToHoldings} />
         </div>
         <div style={{ display: activeTab === 'holdings' ? 'block' : 'none' }}>
-          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} />
+          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} prefill={holdingsPrefill} onPrefillConsumed={() => setHoldingsPrefill(null)} />
         </div>
         <div style={{ display: activeTab === 'sold' ? 'block' : 'none' }}>
           <SoldStocks onLoading={setLoading} holdingsVersion={holdingsVersion} />

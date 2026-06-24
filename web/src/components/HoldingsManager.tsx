@@ -19,11 +19,26 @@ interface HoldingTransaction {
   currency: string
   original_price: number | null
   fx_rate: number | null
+  custom_fields: Record<string, string>
+}
+
+interface HoldingsFieldDef {
+  key: string
+  label: string
+  type: 'text' | 'number' | 'date'
+  actions: string[]
 }
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
-export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number }) {
+interface HoldingsPrefill {
+  symbol: string
+  price?: number
+  notes?: string
+  customFields?: Record<string, string>
+}
+
+export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion, prefill, onPrefillConsumed }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number; prefill?: HoldingsPrefill | null; onPrefillConsumed?: () => void }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [currentPrices, setCurrentPrices] = useState<Record<string, number | null>>({})
   const [currentPriceDates, setCurrentPriceDates] = useState<Record<string, string | null>>({})
@@ -45,6 +60,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [fxRate, setFxRate] = useState<number | null>(null)
   const [fxRateDate, setFxRateDate] = useState<string | null>(null)
   const [fxLoading, setFxLoading] = useState(false)
+  const [customFieldValues, setCustomFieldValues] = useState<Record<string, string>>({})
+  const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
+  const [editingSymbolCard, setEditingSymbolCard] = useState<string | null>(null)
+  const [editCardNotes, setEditCardNotes] = useState('')
+  const [editCardFields, setEditCardFields] = useState<Record<string, string>>({})
   const [editingId, setEditingId] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -53,6 +73,36 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   useEffect(() => {
     loadHoldings()
   }, [configVersion])
+
+  // Pre-fill form when navigating from watchlist
+  useEffect(() => {
+    if (!prefill) return
+    setEditingId(null)
+    setSymbol(prefill.symbol)
+    setTransactionType('purchase')
+    setDate(new Date().toISOString().slice(0, 10))
+    setQuantity('')
+    if (prefill.price != null) setPrice(prefill.price.toString())
+    else setPrice('')
+    setAmount('')
+    setBrokerage('')
+    setNotes(prefill.notes ?? '')
+    // Map watchlist custom fields to holdings custom fields by matching key names
+    const mappedFields: Record<string, string> = {}
+    if (prefill.customFields) {
+      const holdingsDefs: HoldingsFieldDef[] = (() => {
+        try { return JSON.parse(appConfig['holdings_custom_fields'] ?? '[]') } catch { return [] }
+      })()
+      const holdingsKeys = new Set(holdingsDefs.map((d) => d.key))
+      for (const [key, value] of Object.entries(prefill.customFields)) {
+        if (holdingsKeys.has(key) && value) {
+          mappedFields[key] = value
+        }
+      }
+    }
+    setCustomFieldValues(mappedFields)
+    onPrefillConsumed?.()
+  }, [prefill])
 
   // Auto-detect currency from symbolInfo when adding a new transaction
   useEffect(() => {
@@ -64,6 +114,17 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setCurrency('AUD')
     }
   }, [symbol, symbolInfo])
+
+  // Pre-populate custom fields from per-symbol values when entering a new transaction
+  useEffect(() => {
+    if (editingId !== null) return
+    const symFields = holdingsSymbolFields[symbol.trim().toUpperCase()]
+    if (symFields) {
+      setCustomFieldValues(symFields)
+    } else {
+      setCustomFieldValues({})
+    }
+  }, [symbol, holdingsSymbolFields, editingId])
 
   useEffect(() => {
     if (currency === 'AUD') {
@@ -102,15 +163,17 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setSelectedChartSymbol((prev) => prev || symbols[0] || '')
       if (symbols.length > 0) {
         try {
-          const [prices, config, infoData, fxData] = await Promise.all([
-            apiClient.getCurrentPrices(symbols),
+          const [prices, config, infoData, fxData, symFields] = await Promise.all([
+            apiClient.getCachedPrices(symbols),
             apiClient.getConfig(),
             apiClient.getSymbolInfo(),
             apiClient.getFxRates(),
+            apiClient.getHoldingsSymbolFields(),
           ])
           const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
           infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
           setSymbolInfo(infoMap)
+          setHoldingsSymbolFields(symFields)
           if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
           setAppConfig(config)
           const priceMap: Record<string, number | null> = {}
@@ -180,6 +243,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       date,
       brokerage: brokerage ? parseFloat(brokerage) : undefined,
       notes: notes.trim() || undefined,
+      custom_fields: Object.keys(customFieldValues).length > 0 ? customFieldValues : undefined,
     }
 
     if (transactionType === 'purchase' || transactionType === 'sale') {
@@ -255,6 +319,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setAmount('')
       setBrokerage('')
       setNotes('')
+      setCustomFieldValues({})
       setDate(new Date().toISOString().slice(0, 10))
       setCurrency('AUD')
       setFxRate(null)
@@ -286,6 +351,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setCurrency(tx.currency || 'AUD')
     setFxRate(tx.fx_rate ?? null)
     setFxRateDate(tx.currency !== 'AUD' ? tx.date : null)
+    setCustomFieldValues(tx.custom_fields ?? {})
     setSuccess(null)
     setError(null)
   }
@@ -300,6 +366,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setAmount('')
     setBrokerage('')
     setNotes('')
+    setCustomFieldValues({})
     setCurrency('AUD')
     setFxRate(null)
     setFxRateDate(null)
@@ -467,6 +534,12 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     if (currency && currency !== 'AUD' && usdToAud) return rawPrice * usdToAud
     return rawPrice
   }
+
+  const holdingsFieldDefs: HoldingsFieldDef[] = useMemo(() => {
+    try {
+      return JSON.parse(appConfig['holdings_custom_fields'] ?? '[]')
+    } catch { return [] }
+  }, [appConfig])
 
   const summary = useMemo(() => {
     const groupedBySymbol: Record<string, HoldingTransaction[]> = {}
@@ -780,6 +853,24 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
               </button>
             )}
           </div>
+          {holdingsFieldDefs.filter((def) => def.actions.includes(transactionType)).length > 0 && (
+            <div className="form-group" style={{ flexWrap: 'wrap' }}>
+              {holdingsFieldDefs
+                .filter((def) => def.actions.includes(transactionType))
+                .map((def) => (
+                  <input
+                    key={def.key}
+                    type={def.type}
+                    value={customFieldValues[def.key] ?? ''}
+                    onChange={(e) => setCustomFieldValues((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                    placeholder={def.label}
+                    className="symbol-input"
+                    disabled={loading}
+                    style={{ flex: 1, minWidth: 120 }}
+                  />
+                ))}
+            </div>
+          )}
         </form>
       </div>
 
@@ -860,8 +951,25 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   key={item.symbol}
                   className="holdings-summary-card"
                   onClick={() => setSelectedChartSymbol(item.symbol)}
-                  style={{ cursor: 'pointer', outline: isSelected ? '2px solid #1976d2' : undefined, outlineOffset: isSelected ? '-2px' : undefined }}
+                  style={{ cursor: 'pointer', outline: isSelected ? '2px solid #1976d2' : undefined, outlineOffset: isSelected ? '-2px' : undefined, position: 'relative' }}
                 >
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setEditingSymbolCard(item.symbol)
+                      setEditCardNotes(holdingsSymbolFields[item.symbol]?.['_notes'] ?? '')
+                      const fields: Record<string, string> = {}
+                      holdingsFieldDefs.forEach((def) => {
+                        fields[def.key] = holdingsSymbolFields[item.symbol]?.[def.key] ?? ''
+                      })
+                      setEditCardFields(fields)
+                    }}
+                    className="btn btn-outline btn-small"
+                    style={{ position: 'absolute', top: 4, right: 4, padding: '2px 6px', fontSize: 12, lineHeight: 1 }}
+                    title="Edit notes & fields"
+                  >
+                    ✏️
+                  </button>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                     <strong>{item.symbol}</strong>
                     {symbolInfo[item.symbol]?.instrument_type && (
@@ -877,6 +985,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   </div>
                   {symbolInfo[item.symbol]?.long_name && (
                     <div style={{ fontSize: 11, color: '#888', marginBottom: 2 }}>{symbolInfo[item.symbol].long_name}</div>
+                  )}
+                  {holdingsSymbolFields[item.symbol]?.['_notes'] && (
+                    <div style={{ fontSize: 11, color: '#5c6bc0', fontStyle: 'italic', marginBottom: 2 }}>{holdingsSymbolFields[item.symbol]['_notes']}</div>
                   )}
                   <div style={{ color: manualPriceSymbols.has(item.symbol) ? '#2196f3' : undefined }}>
                     {item.shares % 1 === 0 ? item.shares.toFixed(0) : item.shares.toFixed(2)}@{item.currentPrice ? `$${item.currentPrice.toFixed(2)}` : '—'}
@@ -904,6 +1015,14 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   )}
                   <div>Current value: ${item.currentValue.toFixed(2)}</div>
                   <div>Dividends: ${item.dividends.toFixed(2)}</div>
+                  {holdingsFieldDefs.map((def) => {
+                    const val = holdingsSymbolFields[item.symbol]?.[def.key]
+                    return val ? (
+                      <div key={def.key} style={{ fontSize: 11, color: '#555' }}>
+                        <span style={{ color: '#999' }}>{def.label}:</span> {val}
+                      </div>
+                    ) : null
+                  })}
                   {(() => {
                     const pl = item.currentValue - item.invested + item.dividends
                     const pct = item.invested > 0 ? (pl / item.invested) * 100 : null
@@ -997,7 +1116,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                     <th className="sortable-header" onClick={() => handleSort('dividends')}>Total Dividends{sortIndicator('dividends')}</th>
                     <th>Brokerage</th>
                     <th>Notes</th>
-                    <th></th>
+                    {holdingsFieldDefs.map((def) => (
+                      <th key={def.key}>{def.label}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
@@ -1048,10 +1169,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                         </td>
                         <td>{tx.brokerage !== null ? `$${tx.brokerage.toFixed(2)}` : '—'}</td>
                         <td>{tx.notes || '—'}</td>
-                        <td>
-                          <button className="btn btn-secondary btn-small" onClick={() => startEditingTransaction(tx)} disabled={loading}>Edit</button>
-                          <button className="btn btn-danger btn-small" onClick={() => handleDeleteTransaction(tx.id)} disabled={loading}>Delete</button>
-                        </td>
+                        {holdingsFieldDefs.map((def) => (
+                          <td key={def.key}>{tx.custom_fields?.[def.key] || '—'}</td>
+                        ))}
                       </tr>
                     )
                   })}
@@ -1062,6 +1182,80 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
           </>
         )}
       </div>
+
+      {editingSymbolCard && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={() => setEditingSymbolCard(null)}>
+          <div style={{ background: '#fff', borderRadius: 8, padding: 24, minWidth: 320, boxShadow: '0 4px 24px rgba(0,0,0,0.18)' }}
+            onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 16px' }}>Edit {editingSymbolCard}</h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 16 }}>
+              <label style={{ fontSize: 13, color: '#666' }}>Notes</label>
+              <input
+                type="text"
+                value={editCardNotes}
+                onChange={(e) => setEditCardNotes(e.target.value)}
+                placeholder="Add a note..."
+                className="symbol-input"
+                style={{ width: '100%' }}
+              />
+            </div>
+            {holdingsFieldDefs.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+                {holdingsFieldDefs.map((def) => (
+                  <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
+                    <input
+                      type={def.type}
+                      value={editCardFields[def.key] ?? ''}
+                      onChange={(e) => setEditCardFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                      className="symbol-input"
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-outline" onClick={() => setEditingSymbolCard(null)}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                disabled={loading}
+                onClick={async () => {
+                  if (!editingSymbolCard) return
+                  try {
+                    setLoading(true)
+                    const fields = { ...editCardFields }
+                    await apiClient.updateHoldingsSymbolFields(editingSymbolCard, editCardNotes.trim() || null, fields)
+                    // Update local state
+                    const updated = { ...holdingsSymbolFields }
+                    if (!updated[editingSymbolCard]) updated[editingSymbolCard] = {}
+                    if (editCardNotes.trim()) {
+                      updated[editingSymbolCard]['_notes'] = editCardNotes.trim()
+                    } else {
+                      delete updated[editingSymbolCard]['_notes']
+                    }
+                    Object.entries(fields).forEach(([k, v]) => {
+                      if (v) updated[editingSymbolCard][k] = v
+                      else delete updated[editingSymbolCard][k]
+                    })
+                    setHoldingsSymbolFields(updated)
+                    setEditingSymbolCard(null)
+                    setSuccess('Updated fields for ' + editingSymbolCard)
+                    setTimeout(() => setSuccess(null), 3000)
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : 'Failed to update fields')
+                  } finally {
+                    setLoading(false)
+                  }
+                }}
+              >
+                {loading ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   )
