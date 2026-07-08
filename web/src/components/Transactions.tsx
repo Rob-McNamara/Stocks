@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { apiClient } from '../services/api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { apiClient, type HoldingTransactionPayload } from '../services/api'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
@@ -41,6 +41,8 @@ interface TransactionRow {
   amount: number | null
   brokerage: number | null
   notes: string | null
+  /** true for dividend_events rows (per-share amount); false for manual dividend transactions (total dollars) */
+  perShare: boolean
 }
 
 interface EditState {
@@ -54,6 +56,14 @@ interface EditState {
   amount: string
   brokerage: string
   notes: string
+  custom_fields: Record<string, string>
+}
+
+interface HoldingsFieldDef {
+  key: string
+  label: string
+  type: 'text' | 'number' | 'date'
+  actions: string[]
 }
 
 type FilterType = 'all' | 'purchase' | 'sale' | 'dividend'
@@ -70,6 +80,11 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const [editFxRate, setEditFxRate] = useState<number | null>(null)
   const [editFxDate, setEditFxDate] = useState<string | null>(null)
   const [editFxLoading, setEditFxLoading] = useState(false)
+  // FX rate stored on the transaction being edited — reused as long as the
+  // user doesn't change currency or date, so editing other fields never
+  // silently rewrites the historical rate.
+  const editFxSeed = useRef<{ currency: string; date: string; rate: number | null } | null>(null)
+  const [holdingsFieldDefs, setHoldingsFieldDefs] = useState<HoldingsFieldDef[]>([])
 
   useEffect(() => {
     const load = async () => {
@@ -77,12 +92,16 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         setLoading(true)
         setError(null)
         onLoading(true)
-        const [txData, divData] = await Promise.all([
+        const [txData, divData, configData] = await Promise.all([
           apiClient.getHoldings(),
           apiClient.getDividends(),
+          apiClient.getConfig(),
         ])
         setTransactions(txData)
         setDividends(divData)
+        try {
+          setHoldingsFieldDefs(JSON.parse(configData['holdings_custom_fields'] ?? '[]'))
+        } catch { setHoldingsFieldDefs([]) }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load transactions')
       } finally {
@@ -99,6 +118,12 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       setEditFxDate(null)
       return
     }
+    const seed = editFxSeed.current
+    if (seed && seed.rate != null && seed.currency === editing.currency && seed.date === editing.date) {
+      setEditFxRate(seed.rate)
+      setEditFxDate(editing.date)
+      return
+    }
     setEditFxLoading(true)
     apiClient.getFxRateForDate(editing.currency, editing.date).then((result) => {
       if (result) {
@@ -109,7 +134,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         setEditFxDate(null)
       }
     }).finally(() => setEditFxLoading(false))
-  }, [editing?.currency, editing?.date])
+  }, [editing?.currency, editing?.date, editing?.type])
 
   const rows = useMemo((): TransactionRow[] => {
     // Track the earliest purchase date per symbol
@@ -135,10 +160,20 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       amount: tx.amount,
       brokerage: tx.brokerage,
       notes: tx.notes,
+      perShare: false,
     }))
+
+    // Skip fetched dividend events already recorded as a manual dividend
+    // transaction on the same day, so the same dividend isn't listed twice.
+    const manualDividendKeys = new Set(
+      transactions
+        .filter((tx) => tx.transaction_type === 'dividend')
+        .map((tx) => `${tx.symbol}|${tx.date}`)
+    )
 
     const divRows: TransactionRow[] = dividends
       .filter((d) => firstPurchaseDate[d.symbol] && d.ex_date >= firstPurchaseDate[d.symbol])
+      .filter((d) => !manualDividendKeys.has(`${d.symbol}|${d.ex_date}`))
       .map((d, i) => ({
         key: `div-${d.symbol}-${d.ex_date}-${i}`,
         id: null,
@@ -152,6 +187,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         amount: d.amount,
         brokerage: null,
         notes: d.payment_date ? `Payment: ${new Date(d.payment_date).toLocaleDateString()}` : null,
+        perShare: true,
       }))
 
     return [...txRows, ...divRows]
@@ -167,6 +203,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     const displayPrice = currency !== 'AUD' && tx?.original_price != null
       ? tx.original_price.toString()
       : (row.price !== null ? row.price.toString() : '')
+    editFxSeed.current = { currency, date: row.date, rate: tx?.fx_rate ?? null }
     setEditFxRate(tx?.fx_rate ?? null)
     setEditFxDate(currency !== 'AUD' ? row.date : null)
     setEditing({
@@ -180,6 +217,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       amount: row.amount !== null ? row.amount.toString() : '',
       brokerage: row.brokerage !== null ? row.brokerage.toString() : '',
       notes: row.notes ?? '',
+      custom_fields: tx?.custom_fields ?? {},
     })
   }
 
@@ -199,9 +237,14 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
 
   const handleSave = async () => {
     if (!editing) return
+    // Never silently re-save a foreign-currency transaction as AUD
+    if ((editing.type === 'purchase' || editing.type === 'sale') && editing.currency !== 'AUD' && !editFxRate) {
+      setError(`No ${editing.currency}/AUD exchange rate available for ${editing.date} — cannot save. Retry, or pick a different date.`)
+      return
+    }
     try {
       setSaving(true)
-      const payload: Record<string, unknown> = {
+      const payload: HoldingTransactionPayload = {
         symbol: editing.symbol,
         transaction_type: editing.type,
         date: editing.date,
@@ -222,10 +265,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           payload.price = editing.price ? parseFloat(editing.price) : undefined
         }
       }
-      // Preserve existing custom_fields so they aren't deleted by the backend
-      const existingTx = transactions.find((tx) => tx.id === editing.id)
-      if (existingTx?.custom_fields && Object.keys(existingTx.custom_fields).length > 0) {
-        payload.custom_fields = existingTx.custom_fields
+      if (Object.keys(editing.custom_fields).length > 0) {
+        payload.custom_fields = editing.custom_fields
       }
       const updated = await apiClient.updateHoldingTransaction(editing.id, payload)
       setTransactions((prev) => prev.map((tx) => tx.id === editing.id ? updated : tx))
@@ -329,7 +370,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                     </td>
                     <td>
                       {row.type === 'dividend' && row.amount !== null
-                        ? `$${row.amount.toFixed(4)} per share`
+                        ? row.perShare
+                          ? `$${row.amount.toFixed(4)} per share`
+                          : `$${row.amount.toFixed(2)}`
                         : row.quantity !== null && row.price !== null
                         ? `$${(row.quantity * row.price).toFixed(2)}`
                         : '—'}
@@ -430,6 +473,17 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                 <label style={{ fontSize: 13, color: '#666' }}>Notes</label>
                 <input type="text" className="config-input" value={editing.notes} onChange={(e) => setEditing({ ...editing, notes: e.target.value })} />
               </div>
+              {holdingsFieldDefs.filter((def) => def.actions.includes(editing.type)).map((def) => (
+                <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
+                  <input
+                    type={def.type}
+                    className="config-input"
+                    value={editing.custom_fields[def.key] ?? ''}
+                    onChange={(e) => setEditing({ ...editing, custom_fields: { ...editing.custom_fields, [def.key]: e.target.value } })}
+                  />
+                </div>
+              ))}
             </div>
             <div style={{ display: 'flex', gap: 10, marginTop: 22, justifyContent: 'flex-end' }}>
               <button className="btn btn-secondary" onClick={() => setEditing(null)} disabled={saving}>Cancel</button>

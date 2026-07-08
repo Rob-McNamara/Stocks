@@ -245,6 +245,19 @@ describe('calcPortfolioPL', () => {
     expect(result.soldPL).toBeCloseTo(60)
   })
 
+  it('partial sale: dividends counted once, not doubled', () => {
+    const txs = [
+      makeTx(1, 'purchase', '2024-01-01', 100, 10, { dividends_total: 50 }),
+      makeTx(2, 'sale',     '2024-06-01',  40, 10),  // sold at cost — no trading P/L
+    ]
+    // 60 shares remain at price == cost → unrealised 0; dividends belong to the
+    // holdings side only. Total P/L must be exactly $50, not $100.
+    const result = calcPortfolioPL(txs, { 'TST.AX': 10 })
+    expect(result.holdingsPL).toBeCloseTo(50)
+    expect(result.soldPL).toBeCloseTo(0)
+    expect(result.totalPL).toBeCloseTo(50)
+  })
+
   it('multiple symbols summed correctly', () => {
     const txs = [
       { ...makeTx(1, 'purchase', '2024-01-01', 100, 10), symbol: 'AAA.AX' },

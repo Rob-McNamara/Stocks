@@ -53,7 +53,8 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   const [watchlistEntries, setWatchlistEntries] = useState<SymbolSmaEntry[]>([])
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; currency: string | null }>>({})
   const [appConfig, setAppConfig] = useState<Record<string, string>>({})
-  const [usdToAud, setUsdToAud] = useState<number | null>(null)
+  /** AUD per 1 unit of each foreign currency, keyed by ISO code (e.g. USD, GBP) */
+  const [fxRates, setFxRates] = useState<Record<string, number | null>>({})
   const [watchlistFieldValues, setWatchlistFieldValues] = useState<Record<string, Record<string, string>>>({})
   const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
   const [loading, setLoading] = useState(true)
@@ -69,32 +70,35 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       setError(null)
       onLoading(true)
 
-      const [txData, watchlistSymbols, watchlistPricesData, , configData, infoData, fxData, hSymFields] = await Promise.all([
+      const [txData, watchlistSymbols, watchlistPricesData, configData, infoData, hSymFields] = await Promise.all([
         apiClient.getHoldings(),
         apiClient.getWatchlistSymbols(),
         apiClient.getWatchlistCachedPrices(),
-        apiClient.getDividends(),
         apiClient.getConfig(),
         apiClient.getSymbolInfo(),
-        apiClient.getFxRates(),
         apiClient.getHoldingsSymbolFields(),
       ])
       setTransactions(txData)
       setHoldingsSymbolFields(hSymFields)
-      // Build watchlist custom field map: symbol -> { field_key: value }
+      // Build watchlist field map: symbol -> { field_key: value }
       const wfMap: Record<string, Record<string, string>> = {}
-      watchlistSymbols.forEach((s) => {
-        if (s.custom_fields) {
-          if (!wfMap[s.symbol]) wfMap[s.symbol] = {}
-          Object.assign(wfMap[s.symbol], s.custom_fields)
-        }
+      watchlistSymbols.forEach((s: { symbol: string; breakthrough_price?: number | null; stop_loss_price?: number | null; custom_fields?: Record<string, string> }) => {
+        if (!wfMap[s.symbol]) wfMap[s.symbol] = {}
+        if (s.breakthrough_price != null) wfMap[s.symbol]['breakthrough_price'] = String(s.breakthrough_price)
+        if (s.stop_loss_price != null) wfMap[s.symbol]['stop_loss_price'] = String(s.stop_loss_price)
+        if (s.custom_fields) Object.assign(wfMap[s.symbol], s.custom_fields)
       })
       setWatchlistFieldValues(wfMap)
       setAppConfig(configData)
-      if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
       const infoMap: Record<string, { instrument_type: string | null; currency: string | null }> = {}
       infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, currency: i.currency } })
       setSymbolInfo(infoMap)
+
+      // Fetch an AUD rate for every foreign currency actually present
+      const currencies = Array.from(new Set(
+        infoData.map((i) => i.currency?.toUpperCase()).filter((c): c is string => !!c && c !== 'AUD')
+      ))
+      apiClient.getFxRates(currencies).then(setFxRates).catch(() => setFxRates({}))
 
       const holdingSymbols = Array.from(new Set(txData.map((tx) => tx.symbol)))
 
@@ -196,8 +200,8 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
     const isEtf = (symbol: string) => etfTypes.has(getType(symbol))
     const toAud = (price: number, symbol: string) => {
       const currency = symbolInfo[symbol]?.currency?.toUpperCase()
-      if (currency && currency !== 'AUD' && usdToAud) return price * usdToAud
-      return price
+      const rate = currency && currency !== 'AUD' ? fxRates[currency] : null
+      return rate ? price * rate : price
     }
 
     const groupedBySymbol: Record<string, HoldingTransaction[]> = {}
@@ -205,6 +209,10 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       if (!groupedBySymbol[tx.symbol]) groupedBySymbol[tx.symbol] = []
       groupedBySymbol[tx.symbol].push(tx)
     })
+
+    // Per-sector aggregation — sector comes from the symbol-level 'sector'
+    // field; holdings without one are grouped under "Unallocated".
+    const sectorAgg: Record<string, { count: number; value: number; dividends: number; pl: number; cost: number }> = {}
 
     let stockCount = 0
     let equityCount = 0, etfCount = 0, soldCount = 0
@@ -252,15 +260,20 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
             remaining -= used
             if (lots[0].quantity <= 0) lots.shift()
           }
-          const saleDividends = totalSoldQty > 0 ? (tx.quantity / totalSoldQty) * symbolDividends : 0
-          symbolSoldPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis + saleDividends
-          symbolSoldDividends += saleDividends
+          symbolSoldPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis
           symbolSoldProceeds += tx.quantity * tx.price
         }
       })
 
       const remainingShares = lots.reduce((s, l) => s + l.quantity, 0)
       const remainingCost = lots.reduce((s, l) => s + l.quantity * l.price, 0)
+
+      // Count each dividend dollar once: holdings side while shares remain,
+      // sold side only once the position is fully closed.
+      if (remainingShares === 0 && totalSoldQty > 0) {
+        symbolSoldDividends = symbolDividends
+        symbolSoldPL += symbolDividends
+      }
 
       if (remainingShares > 0) {
         stockCount++
@@ -272,6 +285,14 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
         holdingsPL += symPL
         holdingsDividends += symbolDividends
         holdingsCost += remainingCost
+
+        const sectorName = holdingsSymbolFields[symbol]?.['sector'] || 'Unallocated'
+        const agg = sectorAgg[sectorName] ?? (sectorAgg[sectorName] = { count: 0, value: 0, dividends: 0, pl: 0, cost: 0 })
+        agg.count++
+        agg.value += currentValue
+        agg.dividends += symbolDividends
+        agg.pl += symPL
+        agg.cost += remainingCost
 
         if (isEtf(symbol)) {
           etfCount++
@@ -297,6 +318,10 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       soldProceeds += symbolSoldProceeds
     })
 
+    const sectors = Object.entries(sectorAgg)
+      .map(([name, agg]) => ({ name, ...agg }))
+      .sort((a, b) => b.value - a.value)
+
     return {
       stockCount, equityCount, etfCount, soldCount,
       totalValue, totalPL: holdingsPL + soldPL,
@@ -304,16 +329,17 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       soldPL, soldDividendsTotal, soldProceeds, soldCost,
       equityValue, equityDividends, equityPL, equityCost,
       etfValue, etfDividends, etfPL, etfCost,
+      sectors,
     }
-  }, [transactions, holdingPrices, symbolInfo, appConfig, usdToAud])
+  }, [transactions, holdingPrices, symbolInfo, appConfig, fxRates, holdingsSymbolFields])
 
   const worstHoldings = useMemo((): SymbolSmaEntry[] => {
     const activeSyms = new Set(getActiveHoldingSymbols(transactions))
 
     const toAud = (price: number, symbol: string) => {
       const currency = symbolInfo[symbol]?.currency?.toUpperCase()
-      if (currency && currency !== 'AUD' && usdToAud) return price * usdToAud
-      return price
+      const rate = currency && currency !== 'AUD' ? fxRates[currency] : null
+      return rate ? price * rate : price
     }
     return Array.from(activeSyms)
       .map((symbol) => {
@@ -327,7 +353,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       .filter((item): item is SymbolSmaEntry & { pctDiff: number } => item.pctDiff !== null)
       .sort((a, b) => a.pctDiff - b.pctDiff)
       .slice(0, 15)
-  }, [transactions, holdingPrices, holdingSma, symbolInfo, usdToAud])
+  }, [transactions, holdingPrices, holdingSma, symbolInfo, fxRates])
 
   const bestWatchlist = useMemo(() => {
     return [...watchlistEntries]
@@ -342,12 +368,6 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   }, [appConfig])
 
   const customDashboardLists = useMemo(() => {
-    const toAud = (price: number, symbol: string) => {
-      const currency = symbolInfo[symbol]?.currency?.toUpperCase()
-      if (currency && currency !== 'AUD' && usdToAud) return price * usdToAud
-      return price
-    }
-
     return dashboardListDefs.map((def) => {
       const entries: CustomListEntry[] = []
       const [fieldSource, fieldKey] = def.field_key.includes(':') ? def.field_key.split(':', 2) : ['', '']
@@ -406,7 +426,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
 
       return { def, entries: entries.slice(0, def.limit) }
     })
-  }, [dashboardListDefs, transactions, holdingPrices, holdingsSymbolFields, watchlistEntries, watchlistFieldValues, symbolInfo, usdToAud])
+  }, [dashboardListDefs, transactions, holdingPrices, holdingsSymbolFields, watchlistEntries, watchlistFieldValues])
 
   if (loading) return <p className="loading-text">Loading dashboard...</p>
   if (error) return <div className="alert alert-error">❌ {error}</div>
@@ -463,6 +483,41 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
           )
         })}
       </div>
+
+      {portfolio.sectors.length > 0 && (
+        <>
+          <h3 style={{ margin: '24px 0 8px', fontSize: 16 }}>Holdings by Sector</h3>
+          <div className="dashboard-breakdown">
+            {portfolio.sectors.map(({ name, count, value, dividends, pl, cost }) => {
+              const pct = cost > 0 ? (pl / cost) * 100 : null
+              const weight = portfolio.totalValue > 0 ? (value / portfolio.totalValue) * 100 : null
+              return (
+                <div key={name} className="breakdown-card">
+                  <div className="breakdown-label">{name} ({count})</div>
+                  <div className="breakdown-row">
+                    <span className="breakdown-key">Value</span>
+                    <span className="breakdown-val">
+                      ${value.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {weight !== null && <span style={{ fontWeight: 400, marginLeft: 4, color: '#888' }}>({weight.toFixed(1)}%)</span>}
+                    </span>
+                  </div>
+                  <div className="breakdown-row">
+                    <span className="breakdown-key">Dividends</span>
+                    <span className="breakdown-val">${dividends.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                  </div>
+                  <div className="breakdown-row">
+                    <span className="breakdown-key">P/L</span>
+                    <span className={`breakdown-val ${pl >= 0 ? 'positive' : 'negative'}`}>
+                      {pl >= 0 ? '+' : '−'}${Math.abs(pl).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
+                    </span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
 
       <div className="dashboard-lists">
         <div className="manager-card">
@@ -551,8 +606,9 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
 
         {customDashboardLists.map(({ def, entries }) => {
           const [fieldSrc, fieldKey] = def.field_key.includes(':') ? def.field_key.split(':', 2) : ['', '']
+          const builtInFieldLabels: Record<string, string> = { breakthrough_price: 'Breakthrough Price', stop_loss_price: 'Stop Loss Price', stop_loss: 'Stop Loss Price', trailing_sell_pct: 'Trailing Sell %' }
           const fieldDefs: { key: string; label: string }[] = (() => { try { return JSON.parse(appConfig[fieldSrc === 'holdings' ? 'holdings_custom_fields' : 'watchlist_custom_fields'] ?? '[]') } catch { return [] } })()
-          const fieldLabel = fieldDefs.find((f) => f.key === fieldKey)?.label ?? fieldKey
+          const fieldLabel = fieldDefs.find((f) => f.key === fieldKey)?.label ?? builtInFieldLabels[fieldKey] ?? fieldKey
           return (
           <div key={def.key} className="manager-card">
             <h2>{def.label}</h2>

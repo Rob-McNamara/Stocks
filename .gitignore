@@ -1,4 +1,9 @@
 /target
 /launchd
-Cargo.lock
 stocks.db
+stocks.db-wal
+stocks.db-shm
+web/.vite/
+web/coverage/
+web/dist/
+.claude/settings.local.json

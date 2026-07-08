@@ -5,6 +5,16 @@ use serde::Deserialize;
 use std::{env, path::PathBuf, time::Duration};
 use tokio::time;
 
+/// Open the SQLite database with WAL mode and a busy timeout so the API,
+/// price daemon and dividends daemon can write concurrently without
+/// intermittent "database is locked" failures.
+fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    Ok(conn)
+}
+
 #[derive(Debug)]
 struct PriceRecord {
     date: String,
@@ -223,7 +233,7 @@ fn next_daily_run(hour: u32, minute: u32) -> chrono::DateTime<Local> {
     let today_target = now
         .date_naive()
         .and_hms_opt(hour, minute, 0)
-        .unwrap_or_else(|| now.date_naive().and_hms(16, 15, 0));
+        .unwrap_or_else(|| now.date_naive().and_hms_opt(16, 15, 0).unwrap());
 
     let next = if now.time() < today_target.time() {
         Local.from_local_datetime(&today_target).unwrap()
@@ -234,15 +244,29 @@ fn next_daily_run(hour: u32, minute: u32) -> chrono::DateTime<Local> {
     next
 }
 
+/// Read a u64 value from app_config. The Configuration screen writes
+/// WATCHLIST_INTERVAL_SECS there, so edits take effect on the next cycle
+/// without restarting the daemon.
+fn load_config_u64(db_path: &PathBuf, key: &str) -> Option<u64> {
+    let conn = open_db(db_path).ok()?;
+    conn.query_row(
+        "SELECT value FROM app_config WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()?
+    .trim()
+    .parse()
+    .ok()
+}
+
 async fn watchlist_loop(
     client: &Client,
     db_path: &PathBuf,
-    interval_secs: u64,
+    default_interval_secs: u64,
     historical_range: Option<DateRange>,
 ) {
-    let mut interval = time::interval(Duration::from_secs(interval_secs));
     loop {
-        interval.tick().await;
         let today = Utc::now().date_naive();
         if let Err(err) = purge_old_watchlist_entries(db_path, today) {
             log::error!("Watchlist cleanup failed: {}", err);
@@ -260,6 +284,11 @@ async fn watchlist_loop(
             Ok(_) => log::info!("No watchlist symbols configured; skipping watchlist tick."),
             Err(err) => log::error!("Unable to load watchlist symbols: {}", err),
         }
+
+        let interval_secs = load_config_u64(db_path, "WATCHLIST_INTERVAL_SECS")
+            .filter(|&secs| secs >= 30)
+            .unwrap_or(default_interval_secs);
+        time::sleep(Duration::from_secs(interval_secs)).await;
     }
 }
 
@@ -275,7 +304,7 @@ async fn fetch_and_store_watchlist(
 }
 
 fn purge_old_watchlist_entries(db_path: &PathBuf, today: NaiveDate) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_db(db_path)?;
     conn.execute(
         "DELETE FROM watchlist_prices WHERE date <> ?1",
         params![today.format("%Y-%m-%d").to_string()],
@@ -467,7 +496,7 @@ fn easter_sunday(year: i32) -> NaiveDate {
 }
 
 fn init_db(path: &PathBuf) -> anyhow::Result<()> {
-    let conn = Connection::open(path)?;
+    let conn = open_db(path)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS prices (
             id INTEGER PRIMARY KEY,
@@ -502,6 +531,13 @@ fn init_db(path: &PathBuf) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS app_config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS symbol_info (
+            symbol TEXT PRIMARY KEY,
+            instrument_type TEXT,
+            long_name TEXT,
+            currency TEXT,
+            updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS event_log (
             id INTEGER PRIMARY KEY,
@@ -612,7 +648,7 @@ fn store_symbol_info(
     long_name: Option<&str>,
     currency: Option<&str>,
 ) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_db(db_path)?;
     conn.execute(
         "INSERT INTO symbol_info (symbol, instrument_type, long_name, currency, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -627,7 +663,7 @@ fn store_symbol_info(
 }
 
 fn store_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> anyhow::Result<usize> {
-    let mut conn = Connection::open(db_path)?;
+    let mut conn = open_db(db_path)?;
     let tx = conn.transaction()?;
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO prices (symbol, date, open, high, low, close, volume, fetched_at)
@@ -660,7 +696,7 @@ fn store_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> a
 }
 
 fn load_watchlist_symbols(db_path: &PathBuf) -> anyhow::Result<Vec<String>> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_db(db_path)?;
     let mut stmt = conn.prepare("SELECT symbol FROM watchlist_symbols ORDER BY symbol")?;
     let rows = stmt
         .query_map([], |row| row.get::<usize, String>(0))?
@@ -669,7 +705,7 @@ fn load_watchlist_symbols(db_path: &PathBuf) -> anyhow::Result<Vec<String>> {
 }
 
 fn store_watchlist_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> anyhow::Result<usize> {
-    let mut conn = Connection::open(db_path)?;
+    let mut conn = open_db(db_path)?;
     let tx = conn.transaction()?;
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO watchlist_prices (symbol, date, fetched_at, open, high, low, close, volume)
@@ -708,7 +744,7 @@ fn insert_event_log(
     symbol: Option<&str>,
     details: &str,
 ) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_db(db_path)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

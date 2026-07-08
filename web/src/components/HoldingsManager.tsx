@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { apiClient } from '../services/api'
-import { getActiveHoldingSymbols } from '../utils/holdings'
+import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate } from '../utils/holdings'
 import { calculateSMA, getLatestSMA } from '../utils/sma'
-import { calcRemainingByLot } from '../utils/fifo'
+import { applyFifoSale, calcRemainingByLot } from '../utils/fifo'
+import { mapLimit } from '../utils/async'
+import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
 
 interface HoldingTransaction {
@@ -32,6 +34,10 @@ interface HoldingsFieldDef {
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
+// Symbol-level fields with dedicated inputs — excluded from the user-defined
+// custom-field plumbing.
+const BUILT_IN_HOLDINGS_KEYS = ['stop_loss', 'trailing_sell_pct', 'trailing_sell_date', 'sector']
+
 interface HoldingsPrefill {
   symbol: string
   price?: number
@@ -39,16 +45,18 @@ interface HoldingsPrefill {
   customFields?: Record<string, string>
 }
 
-export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion, prefill, onPrefillConsumed }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number; prefill?: HoldingsPrefill | null; onPrefillConsumed?: () => void }) {
+export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion, prefill, onPrefillConsumed, onPrefillSaved }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number; prefill?: HoldingsPrefill | null; onPrefillConsumed?: () => void; onPrefillSaved?: (symbol: string) => void }) {
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [currentPrices, setCurrentPrices] = useState<Record<string, number | null>>({})
   const [currentPriceDates, setCurrentPriceDates] = useState<Record<string, string | null>>({})
+  const [currentVolumes, setCurrentVolumes] = useState<Record<string, number | null>>({})
   const [priceChanges, setPriceChanges] = useState<Record<string, { change: number | null; change_percent: number | null }>>({})
   const [manualPriceSymbols, setManualPriceSymbols] = useState<Set<string>>(new Set())
   const [smaPrices, setSmaPrices] = useState<Record<string, number | null>>({})
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
   const [appConfig, setAppConfig] = useState<Record<string, string>>({})
-  const [usdToAud, setUsdToAud] = useState<number | null>(null)
+  /** AUD per 1 unit of each foreign currency, keyed by ISO code (e.g. USD, GBP) */
+  const [fxRates, setFxRates] = useState<Record<string, number | null>>({})
   const [symbol, setSymbol] = useState('')
   const [transactionType, setTransactionType] = useState<HoldingTransaction['transaction_type']>('purchase')
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
@@ -64,7 +72,15 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, string>>({})
   const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
   const prefillJustApplied = useRef(false)
+  // Symbol that arrived via "Move to Holdings" — the watchlist entry is only
+  // removed (via onPrefillSaved) once a transaction for it is actually saved.
+  const prefillPendingSymbol = useRef<string | null>(null)
   const [editingSymbolCard, setEditingSymbolCard] = useState<string | null>(null)
+  const [editCardSymbol, setEditCardSymbol] = useState('')
+  const [stopLossPrice, setStopLossPrice] = useState('')
+  const [trailingSellPct, setTrailingSellPct] = useState('')
+  const [trailingSellDate, setTrailingSellDate] = useState('')
+  const [sector, setSector] = useState('')
   const [editCardNotes, setEditCardNotes] = useState('')
   const [editCardFields, setEditCardFields] = useState<Record<string, string>>({})
   const [editingId, setEditingId] = useState<number | null>(null)
@@ -95,7 +111,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       const holdingsDefs: HoldingsFieldDef[] = (() => {
         try { return JSON.parse(appConfig['holdings_custom_fields'] ?? '[]') } catch { return [] }
       })()
-      const holdingsKeys = new Set(holdingsDefs.map((d) => d.key))
+      const holdingsKeys = new Set([...holdingsDefs.map((d) => d.key), 'stop_loss'])
       for (const [key, value] of Object.entries(prefill.customFields)) {
         if (holdingsKeys.has(key) && value) {
           mappedFields[key] = value
@@ -103,7 +119,18 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       }
     }
     setCustomFieldValues(mappedFields)
+    // Carry the watchlist sector across to the holding
+    setSector(prefill.customFields?.['sector'] ?? '')
+    // If stop_loss came through prefill, also set it as a symbol-level field
+    if (prefill.customFields?.['stop_loss']) {
+      const updated = { ...holdingsSymbolFields }
+      if (!updated[prefill.symbol]) updated[prefill.symbol] = {}
+      updated[prefill.symbol]['stop_loss'] = prefill.customFields['stop_loss']
+      setHoldingsSymbolFields(updated)
+      apiClient.updateHoldingsSymbolFields(prefill.symbol, null, { stop_loss: prefill.customFields['stop_loss'] }).catch(() => {})
+    }
     prefillJustApplied.current = true
+    prefillPendingSymbol.current = prefill.symbol.trim().toUpperCase()
     onPrefillConsumed?.()
   }, [prefill])
 
@@ -127,9 +154,17 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     }
     const symFields = holdingsSymbolFields[symbol.trim().toUpperCase()]
     if (symFields) {
-      setCustomFieldValues(symFields)
+      // Built-in symbol-level fields (_notes, stop_loss, sector, ...) have
+      // dedicated inputs — only user-defined fields go into the custom inputs.
+      const custom: Record<string, string> = {}
+      Object.entries(symFields).forEach(([k, v]) => {
+        if (!BUILT_IN_HOLDINGS_KEYS.includes(k) && k !== '_notes') custom[k] = v
+      })
+      setCustomFieldValues(custom)
+      setSector(symFields['sector'] ?? '')
     } else {
       setCustomFieldValues({})
+      setSector('')
     }
   }, [symbol, holdingsSymbolFields, editingId])
 
@@ -163,31 +198,37 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setSelectedChartSymbol((prev) => prev || symbols[0] || '')
       if (symbols.length > 0) {
         try {
-          const [prices, config, infoData, fxData, symFields] = await Promise.all([
+          const [prices, config, infoData, symFields] = await Promise.all([
             apiClient.getCachedPrices(symbols),
             apiClient.getConfig(),
             apiClient.getSymbolInfo(),
-            apiClient.getFxRates(),
             apiClient.getHoldingsSymbolFields(),
           ])
           const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
           infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
           setSymbolInfo(infoMap)
           setHoldingsSymbolFields(symFields)
-          if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
+          // Fetch an AUD rate for every foreign currency actually present
+          const currencies = Array.from(new Set(
+            infoData.map((i) => i.currency?.toUpperCase()).filter((c): c is string => !!c && c !== 'AUD')
+          ))
+          apiClient.getFxRates(currencies).then(setFxRates).catch(() => setFxRates({}))
           setAppConfig(config)
           const priceMap: Record<string, number | null> = {}
           const priceDateMap: Record<string, string | null> = {}
+          const volumeMap: Record<string, number | null> = {}
           const changeMap: Record<string, { change: number | null; change_percent: number | null }> = {}
           prices.forEach((p) => {
             priceMap[p.symbol] = p.price
             priceDateMap[p.symbol] = p.price_date ?? null
+            volumeMap[p.symbol] = p.volume
             changeMap[p.symbol] = { change: p.change, change_percent: p.change_percent }
           })
+          setCurrentVolumes(volumeMap)
           // Fill in manual prices for symbols with no auto-fetched price
           const manualSymbols = new Set<string>()
           symbols.forEach((sym) => {
-            if (!priceMap[sym]) {
+            if (priceMap[sym] == null) {
               const manual = config[`manual_price_${sym}`]
               if (manual) {
                 priceMap[sym] = parseFloat(manual)
@@ -199,20 +240,18 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
           setCurrentPriceDates(priceDateMap)
           setPriceChanges(changeMap)
           setManualPriceSymbols(manualSymbols)
-          
-          // Fetch and calculate SMA for each symbol
+
+          // Fetch and calculate SMA for each symbol (bounded concurrency)
           const smaMap: Record<string, number | null> = {}
-          for (const sym of symbols) {
+          const smaResults = await mapLimit(symbols, 6, async (sym) => {
             try {
               const history = await apiClient.getPriceHistory(sym, 300)
-              const smaArray = calculateSMA(history, 150)
-              const sma150 = getLatestSMA(smaArray)
-              smaMap[sym] = sma150
-            } catch (err) {
-              // If SMA calculation fails, just leave it as null
-              smaMap[sym] = null
+              return getLatestSMA(calculateSMA(history, 150))
+            } catch {
+              return null
             }
-          }
+          })
+          symbols.forEach((sym, i) => { smaMap[sym] = smaResults[i] })
           setSmaPrices(smaMap)
         } catch (err) {
           // Continue even if price fetch fails
@@ -277,7 +316,12 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
 
       payload.quantity = parsedQuantity
 
-      if (currency !== 'AUD' && fxRate) {
+      if (currency !== 'AUD') {
+        // Never silently record a foreign-currency price as AUD
+        if (!fxRate) {
+          setError(`No ${currency}/AUD exchange rate available for ${date} — cannot save. Retry, or pick a different date.`)
+          return
+        }
         payload.currency = currency
         payload.original_price = parsedPrice
         payload.fx_rate = fxRate
@@ -311,7 +355,27 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         return [result, ...current]
       })
 
+      // Save built-in symbol-level fields if provided
+      const builtInUpdates: Record<string, string> = {}
+      if (stopLossPrice.trim()) builtInUpdates['stop_loss'] = stopLossPrice.trim()
+      if (trailingSellPct.trim()) builtInUpdates['trailing_sell_pct'] = trailingSellPct.trim()
+      if (trailingSellDate.trim()) builtInUpdates['trailing_sell_date'] = trailingSellDate.trim()
+      if (sector) builtInUpdates['sector'] = sector
+      if (Object.keys(builtInUpdates).length > 0) {
+        const sym = symbol.trim().toUpperCase()
+        await apiClient.updateHoldingsSymbolFields(sym, holdingsSymbolFields[sym]?.['_notes'] ?? null, builtInUpdates)
+        setHoldingsSymbolFields((prev) => ({
+          ...prev,
+          [sym]: { ...prev[sym], ...builtInUpdates },
+        }))
+      }
       onTransactionsChanged?.()
+      // If this symbol came from "Move to Holdings", the watchlist entry can
+      // now be removed safely — the holding actually exists.
+      if (!editingId && prefillPendingSymbol.current && prefillPendingSymbol.current === result.symbol) {
+        onPrefillSaved?.(result.symbol)
+        prefillPendingSymbol.current = null
+      }
       setSuccess(editingId ? 'Transaction updated successfully' : 'Transaction recorded successfully')
       setSymbol('')
       setQuantity('')
@@ -319,6 +383,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setAmount('')
       setBrokerage('')
       setNotes('')
+      setStopLossPrice('')
+      setTrailingSellPct('')
+      setTrailingSellDate('')
+      setSector('')
       setCustomFieldValues({})
       setDate(new Date().toISOString().slice(0, 10))
       setCurrency('AUD')
@@ -334,28 +402,6 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     }
   }
 
-  const startEditingTransaction = (tx: HoldingTransaction) => {
-    setEditingId(tx.id)
-    setSymbol(tx.symbol)
-    setTransactionType(tx.transaction_type)
-    setDate(tx.date)
-    setQuantity(tx.quantity !== null ? tx.quantity.toString() : '')
-    // Show original currency price if available, otherwise AUD price
-    const displayPrice = tx.currency !== 'AUD' && tx.original_price !== null
-      ? tx.original_price.toString()
-      : (tx.price !== null ? tx.price.toString() : '')
-    setPrice(displayPrice)
-    setAmount(tx.amount !== null ? tx.amount.toString() : '')
-    setBrokerage(tx.brokerage !== null ? tx.brokerage.toString() : '')
-    setNotes(tx.notes ?? '')
-    setCurrency(tx.currency || 'AUD')
-    setFxRate(tx.fx_rate ?? null)
-    setFxRateDate(tx.currency !== 'AUD' ? tx.date : null)
-    setCustomFieldValues(tx.custom_fields ?? {})
-    setSuccess(null)
-    setError(null)
-  }
-
   const cancelEditing = () => {
     setEditingId(null)
     setSymbol('')
@@ -367,43 +413,13 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setBrokerage('')
     setNotes('')
     setCustomFieldValues({})
+    setStopLossPrice('')
+    setTrailingSellPct('')
+    setTrailingSellDate('')
+    setSector('')
     setCurrency('AUD')
     setFxRate(null)
     setFxRateDate(null)
-  }
-
-  const handleDeleteTransaction = async (id: number) => {
-    if (editingId === id) {
-      setEditingId(null)
-      setSymbol('')
-      setTransactionType('purchase')
-      setDate(new Date().toISOString().slice(0, 10))
-      setQuantity('')
-      setPrice('')
-      setAmount('')
-      setBrokerage('')
-      setNotes('')
-    }
-
-    if (!confirm('Delete this transaction?')) {
-      return
-    }
-
-    try {
-      setLoading(true)
-      setError(null)
-      onLoading(true)
-      await apiClient.removeHoldingTransaction(id)
-      setTransactions((current) => current.filter((tx) => tx.id !== id))
-      onTransactionsChanged?.()
-      setSuccess('Transaction deleted')
-      setTimeout(() => setSuccess(null), 3000)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete transaction')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
   }
 
   const refreshHoldingPrices = async () => {
@@ -422,16 +438,19 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       const prices = await apiClient.getCurrentPrices(symbols)
       const priceMap: Record<string, number | null> = {}
       const priceDateMap2: Record<string, string | null> = {}
+      const volumeMap2: Record<string, number | null> = {}
       const changeMap: Record<string, { change: number | null; change_percent: number | null }> = {}
       prices.forEach((p) => {
         priceMap[p.symbol] = p.price
         priceDateMap2[p.symbol] = p.price_date ?? null
+        volumeMap2[p.symbol] = p.volume
         changeMap[p.symbol] = { change: p.change, change_percent: p.change_percent }
       })
+      setCurrentVolumes(volumeMap2)
       // Apply manual price fallback for symbols that failed to fetch
       const newManualSymbols = new Set<string>()
       symbols.forEach((sym) => {
-        if (!priceMap[sym]) {
+        if (priceMap[sym] == null) {
           const manual = appConfig[`manual_price_${sym}`]
           if (manual) {
             priceMap[sym] = parseFloat(manual)
@@ -443,27 +462,29 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setCurrentPriceDates(priceDateMap2)
       setPriceChanges(changeMap)
       setManualPriceSymbols(newManualSymbols)
-      
-      // Fetch and calculate SMA for each symbol
+
+      // Fetch and calculate SMA for each symbol (bounded concurrency)
       const smaMap: Record<string, number | null> = {}
-      for (const sym of symbols) {
+      const smaResults = await mapLimit(symbols, 6, async (sym) => {
         try {
           const history = await apiClient.getPriceHistory(sym, 300)
-          const smaArray = calculateSMA(history, 150)
-          const sma150 = getLatestSMA(smaArray)
-          smaMap[sym] = sma150
-        } catch (err) {
-          smaMap[sym] = null
+          return getLatestSMA(calculateSMA(history, 150))
+        } catch {
+          return null
         }
-      }
+      })
+      symbols.forEach((sym, i) => { smaMap[sym] = smaResults[i] })
       setSmaPrices(smaMap)
 
       // Reload symbol info now that fetch has populated it
-      const [infoData, fxData] = await Promise.all([apiClient.getSymbolInfo(), apiClient.getFxRates()])
+      const infoData = await apiClient.getSymbolInfo()
       const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
       infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
       setSymbolInfo(infoMap)
-      if (fxData.USDAUD) setUsdToAud(fxData.USDAUD)
+      const currencies = Array.from(new Set(
+        infoData.map((i) => i.currency?.toUpperCase()).filter((c): c is string => !!c && c !== 'AUD')
+      ))
+      apiClient.getFxRates(currencies).then(setFxRates).catch(() => setFxRates({}))
 
       const hasPrice = prices.some((item) => item.price !== null)
       const errorDetails = prices
@@ -525,13 +546,14 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const toAudPrice = (rawPrice: number | null, symbol: string): number | null => {
     if (rawPrice === null) return null
     const currency = symbolInfo[symbol]?.currency?.toUpperCase()
-    if (currency && currency !== 'AUD' && usdToAud) return rawPrice * usdToAud
-    return rawPrice
+    const rate = currency && currency !== 'AUD' ? fxRates[currency] : null
+    return rate ? rawPrice * rate : rawPrice
   }
 
+  const builtInHoldingsKeys = BUILT_IN_HOLDINGS_KEYS
   const holdingsFieldDefs: HoldingsFieldDef[] = useMemo(() => {
     try {
-      return JSON.parse(appConfig['holdings_custom_fields'] ?? '[]')
+      return (JSON.parse(appConfig['holdings_custom_fields'] ?? '[]') as HoldingsFieldDef[]).filter((def) => !builtInHoldingsKeys.includes(def.key))
     } catch { return [] }
   }, [appConfig])
 
@@ -550,9 +572,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       let dividends = 0
       let dividendsFromTotal = 0
 
+      const nativeLots: Array<{ quantity: number; price: number }> = []
       sorted.forEach((tx) => {
         if (tx.transaction_type === 'purchase' && tx.quantity && tx.price) {
           lots.push({ quantity: tx.quantity, price: tx.price })
+          nativeLots.push({ quantity: tx.quantity, price: tx.original_price ?? tx.price })
         } else if (tx.transaction_type === 'sale' && tx.quantity) {
           let remaining = tx.quantity
           while (remaining > 0 && lots.length > 0) {
@@ -560,6 +584,13 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
             lots[0].quantity -= used
             remaining -= used
             if (lots[0].quantity <= 0) lots.shift()
+          }
+          let nativeRemaining = tx.quantity
+          while (nativeRemaining > 0 && nativeLots.length > 0) {
+            const used = Math.min(nativeRemaining, nativeLots[0].quantity)
+            nativeLots[0].quantity -= used
+            nativeRemaining -= used
+            if (nativeLots[0].quantity <= 0) nativeLots.shift()
           }
         }
         if (tx.dividends_total > 0) dividendsFromTotal = tx.dividends_total
@@ -570,12 +601,14 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       if (shares <= 0) return null
 
       const invested = lots.reduce((s, l) => s + l.quantity * l.price, 0)
-      const rawCurrentPrice = currentPrices[symbol] || null
+      const rawCurrentPrice = currentPrices[symbol] ?? null
       const currentPrice = toAudPrice(rawCurrentPrice, symbol)
-      const rawSma150 = smaPrices[symbol] || null
+      const rawSma150 = smaPrices[symbol] ?? null
       const sma150 = toAudPrice(rawSma150, symbol)
       const currentValue = currentPrice ? shares * currentPrice : 0
       const avgCost = shares > 0 ? invested / shares : null
+      const nativeInvested = nativeLots.reduce((s, l) => s + l.quantity * l.price, 0)
+      const nativeAvgCost = shares > 0 ? nativeInvested / shares : null
 
       return {
         symbol,
@@ -586,9 +619,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         sma150,
         currentValue,
         avgCost,
+        nativeAvgCost,
       }
     }).filter((item): item is NonNullable<typeof item> => item !== null)
-  }, [transactions, currentPrices, smaPrices, symbolInfo, usdToAud])
+  }, [transactions, currentPrices, smaPrices, symbolInfo, fxRates])
 
   const dividendTotalsBySymbol = useMemo(() => {
     return transactions.reduce<Record<string, number>>((acc, tx) => {
@@ -622,7 +656,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         const dateCompare = a.date.localeCompare(b.date)
         return dateCompare !== 0 ? dateCompare : a.id - b.id
       })
-      const lots: Array<{ quantity: number; totalCost: number }> = []
+      const lots: Array<{ quantity: number; price: number }> = []
       const currentPrice = toAudPrice(currentPrices[sortedGroup[0].symbol] ?? null, sortedGroup[0].symbol)
 
       sortedGroup.forEach((tx) => {
@@ -635,23 +669,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
             currentValue = remaining * currentPrice
             profitLoss = currentValue - (remaining * tx.price + (tx.brokerage ?? 0))
           }
-          lots.push({ quantity: tx.quantity, totalCost: tx.quantity * tx.price })
+          lots.push({ quantity: tx.quantity, price: tx.price })
         } else if (tx.transaction_type === 'sale' && tx.quantity !== null && tx.price !== null) {
-          let remaining = tx.quantity
-          let costBasis = 0
-
-          while (remaining > 0 && lots.length > 0) {
-            const lot = lots[0]
-            const used = Math.min(remaining, lot.quantity)
-            costBasis += used * (lot.totalCost / lot.quantity)
-            remaining -= used
-            if (used >= lot.quantity) {
-              lots.shift()
-            } else {
-              lots[0].quantity -= used
-            }
-          }
-
+          const costBasis = applyFifoSale(lots, tx.quantity)
           profitLoss = tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis
         }
 
@@ -660,7 +680,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     })
 
     return details
-  }, [transactions, currentPrices, remainingQuantities, symbolInfo, usdToAud])
+  }, [transactions, currentPrices, remainingQuantities, symbolInfo, fxRates])
 
   const [selectedChartSymbol, setSelectedChartSymbol] = useState<string>('')
   const [sortColumn, setSortColumn] = useState<string | null>(null)
@@ -838,6 +858,51 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
               className="symbol-input"
               disabled={loading}
             />
+            <select
+              value={sector}
+              onChange={(e) => setSector(e.target.value)}
+              className="config-input"
+              disabled={loading}
+              title="Sector"
+              style={{ minWidth: 140 }}
+            >
+              <option value="">Sector (optional)</option>
+              {sector && !(SECTORS as readonly string[]).includes(sector) && (
+                <option value={sector}>{sector}</option>
+              )}
+              {SECTORS.map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={stopLossPrice}
+              onChange={(e) => setStopLossPrice(e.target.value)}
+              placeholder="Stop Loss Price (optional)"
+              className="symbol-input"
+              disabled={loading}
+            />
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              value={trailingSellPct}
+              onChange={(e) => setTrailingSellPct(e.target.value)}
+              placeholder="Trailing Sell % (optional)"
+              className="symbol-input"
+              disabled={loading}
+            />
+            <input
+              type="date"
+              value={trailingSellDate}
+              onChange={(e) => setTrailingSellDate(e.target.value)}
+              placeholder="Trailing Sell Date"
+              className="symbol-input"
+              disabled={loading}
+              title="Date trailing sell was placed"
+            />
             <button type="submit" className="btn btn-primary" disabled={loading}>
               {loading ? 'Saving...' : editingId ? 'Save Changes' : 'Record Transaction'}
             </button>
@@ -870,6 +935,42 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
 
       {error && <div className="alert alert-error">❌ {error}</div>}
       {success && <div className="alert alert-success">✓ {success}</div>}
+
+      {selectedChartSymbol && (
+        <div className="manager-card chart-card">
+          <div className="card-header">
+            <h2>Simple Moving Average Chart</h2>
+            <div className="chart-select">
+              <label htmlFor="holdings-chart-symbol">Symbol</label>
+              <select
+                id="holdings-chart-symbol"
+                value={selectedChartSymbol}
+                onChange={(e) => setSelectedChartSymbol(e.target.value)}
+                disabled={loading}
+              >
+                {summary.map((item) => (
+                  <option key={item.symbol} value={item.symbol}>
+                    {item.symbol}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <PriceChart
+            symbol={selectedChartSymbol}
+            currency={symbolInfo[selectedChartSymbol]?.currency?.toUpperCase() ?? 'AUD'}
+            onLoading={onLoading}
+            purchasePrice={summary.find((s) => s.symbol === selectedChartSymbol)?.nativeAvgCost ?? null}
+            purchaseDate={getEarliestRemainingPurchaseDate(transactions, selectedChartSymbol)}
+            currentPrice={currentPrices[selectedChartSymbol] ?? null}
+            currentVolume={currentVolumes[selectedChartSymbol] ?? null}
+            currentPriceDate={currentPriceDates[selectedChartSymbol] ?? null}
+            markerPrice={(() => { const v = holdingsSymbolFields[selectedChartSymbol]?.['stop_loss']; return v ? parseFloat(v) : null })()}
+            markerLabel="Stop Loss"
+            markerMode="stoploss"
+          />
+        </div>
+      )}
 
       <div className="manager-card holdings-card">
         <div className="card-header">
@@ -919,7 +1020,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         ) : transactions.length === 0 ? (
           <p className="empty-text">No holdings configured.</p>
         ) : (
-          <>
+          <div style={{ maxHeight: 600, overflowY: 'auto' }}>
             {(() => {
               const etfTypes = new Set(['ETF', 'MUTUALFUND'])
               const getInstrumentType = (symbol: string) =>
@@ -951,8 +1052,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                     onClick={(e) => {
                       e.stopPropagation()
                       setEditingSymbolCard(item.symbol)
+                      setEditCardSymbol(item.symbol)
                       setEditCardNotes(holdingsSymbolFields[item.symbol]?.['_notes'] ?? '')
-                      const fields: Record<string, string> = {}
+                      const fields: Record<string, string> = { stop_loss: holdingsSymbolFields[item.symbol]?.['stop_loss'] ?? '', trailing_sell_pct: holdingsSymbolFields[item.symbol]?.['trailing_sell_pct'] ?? '', trailing_sell_date: holdingsSymbolFields[item.symbol]?.['trailing_sell_date'] ?? '', sector: holdingsSymbolFields[item.symbol]?.['sector'] ?? '' }
                       holdingsFieldDefs.forEach((def) => {
                         fields[def.key] = holdingsSymbolFields[item.symbol]?.[def.key] ?? ''
                       })
@@ -1009,6 +1111,24 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   )}
                   <div>Current value: ${item.currentValue.toFixed(2)}</div>
                   <div>Dividends: ${item.dividends.toFixed(2)}</div>
+                  {holdingsSymbolFields[item.symbol]?.['stop_loss'] && (
+                    <div style={{ fontSize: 11, color: '#555' }}>
+                      <span style={{ color: '#999' }}>Stop Loss:</span> {holdingsSymbolFields[item.symbol]['stop_loss']}
+                    </div>
+                  )}
+                  {holdingsSymbolFields[item.symbol]?.['trailing_sell_pct'] && (
+                    <div style={{ fontSize: 11, color: '#555' }}>
+                      <span style={{ color: '#999' }}>Trailing Sell:</span> {holdingsSymbolFields[item.symbol]['trailing_sell_pct']}%
+                      {holdingsSymbolFields[item.symbol]?.['trailing_sell_date'] && (
+                        <span style={{ marginLeft: 4 }}>({new Date(holdingsSymbolFields[item.symbol]['trailing_sell_date']).toLocaleDateString()})</span>
+                      )}
+                    </div>
+                  )}
+                  {holdingsSymbolFields[item.symbol]?.['sector'] && (
+                    <div style={{ fontSize: 11, color: '#555' }}>
+                      <span style={{ color: '#999' }}>Sector:</span> {holdingsSymbolFields[item.symbol]['sector']}
+                    </div>
+                  )}
                   {holdingsFieldDefs.map((def) => {
                     const val = holdingsSymbolFields[item.symbol]?.[def.key]
                     return val ? (
@@ -1064,37 +1184,6 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 </>
               )
             })()}
-
-            {selectedChartSymbol && (
-              <div style={{ marginBottom: 24 }}>
-                <div className="card-header" style={{ marginBottom: 8 }}>
-                  <h3 style={{ margin: 0 }}>Simple Moving Average Chart</h3>
-                  <div className="chart-select">
-                    <label htmlFor="holdings-chart-symbol">Symbol</label>
-                    <select
-                      id="holdings-chart-symbol"
-                      value={selectedChartSymbol}
-                      onChange={(e) => setSelectedChartSymbol(e.target.value)}
-                      disabled={loading}
-                    >
-                      {summary.map((item) => (
-                        <option key={item.symbol} value={item.symbol}>
-                          {item.symbol}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-                <PriceChart
-                  symbol={selectedChartSymbol}
-                  currency={symbolInfo[selectedChartSymbol]?.currency?.toUpperCase() ?? 'AUD'}
-                  onLoading={onLoading}
-                  purchasePrice={summary.find((s) => s.symbol === selectedChartSymbol)?.avgCost ?? null}
-                  currentPrice={currentPrices[selectedChartSymbol] ?? null}
-                  currentPriceDate={currentPriceDates[selectedChartSymbol] ?? null}
-                />
-              </div>
-            )}
 
             <div className="holdings-table-wrapper">
               <h3>Active Holdings</h3>
@@ -1173,7 +1262,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
               </table>
             </div>
 
-          </>
+          </div>
         )}
       </div>
 
@@ -1183,6 +1272,23 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
           <div style={{ background: '#fff', borderRadius: 8, padding: 24, minWidth: 320, boxShadow: '0 4px 24px rgba(0,0,0,0.18)' }}
             onClick={(e) => e.stopPropagation()}>
             <h3 style={{ margin: '0 0 16px' }}>Edit {editingSymbolCard}</h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 16 }}>
+              <label style={{ fontSize: 13, color: '#666' }}>Stock Symbol</label>
+              <input
+                type="text"
+                value={editCardSymbol}
+                onChange={(e) => setEditCardSymbol(e.target.value.toUpperCase())}
+                placeholder="e.g. BHP.AX"
+                className="symbol-input"
+                style={{ width: '100%' }}
+                maxLength={12}
+              />
+              {editCardSymbol.trim().toUpperCase() !== editingSymbolCard && (
+                <span style={{ fontSize: 11, color: '#e65100' }}>
+                  Renames the symbol across all of this holding's transactions.
+                </span>
+              )}
+            </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 16 }}>
               <label style={{ fontSize: 13, color: '#666' }}>Notes</label>
               <input
@@ -1194,22 +1300,69 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 style={{ width: '100%' }}
               />
             </div>
-            {holdingsFieldDefs.length > 0 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
-                {holdingsFieldDefs.map((def) => (
-                  <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
-                    <input
-                      type={def.type}
-                      value={editCardFields[def.key] ?? ''}
-                      onChange={(e) => setEditCardFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
-                      className="symbol-input"
-                      style={{ width: '100%' }}
-                    />
-                  </div>
-                ))}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Stop Loss Price</label>
+                <input
+                  type="number"
+                  value={editCardFields['stop_loss'] ?? ''}
+                  onChange={(e) => setEditCardFields((prev) => ({ ...prev, stop_loss: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                />
               </div>
-            )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Trailing Sell %</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  value={editCardFields['trailing_sell_pct'] ?? ''}
+                  onChange={(e) => setEditCardFields((prev) => ({ ...prev, trailing_sell_pct: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Trailing Sell Date</label>
+                <input
+                  type="date"
+                  value={editCardFields['trailing_sell_date'] ?? ''}
+                  onChange={(e) => setEditCardFields((prev) => ({ ...prev, trailing_sell_date: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Sector</label>
+                <select
+                  value={editCardFields['sector'] ?? ''}
+                  onChange={(e) => setEditCardFields((prev) => ({ ...prev, sector: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                >
+                  <option value="">— None —</option>
+                  {(editCardFields['sector'] ?? '') !== '' && !(SECTORS as readonly string[]).includes(editCardFields['sector']) && (
+                    <option value={editCardFields['sector']}>{editCardFields['sector']}</option>
+                  )}
+                  {SECTORS.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              {holdingsFieldDefs.map((def) => (
+                <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
+                  <input
+                    type={def.type}
+                    value={editCardFields[def.key] ?? ''}
+                    onChange={(e) => setEditCardFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                    className="symbol-input"
+                    style={{ width: '100%' }}
+                  />
+                </div>
+              ))}
+            </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button className="btn btn-outline" onClick={() => setEditingSymbolCard(null)}>Cancel</button>
               <button
@@ -1217,25 +1370,48 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 disabled={loading}
                 onClick={async () => {
                   if (!editingSymbolCard) return
+                  const oldSymbol = editingSymbolCard
+                  const newSymbol = editCardSymbol.trim().toUpperCase()
+                  if (!newSymbol) {
+                    setError('Stock symbol is required')
+                    return
+                  }
+                  const symbolChanged = newSymbol !== oldSymbol
+                  if (symbolChanged && transactions.some((tx) => tx.symbol === newSymbol)) {
+                    if (!confirm(`You already have transactions under ${newSymbol}. Merge ${oldSymbol}'s transactions into ${newSymbol}?`)) return
+                  }
                   try {
                     setLoading(true)
-                    const fields = { ...editCardFields }
-                    await apiClient.updateHoldingsSymbolFields(editingSymbolCard, editCardNotes.trim() || null, fields)
-                    // Update local state
-                    const updated = { ...holdingsSymbolFields }
-                    if (!updated[editingSymbolCard]) updated[editingSymbolCard] = {}
-                    if (editCardNotes.trim()) {
-                      updated[editingSymbolCard]['_notes'] = editCardNotes.trim()
-                    } else {
-                      delete updated[editingSymbolCard]['_notes']
+                    setError(null)
+                    const targetSymbol = symbolChanged ? newSymbol : oldSymbol
+                    if (symbolChanged) {
+                      await apiClient.renameHoldingSymbol(oldSymbol, newSymbol)
                     }
-                    Object.entries(fields).forEach(([k, v]) => {
-                      if (v) updated[editingSymbolCard][k] = v
-                      else delete updated[editingSymbolCard][k]
-                    })
-                    setHoldingsSymbolFields(updated)
+                    const fields = { ...editCardFields }
+                    await apiClient.updateHoldingsSymbolFields(targetSymbol, editCardNotes.trim() || null, fields)
                     setEditingSymbolCard(null)
-                    setSuccess('Updated fields for ' + editingSymbolCard)
+                    if (symbolChanged) {
+                      // Transactions changed — reload everything and notify other tabs
+                      if (selectedChartSymbol === oldSymbol) setSelectedChartSymbol(newSymbol)
+                      await loadHoldings()
+                      onTransactionsChanged?.()
+                      setSuccess(`Renamed ${oldSymbol} to ${newSymbol}`)
+                    } else {
+                      // Update local state in place
+                      const updated = { ...holdingsSymbolFields }
+                      if (!updated[targetSymbol]) updated[targetSymbol] = {}
+                      if (editCardNotes.trim()) {
+                        updated[targetSymbol]['_notes'] = editCardNotes.trim()
+                      } else {
+                        delete updated[targetSymbol]['_notes']
+                      }
+                      Object.entries(fields).forEach(([k, v]) => {
+                        if (v) updated[targetSymbol][k] = v
+                        else delete updated[targetSymbol][k]
+                      })
+                      setHoldingsSymbolFields(updated)
+                      setSuccess('Updated fields for ' + targetSymbol)
+                    }
                     setTimeout(() => setSuccess(null), 3000)
                   } catch (err) {
                     setError(err instanceof Error ? err.message : 'Failed to update fields')

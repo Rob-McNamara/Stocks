@@ -132,20 +132,24 @@ export function calcPortfolioPL(
         lots.push({ quantity: tx.quantity, price: tx.price })
       } else if (tx.transaction_type === 'sale' && tx.quantity != null && tx.price != null) {
         const costBasis = applyFifoSale(lots, tx.quantity)
-        const saleDividends = totalSoldQty > 0 ? (tx.quantity / totalSoldQty) * symbolDividends : 0
-        symbolSoldPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis + saleDividends
+        symbolSoldPL += tx.quantity * tx.price - (tx.brokerage ?? 0) - costBasis
       }
     }
 
     const remainingShares = lots.reduce((s, l) => s + l.quantity, 0)
     const remainingCost = lots.reduce((s, l) => s + l.quantity * l.price, 0)
 
+    // Count each dividend dollar exactly once: it stays on the holdings side
+    // while any shares remain, and moves to the sold side once the position
+    // is fully closed.
     if (remainingShares > 0) {
       stockCount++
       const price = priceMap[symbol] ?? null
       const currentValue = price ? remainingShares * price : 0
       if (price) totalValue += currentValue
       holdingsPL += currentValue - remainingCost + symbolDividends
+    } else if (totalSoldQty > 0) {
+      symbolSoldPL += symbolDividends
     }
 
     soldPL += symbolSoldPL

@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://localhost:3001/api'
+const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001/api'
 
 interface WatchlistSymbol {
   id: number
@@ -6,6 +6,8 @@ interface WatchlistSymbol {
   list_name: string
   added_at: string
   notes: string | null
+  breakthrough_price: number | null
+  stop_loss_price: number | null
   custom_fields: Record<string, string>
 }
 
@@ -59,7 +61,7 @@ interface HoldingTransaction {
   custom_fields: Record<string, string>
 }
 
-interface HoldingTransactionPayload {
+export interface HoldingTransactionPayload {
   symbol: string
   transaction_type: 'purchase' | 'sale' | 'dividend'
   date: string
@@ -75,6 +77,15 @@ interface HoldingTransactionPayload {
 }
 
 export const apiClient = {
+  async checkHealth(): Promise<boolean> {
+    try {
+      const response = await fetch(`${API_BASE_URL}/health`)
+      return response.ok
+    } catch {
+      return false
+    }
+  },
+
   async getWatchlistLists(): Promise<string[]> {
     const response = await fetch(`${API_BASE_URL}/watchlist/lists`)
     if (!response.ok) throw new Error('Failed to fetch watchlist lists')
@@ -88,11 +99,11 @@ export const apiClient = {
     return response.json()
   },
 
-  async addWatchlistSymbol(symbol: string, listName?: string, notes?: string, customFields?: Record<string, string>): Promise<WatchlistSymbol> {
+  async addWatchlistSymbol(symbol: string, listName?: string, notes?: string, opts?: { breakthroughPrice?: number | null; stopLossPrice?: number | null; customFields?: Record<string, string> }): Promise<WatchlistSymbol> {
     const response = await fetch(`${API_BASE_URL}/watchlist`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol: symbol.toUpperCase(), list_name: listName ?? 'Default', notes: notes || null, custom_fields: customFields ?? {} })
+      body: JSON.stringify({ symbol: symbol.toUpperCase(), list_name: listName ?? 'Default', notes: notes || null, breakthrough_price: opts?.breakthroughPrice ?? null, stop_loss_price: opts?.stopLossPrice ?? null, custom_fields: opts?.customFields ?? {} })
     })
     if (!response.ok) {
       const error = await response.text()
@@ -101,11 +112,11 @@ export const apiClient = {
     return response.json()
   },
 
-  async updateWatchlistSymbol(id: number, notes: string | null, customFields?: Record<string, string>): Promise<WatchlistSymbol> {
+  async updateWatchlistSymbol(id: number, notes: string | null, opts?: { breakthroughPrice?: number | null; stopLossPrice?: number | null; customFields?: Record<string, string> }): Promise<WatchlistSymbol> {
     const response = await fetch(`${API_BASE_URL}/watchlist/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notes, custom_fields: customFields ?? {} })
+      body: JSON.stringify({ notes, breakthrough_price: opts?.breakthroughPrice ?? null, stop_loss_price: opts?.stopLossPrice ?? null, custom_fields: opts?.customFields ?? {} })
     })
     if (!response.ok) throw new Error('Failed to update symbol')
     return response.json()
@@ -116,6 +127,15 @@ export const apiClient = {
       method: 'DELETE'
     })
     if (!response.ok) throw new Error('Failed to remove symbol')
+  },
+
+  async renameWatchlistList(oldName: string, newName: string): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/watchlist/lists/rename`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ old_name: oldName, new_name: newName }),
+    })
+    if (!response.ok) throw new Error('Failed to rename list')
   },
 
   async getWatchlistPrices(list?: string): Promise<CurrentPrice[]> {
@@ -207,6 +227,19 @@ export const apiClient = {
     return response.json()
   },
 
+  async renameHoldingSymbol(oldSymbol: string, newSymbol: string): Promise<{ renamed: number }> {
+    const response = await fetch(`${API_BASE_URL}/holdings/rename-symbol/${encodeURIComponent(oldSymbol)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_symbol: newSymbol }),
+    })
+    if (!response.ok) {
+      const message = await response.text()
+      throw new Error(message || 'Failed to rename holding symbol')
+    }
+    return response.json()
+  },
+
   async removeHoldingTransaction(id: number): Promise<void> {
     const response = await fetch(`${API_BASE_URL}/holdings/${id}`, {
       method: 'DELETE',
@@ -258,9 +291,12 @@ export const apiClient = {
     return response.json()
   },
 
-  async getFxRates(): Promise<{ USDAUD: number | null }> {
-    const response = await fetch(`${API_BASE_URL}/fx-rates`)
-    if (!response.ok) return { USDAUD: null }
+  /** Returns AUD per 1 unit of each requested currency, keyed by ISO code. */
+  async getFxRates(currencies: string[]): Promise<Record<string, number | null>> {
+    const wanted = currencies.map((c) => c.toUpperCase()).filter((c) => c && c !== 'AUD')
+    if (wanted.length === 0) return {}
+    const response = await fetch(`${API_BASE_URL}/fx-rates?currencies=${wanted.map(encodeURIComponent).join(',')}`)
+    if (!response.ok) return {}
     return response.json()
   },
 
@@ -301,5 +337,29 @@ export const apiClient = {
       body: JSON.stringify({ key, value })
     })
     if (!response.ok) throw new Error('Failed to update config')
-  }
+  },
+
+  async analyzeStock(symbol: string, messages: { role: string; content: string }[]): Promise<{ role: string; content: string }> {
+    const response = await fetch(`${API_BASE_URL}/stock-analysis`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol, messages }),
+    })
+    if (!response.ok) {
+      const error = await response.text()
+      throw new Error(error || 'Failed to analyze stock')
+    }
+    return response.json()
+  },
+
+  async getAnalysisHistory(symbol: string): Promise<{ id: number; role: string; content: string; model_used: string | null; created_at: string }[]> {
+    const response = await fetch(`${API_BASE_URL}/stock-analysis/history?symbol=${encodeURIComponent(symbol)}`)
+    if (!response.ok) throw new Error('Failed to fetch analysis history')
+    return response.json()
+  },
+
+  async clearAnalysisHistory(symbol: string): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/stock-analysis/history?symbol=${encodeURIComponent(symbol)}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error('Failed to clear analysis history')
+  },
 }

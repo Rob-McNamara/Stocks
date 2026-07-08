@@ -120,7 +120,6 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
           lots.length = 0
           lots.push(...lotsClone)
           const brokerage = tx.brokerage ?? 0
-          const dividends = totalSoldQty > 0 ? (tx.quantity / totalSoldQty) * symbolDividends : 0
           const saleProceeds = tx.quantity * tx.price - brokerage - costBasis
           const daysHeld = Math.round(
             (new Date(tx.date).getTime() - new Date(earliestPurchaseDate).getTime()) / 86400000
@@ -132,12 +131,24 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
             avgPurchasePrice: tx.quantity > 0 ? costBasis / tx.quantity : 0,
             salePrice: tx.price,
             brokerage,
-            dividends,
+            dividends: 0,
             daysHeld,
-            realisedPL: saleProceeds + dividends,
+            realisedPL: saleProceeds,
           })
         }
       })
+
+      // Dividends count on the sold side only once the position is fully
+      // closed (while shares remain they belong to the Holdings screen).
+      // Distribute them across the sales proportionally by quantity.
+      const remainingShares = lots.reduce((s, l) => s + l.quantity, 0)
+      if (remainingShares === 0 && totalSoldQty > 0 && symbolDividends > 0) {
+        sales.forEach((sale) => {
+          const share = (sale.quantity / totalSoldQty) * symbolDividends
+          sale.dividends = share
+          sale.realisedPL += share
+        })
+      }
 
       results.push(...sales)
     })

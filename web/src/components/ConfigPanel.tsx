@@ -13,24 +13,16 @@ interface ConfigItem {
   type: 'string' | 'number'
 }
 
+// Only settings the daemon actually reads from the database belong here.
+// Fetch schedule (FETCH_SCHEDULE_HOUR/MINUTE) and DATABASE_PATH are
+// environment variables read at daemon startup and can't be changed from
+// this screen.
 const CONFIG_SCHEMA: ConfigItem[] = [
   {
-    key: 'FETCH_INTERVAL_SECS',
-    value: '3600',
-    description: 'Interval between scheduled ASX closing price fetches (seconds)',
-    type: 'number'
-  },
-  {
     key: 'WATCHLIST_INTERVAL_SECS',
-    value: '600',
-    description: 'Interval between watchlist price updates (seconds)',
+    value: '900',
+    description: 'Interval between watchlist price updates (seconds, min 30) — applies from the next daemon cycle',
     type: 'number'
-  },
-  {
-    key: 'DATABASE_PATH',
-    value: './stocks.db',
-    description: 'Path to SQLite database file',
-    type: 'string'
   }
 ]
 
@@ -46,6 +38,8 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [editingPrices, setEditingPrices] = useState<Record<string, string>>({})
   const [typeSymbol, setTypeSymbol] = useState('')
   const [typeValue, setTypeValue] = useState('ETF')
+  const builtInWatchlistKeys = ['breakthrough_price', 'stop_loss_price', 'sector']
+  const builtInHoldingsKeys = ['stop_loss', 'trailing_sell_pct', 'trailing_sell_date', 'sector']
   const [customFieldDefs, setCustomFieldDefs] = useState<{ key: string; label: string; type: 'text' | 'number' | 'date' }[]>([])
   const [newFieldLabel, setNewFieldLabel] = useState('')
   const [newFieldType, setNewFieldType] = useState<'text' | 'number' | 'date'>('text')
@@ -53,7 +47,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [newHoldingsFieldLabel, setNewHoldingsFieldLabel] = useState('')
   const [newHoldingsFieldType, setNewHoldingsFieldType] = useState<'text' | 'number' | 'date'>('text')
   const [newHoldingsFieldActions, setNewHoldingsFieldActions] = useState<string[]>(['purchase'])
-  const [dashboardLists, setDashboardLists] = useState<{ key: string; label: string; source: 'holdings' | 'watchlist' | 'both'; field_key: string; operator: 'above' | 'below'; limit: number }[]>([])
+  const [dashboardLists, setDashboardLists] = useState<{ key: string; label: string; source: 'holdings' | 'watchlist' | 'both'; field_key: string; operator: 'above' | 'below' | 'pct_above' | 'pct_below'; limit: number; sort?: 'asc' | 'desc' }[]>([])
   const [editingWatchlistFieldIndex, setEditingWatchlistFieldIndex] = useState<number | null>(null)
   const [editingHoldingsFieldIndex, setEditingHoldingsFieldIndex] = useState<number | null>(null)
   const [newDashListLabel, setNewDashListLabel] = useState('')
@@ -75,10 +69,10 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       const data = await apiClient.getConfig()
       setConfig(data)
       try {
-        setCustomFieldDefs(JSON.parse(data['watchlist_custom_fields'] ?? '[]'))
+        setCustomFieldDefs((JSON.parse(data['watchlist_custom_fields'] ?? '[]') as typeof customFieldDefs).filter((d) => !builtInWatchlistKeys.includes(d.key)))
       } catch { setCustomFieldDefs([]) }
       try {
-        setHoldingsFieldDefs(JSON.parse(data['holdings_custom_fields'] ?? '[]'))
+        setHoldingsFieldDefs((JSON.parse(data['holdings_custom_fields'] ?? '[]') as typeof holdingsFieldDefs).filter((d) => !builtInHoldingsKeys.includes(d.key)))
       } catch { setHoldingsFieldDefs([]) }
       try {
         setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
@@ -547,7 +541,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     onConfigChanged?.()
                   } else {
                     const key = newFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
-                    if (!key || customFieldDefs.some((d) => d.key === key)) return
+                    if (!key || customFieldDefs.some((d) => d.key === key) || builtInWatchlistKeys.includes(key)) return
                     const next = [...customFieldDefs, { key, label: newFieldLabel.trim(), type: newFieldType }]
                     setCustomFieldDefs(next)
                     setNewFieldLabel('')
@@ -681,7 +675,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     onConfigChanged?.()
                   } else {
                     const key = newHoldingsFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
-                    if (!key || holdingsFieldDefs.some((d) => d.key === key)) return
+                    if (!key || holdingsFieldDefs.some((d) => d.key === key) || builtInHoldingsKeys.includes(key)) return
                     const next = [...holdingsFieldDefs, { key, label: newHoldingsFieldLabel.trim(), type: newHoldingsFieldType, actions: [...newHoldingsFieldActions] }]
                     setHoldingsFieldDefs(next)
                     setNewHoldingsFieldLabel('')
@@ -729,7 +723,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                       <td style={{ color: '#888' }}>{dl.source}</td>
                       <td style={{ color: '#555' }}>{dl.field_key}</td>
                       <td>{{ above: 'Price above field', below: 'Price below field', pct_above: '% above price', pct_below: '% below price' }[dl.operator] ?? dl.operator}</td>
-                      <td style={{ color: '#888' }}>{(dl as any).sort === 'desc' ? 'Desc' : 'Asc'}</td>
+                      <td style={{ color: '#888' }}>{dl.sort === 'desc' ? 'Desc' : 'Asc'}</td>
                       <td>{dl.limit}</td>
                       <td style={{ display: 'flex', gap: 6 }}>
                         <button
@@ -741,7 +735,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                             setNewDashListField(dl.field_key)
                             setNewDashListOperator(dl.operator)
                             setNewDashListLimit(dl.limit.toString())
-                            setNewDashListSort((dl as any).sort ?? 'asc')
+                            setNewDashListSort(dl.sort ?? 'asc')
                           }}
                         >
                           Edit
@@ -796,9 +790,13 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                   className="config-input"
                 >
                   <option value="">Select field...</option>
+                  <option value="holdings:stop_loss">Holdings: Stop Loss Price</option>
+                  <option value="holdings:trailing_sell_pct">Holdings: Trailing Sell %</option>
                   {holdingsFieldDefs.map((f) => (
                     <option key={`h_${f.key}`} value={`holdings:${f.key}`}>Holdings: {f.label}</option>
                   ))}
+                  <option value="watchlist:breakthrough_price">Watchlist: Breakthrough Price</option>
+                  <option value="watchlist:stop_loss_price">Watchlist: Stop Loss Price</option>
                   {customFieldDefs.map((f) => (
                     <option key={`w_${f.key}`} value={`watchlist:${f.key}`}>Watchlist: {f.label}</option>
                   ))}
@@ -889,20 +887,78 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
             </div>
           </div>
 
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>AI Stock Analysis</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              Configure the AI provider for stock analysis. The API key is stored in the database.
+            </p>
+            <div className="config-list" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>Provider</label>
+                  <select
+                    value={config['ai_provider'] ?? 'anthropic'}
+                    onChange={async (e) => {
+                      await apiClient.updateConfig('ai_provider', e.target.value)
+                      setConfig((c) => ({ ...c, ai_provider: e.target.value }))
+                      onConfigChanged?.()
+                    }}
+                    className="config-input"
+                  >
+                    <option value="anthropic">Anthropic (Claude)</option>
+                    <option value="openai">OpenAI (GPT)</option>
+                  </select>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 200 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>API Key</label>
+                  <input
+                    type="password"
+                    value={config['ai_api_key'] ?? ''}
+                    onChange={(e) => setConfig((c) => ({ ...c, ai_api_key: e.target.value }))}
+                    onBlur={async (e) => {
+                      if (e.target.value) {
+                        await apiClient.updateConfig('ai_api_key', e.target.value)
+                        setConfig((c) => ({ ...c, ai_api_key_configured: 'true' }))
+                        onConfigChanged?.()
+                        setSuccess('API key saved')
+                        setTimeout(() => setSuccess(null), 3000)
+                      }
+                    }}
+                    placeholder={config['ai_api_key_configured'] === 'true' ? '•••••••• (configured — enter to replace)' : 'Enter API key...'}
+                    className="config-input"
+                  />
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>Model</label>
+                  <input
+                    type="text"
+                    value={config['ai_model'] ?? 'claude-sonnet-4-20250514'}
+                    onChange={(e) => setConfig((c) => ({ ...c, ai_model: e.target.value }))}
+                    onBlur={async (e) => {
+                      await apiClient.updateConfig('ai_model', e.target.value || 'claude-sonnet-4-20250514')
+                      onConfigChanged?.()
+                    }}
+                    placeholder="claude-sonnet-4-20250514"
+                    className="config-input"
+                    style={{ width: 250 }}
+                  />
+                </div>
+              </div>
+              {(config['ai_api_key'] || config['ai_api_key_configured'] === 'true') && (
+                <p style={{ fontSize: 12, color: '#4caf50', margin: 0 }}>API key is configured</p>
+              )}
+            </div>
+          </div>
+
           <div className="config-card info-card">
             <h3>⚙️ Configuration Notes</h3>
             <ul>
               <li>
-                <strong>FETCH_INTERVAL_SECS:</strong> How often the daemon fetches ASX closing prices (usually 3600 = 1 hour)
+                <strong>WATCHLIST_INTERVAL_SECS:</strong> How often intraday watchlist prices are updated (default 900 = 15 minutes). The daemon re-reads this each cycle, so no restart is needed.
               </li>
               <li>
-                <strong>WATCHLIST_INTERVAL_SECS:</strong> How often intraday prices are updated (usually 600 = 10 minutes)
+                The daily fetch schedule (<code>FETCH_SCHEDULE_HOUR</code>/<code>FETCH_SCHEDULE_MINUTE</code>) and <code>DATABASE_PATH</code> are environment variables read when the daemon starts — change them in the daemon's launch configuration, not here.
               </li>
-              <li>
-                <strong>DATABASE_PATH:</strong> Where the SQLite database is stored (don't change this unless you know what you're doing)
-              </li>
-              <li>Changes take effect on the next daemon cycle</li>
-              <li>For immediate changes, restart the daemon</li>
             </ul>
           </div>
         </>

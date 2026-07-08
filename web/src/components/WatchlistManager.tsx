@@ -1,7 +1,10 @@
 import { useState, useEffect } from 'react'
 import { apiClient } from '../services/api'
 import { calculateSMA, crossoverStats, getLatestSMA, smaTrend } from '../utils/sma'
+import { mapLimit } from '../utils/async'
+import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
+import StockAnalysis from './StockAnalysis'
 
 interface WatchlistSymbol {
   id: number
@@ -9,6 +12,8 @@ interface WatchlistSymbol {
   list_name: string
   added_at: string
   notes: string | null
+  breakthrough_price: number | null
+  stop_loss_price: number | null
   custom_fields: Record<string, string>
 }
 
@@ -43,6 +48,9 @@ interface WatchlistManagerProps {
   initialSymbol?: string | null
   onInitialSymbolConsumed?: () => void
   onMoveToHoldings?: (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string> }) => void
+  /** Symbol whose memberships should be removed — set by App once a "Move to Holdings" transaction is saved */
+  removeSymbolRequest?: string | null
+  onRemoveSymbolConsumed?: () => void
 }
 
 
@@ -85,24 +93,17 @@ async function enrichOne(price: CurrentPrice): Promise<CurrentPrice> {
 }
 
 async function enrichWithSMA(pricesData: CurrentPrice[]): Promise<CurrentPrice[]> {
-  const results = [...pricesData]
-  const concurrency = 6
-  let index = 0
-  async function worker() {
-    while (index < pricesData.length) {
-      const i = index++
-      results[i] = await enrichOne(pricesData[i])
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, pricesData.length) }, () => worker()))
-  return results
+  return mapLimit(pricesData, 6, enrichOne)
 }
 
-export default function WatchlistManager({ onLoading, initialSymbol, onInitialSymbolConsumed, onMoveToHoldings }: WatchlistManagerProps) {
+export default function WatchlistManager({ onLoading, initialSymbol, onInitialSymbolConsumed, onMoveToHoldings, removeSymbolRequest, onRemoveSymbolConsumed }: WatchlistManagerProps) {
   const [lists, setLists] = useState<string[]>(['Default'])
+  const [defaultList, setDefaultList] = useState('Default')
   const [selectedList, setSelectedList] = useState('Default')
   const [creatingList, setCreatingList] = useState(false)
   const [newListName, setNewListName] = useState('')
+  const [renamingList, setRenamingList] = useState(false)
+  const [renameListValue, setRenameListValue] = useState('')
   const [symbols, setSymbols] = useState<WatchlistSymbol[]>([])
   const [allPrices, setAllPrices] = useState<CurrentPrice[]>([])
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
@@ -114,9 +115,12 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
   const [success, setSuccess] = useState<string | null>(null)
   const [pricesUpdatedAt, setPricesUpdatedAt] = useState<string | null>(null)
   const [editingSymbol, setEditingSymbol] = useState<string | null>(null)
+  const [analyzingSymbol, setAnalyzingSymbol] = useState<string | null>(null)
   const [editListChecks, setEditListChecks] = useState<Record<string, boolean>>({})
   const [editNotes, setEditNotes] = useState('')
   const [customFieldDefs, setCustomFieldDefs] = useState<CustomFieldDef[]>([])
+  const builtInWatchlistKeys = ['breakthrough_price', 'stop_loss_price', 'sector']
+  const extraCustomFieldDefs = customFieldDefs.filter((def) => !builtInWatchlistKeys.includes(def.key))
   const [newSymbolFields, setNewSymbolFields] = useState<Record<string, string>>({})
   const [editCustomFields, setEditCustomFields] = useState<Record<string, string>>({})
 
@@ -134,6 +138,32 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     }
   }, [initialSymbol, symbols])
 
+  // A "Move to Holdings" transaction was saved — now it's safe to drop the
+  // symbol from all watchlists.
+  useEffect(() => {
+    if (!removeSymbolRequest) return
+    const entries = symbols.filter((s) => s.symbol === removeSymbolRequest)
+    onRemoveSymbolConsumed?.()
+    if (entries.length === 0) return
+    const removeAll = async () => {
+      try {
+        for (const entry of entries) {
+          await apiClient.removeWatchlistSymbol(entry.id)
+        }
+        const remaining = symbols.filter((s) => s.symbol !== removeSymbolRequest)
+        setSymbols(remaining)
+        if (selectedSymbol === removeSymbolRequest) setSelectedSymbol(remaining[0]?.symbol || '')
+        const listsData = await apiClient.getWatchlistLists()
+        setLists(listsData.length > 0 ? listsData : ['Default'])
+        setSuccess(`${removeSymbolRequest} moved to Holdings and removed from watchlist`)
+        setTimeout(() => setSuccess(null), 3000)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to remove from watchlist')
+      }
+    }
+    removeAll()
+  }, [removeSymbolRequest])
+
   const loadWatchlistData = async () => {
     try {
       setLoading(true)
@@ -150,10 +180,15 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
         setCustomFieldDefs(defs)
       } catch { setCustomFieldDefs([]) }
       setPricesUpdatedAt(configData['watchlist_prices_updated_at'] ?? null)
+      const savedDefault = configData['default_watchlist'] ?? ''
+      const effectiveLists = listsData.length > 0 ? listsData : ['Default']
+      const effectiveDefault = effectiveLists.includes(savedDefault) ? savedDefault : effectiveLists[0]
+      setDefaultList(effectiveDefault)
+      if (!selectedSymbol) setSelectedList(effectiveDefault)
       const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
       infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
       setSymbolInfo(infoMap)
-      setLists(listsData.length > 0 ? listsData : ['Default'])
+      setLists(effectiveLists)
       setSymbols(symbolsData)
       setAllPrices(pricesData)
       if (symbolsData.length && !selectedSymbol) {
@@ -183,6 +218,33 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     setNewListName('')
   }
 
+  const handleRenameList = async () => {
+    const newName = renameListValue.trim()
+    if (!newName || newName === selectedList) {
+      setRenamingList(false)
+      return
+    }
+    try {
+      setLoading(true)
+      await apiClient.renameWatchlistList(selectedList, newName)
+      const [listsData, symbolsData] = await Promise.all([
+        apiClient.getWatchlistLists(),
+        apiClient.getWatchlistSymbols(),
+      ])
+      setLists(listsData.length > 0 ? listsData : ['Default'])
+      setSymbols(symbolsData)
+      setSelectedList(newName)
+      setRenamingList(false)
+      setSuccess(`Renamed list to "${newName}"`)
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to rename list')
+    } finally {
+      setLoading(false)
+      onLoading(false)
+    }
+  }
+
   const handleAddSymbol = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!newSymbol.trim()) {
@@ -193,7 +255,14 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       setLoading(true)
       setError(null)
       setSuccess(null)
-      const result = await apiClient.addWatchlistSymbol(newSymbol.trim(), selectedList, newSymbolNotes.trim() || undefined, newSymbolFields)
+      const parsePrice = (s: string | undefined) => {
+        const n = parseFloat(s ?? '')
+        return Number.isNaN(n) ? null : n
+      }
+      const bp = parsePrice(newSymbolFields['breakthrough_price'])
+      const sl = parsePrice(newSymbolFields['stop_loss_price'])
+      const { breakthrough_price: _bp, stop_loss_price: _sl, ...cfFields } = newSymbolFields
+      const result = await apiClient.addWatchlistSymbol(newSymbol.trim(), selectedList, newSymbolNotes.trim() || undefined, { breakthroughPrice: bp, stopLossPrice: sl, customFields: cfFields })
       setNewSymbol('')
       setNewSymbolNotes('')
       setNewSymbolFields({})
@@ -284,7 +353,11 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     setEditListChecks(checks)
     const existing = symbols.find((s) => s.symbol === symbol)
     setEditNotes(existing?.notes ?? '')
-    setEditCustomFields(existing?.custom_fields ?? {})
+    setEditCustomFields({
+      ...existing?.custom_fields ?? {},
+      breakthrough_price: existing?.breakthrough_price != null ? String(existing.breakthrough_price) : '',
+      stop_loss_price: existing?.stop_loss_price != null ? String(existing.stop_loss_price) : '',
+    })
     setEditingSymbol(symbol)
   }
 
@@ -297,11 +370,18 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       const toRemove = symbols.filter((s) => s.symbol === editingSymbol && !editListChecks[s.list_name])
       // Update notes on all existing rows for this symbol
       const existingRows = symbols.filter((s) => s.symbol === editingSymbol && editListChecks[s.list_name])
-      const fields = editCustomFields
+      const { breakthrough_price: bpStr, stop_loss_price: slStr, ...cfFields } = editCustomFields
+      const parsePrice = (s: string | undefined) => {
+        const n = parseFloat(s ?? '')
+        return Number.isNaN(n) ? null : n
+      }
+      const bp = parsePrice(bpStr)
+      const sl = parsePrice(slStr)
+      const opts = { breakthroughPrice: bp, stopLossPrice: sl, customFields: cfFields }
       await Promise.all([
-        ...toAdd.map((l) => apiClient.addWatchlistSymbol(editingSymbol, l, editNotes.trim() || undefined, fields)),
+        ...toAdd.map((l) => apiClient.addWatchlistSymbol(editingSymbol, l, editNotes.trim() || undefined, opts)),
         ...toRemove.map((s) => apiClient.removeWatchlistSymbol(s.id)),
-        ...existingRows.map((s) => apiClient.updateWatchlistSymbol(s.id, editNotes.trim() || null, fields)),
+        ...existingRows.map((s) => apiClient.updateWatchlistSymbol(s.id, editNotes.trim() || null, opts)),
       ])
       setEditingSymbol(null)
       const [listsData, symbolsData] = await Promise.all([
@@ -323,7 +403,8 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
   const listSymbols = symbols.filter((s) => s.list_name === selectedList)
   const listPrices = allPrices.filter((p) => listSymbols.some((s) => s.symbol === p.symbol))
 
-  const renderItem = ({ id, symbol, added_at, notes, custom_fields }: WatchlistSymbol) => {
+  const renderItem = (entry: WatchlistSymbol) => {
+    const { id, symbol, added_at, notes, custom_fields } = entry
     const priceData = listPrices.find((p) => p.symbol === symbol)
     const symCurrency = symbolInfo[symbol]?.currency?.toUpperCase()
     return (
@@ -354,7 +435,22 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
           {notes && (
             <div style={{ fontSize: 11, color: '#5c6bc0', fontStyle: 'italic', marginTop: 1 }}>{notes}</div>
           )}
-          {customFieldDefs.filter((def) => custom_fields[def.key]).map((def) => (
+          {entry.breakthrough_price != null && (
+            <div style={{ fontSize: 11, color: '#555', marginTop: 1 }}>
+              <span style={{ color: '#999' }}>Breakthrough Price:</span> {entry.breakthrough_price}
+            </div>
+          )}
+          {entry.stop_loss_price != null && (
+            <div style={{ fontSize: 11, color: '#555', marginTop: 1 }}>
+              <span style={{ color: '#999' }}>Stop Loss Price:</span> {entry.stop_loss_price}
+            </div>
+          )}
+          {custom_fields['sector'] && (
+            <div style={{ fontSize: 11, color: '#555', marginTop: 1 }}>
+              <span style={{ color: '#999' }}>Sector:</span> {custom_fields['sector']}
+            </div>
+          )}
+          {extraCustomFieldDefs.filter((def) => custom_fields[def.key]).map((def) => (
             <div key={def.key} style={{ fontSize: 11, color: '#555', marginTop: 1 }}>
               <span style={{ color: '#999' }}>{def.label}:</span> {custom_fields[def.key]}
             </div>
@@ -365,7 +461,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
           {priceData ? (
             <div className="price-details">
               <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-                {priceData.price ? (
+                {priceData.price != null ? (
                   <span className="price-value">${priceData.price.toFixed(2)}</span>
                 ) : (
                   <span className="price-unavailable">—</span>
@@ -435,31 +531,29 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
           )}
         </div>
         <div style={{ position: 'absolute', top: 6, right: 8, display: 'flex', gap: 4 }}>
+          <button
+            onClick={(e) => { e.stopPropagation(); setAnalyzingSymbol(symbol) }}
+            className="btn btn-outline btn-small"
+            disabled={loading}
+            title="AI Analysis"
+            style={{ padding: '2px 6px', fontSize: 13, lineHeight: 1 }}
+          >
+            🔍
+          </button>
           {onMoveToHoldings && (
             <button
-              onClick={async (e) => {
+              onClick={(e) => {
                 e.stopPropagation()
+                // Pre-fills the Holdings form; the watchlist entry is only
+                // removed once the holding transaction is actually saved
+                // (via the removeSymbolRequest prop from App).
                 const priceData = listPrices.find((p) => p.symbol === symbol)
                 onMoveToHoldings({
                   symbol,
                   price: priceData?.price ?? undefined,
                   notes: notes ?? undefined,
-                  customFields: custom_fields,
+                  customFields: { ...custom_fields, ...(entry.stop_loss_price != null ? { stop_loss: String(entry.stop_loss_price) } : {}) },
                 })
-                // Remove all watchlist memberships for this symbol
-                const allEntries = symbols.filter((s) => s.symbol === symbol)
-                try {
-                  for (const entry of allEntries) {
-                    await apiClient.removeWatchlistSymbol(entry.id)
-                  }
-                  const remaining = symbols.filter((s) => s.symbol !== symbol)
-                  setSymbols(remaining)
-                  if (selectedSymbol === symbol) setSelectedSymbol(remaining[0]?.symbol || '')
-                  const listsData = await apiClient.getWatchlistLists()
-                  setLists(listsData.length > 0 ? listsData : ['Default'])
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : 'Failed to remove from watchlist')
-                }
               }}
               className="btn btn-outline btn-small"
               disabled={loading}
@@ -510,15 +604,55 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
             >
               {lists.map((l) => <option key={l} value={l}>{l}</option>)}
             </select>
-            {!creatingList ? (
-              <button
-                className="btn btn-outline"
-                style={{ fontSize: 12, padding: '4px 10px' }}
-                onClick={() => setCreatingList(true)}
-                disabled={loading}
-              >
-                + New List
-              </button>
+            {!creatingList && !renamingList ? (
+              <>
+                <button
+                  className="btn btn-outline"
+                  style={{ fontSize: 12, padding: '4px 10px' }}
+                  onClick={() => setCreatingList(true)}
+                  disabled={loading}
+                >
+                  + New List
+                </button>
+                <button
+                  className="btn btn-outline"
+                  style={{ fontSize: 12, padding: '4px 10px' }}
+                  onClick={() => { setRenamingList(true); setRenameListValue(selectedList) }}
+                  disabled={loading}
+                >
+                  Rename
+                </button>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, cursor: 'pointer', marginLeft: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedList === defaultList}
+                    onChange={async (e) => {
+                      if (e.target.checked) {
+                        setDefaultList(selectedList)
+                        await apiClient.updateConfig('default_watchlist', selectedList)
+                      }
+                    }}
+                    disabled={loading || selectedList === defaultList}
+                    style={{ width: 14, height: 14, cursor: 'pointer' }}
+                  />
+                  Default
+                </label>
+              </>
+            ) : renamingList ? (
+              <div style={{ display: 'flex', gap: 4 }}>
+                <input
+                  autoFocus
+                  type="text"
+                  value={renameListValue}
+                  onChange={(e) => setRenameListValue(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleRenameList(); if (e.key === 'Escape') setRenamingList(false) }}
+                  placeholder="New name"
+                  style={{ padding: '4px 8px', borderRadius: 4, border: '1px solid #ccc', fontSize: 13, width: 130 }}
+                  maxLength={40}
+                />
+                <button className="btn btn-primary" style={{ fontSize: 12, padding: '4px 10px' }} onClick={handleRenameList} disabled={!renameListValue.trim() || renameListValue.trim() === selectedList}>Rename</button>
+                <button className="btn btn-outline" style={{ fontSize: 12, padding: '4px 10px' }} onClick={() => setRenamingList(false)}>Cancel</button>
+              </div>
             ) : (
               <div style={{ display: 'flex', gap: 4 }}>
                 <input
@@ -561,27 +695,93 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
               {loading ? 'Adding...' : 'Add Symbol'}
             </button>
           </div>
-          {customFieldDefs.length > 0 && (
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-              {customFieldDefs.map((def) => (
-                <input
-                  key={def.key}
-                  type={def.type}
-                  value={newSymbolFields[def.key] ?? ''}
-                  onChange={(e) => setNewSymbolFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
-                  placeholder={def.label}
-                  className="symbol-input"
-                  disabled={loading}
-                  style={{ flex: 1, minWidth: 120 }}
-                />
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+            <input
+              type="number"
+              value={newSymbolFields['breakthrough_price'] ?? ''}
+              onChange={(e) => setNewSymbolFields((prev) => ({ ...prev, breakthrough_price: e.target.value }))}
+              placeholder="Breakthrough Price"
+              className="symbol-input"
+              disabled={loading}
+              style={{ flex: 1, minWidth: 120 }}
+            />
+            <input
+              type="number"
+              value={newSymbolFields['stop_loss_price'] ?? ''}
+              onChange={(e) => setNewSymbolFields((prev) => ({ ...prev, stop_loss_price: e.target.value }))}
+              placeholder="Stop Loss Price"
+              className="symbol-input"
+              disabled={loading}
+              style={{ flex: 1, minWidth: 120 }}
+            />
+            <select
+              value={newSymbolFields['sector'] ?? ''}
+              onChange={(e) => setNewSymbolFields((prev) => ({ ...prev, sector: e.target.value }))}
+              className="config-input"
+              disabled={loading}
+              title="Sector"
+              style={{ flex: 1, minWidth: 140 }}
+            >
+              <option value="">Sector (optional)</option>
+              {SECTORS.map((s) => (
+                <option key={s} value={s}>{s}</option>
               ))}
-            </div>
-          )}
+            </select>
+            {extraCustomFieldDefs.map((def) => (
+              <input
+                key={def.key}
+                type={def.type}
+                value={newSymbolFields[def.key] ?? ''}
+                onChange={(e) => setNewSymbolFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                placeholder={def.label}
+                className="symbol-input"
+                disabled={loading}
+                style={{ flex: 1, minWidth: 120 }}
+              />
+            ))}
+          </div>
         </form>
       </div>
 
       {error && <div className="alert alert-error">❌ {error}</div>}
       {success && <div className="alert alert-success">✓ {success}</div>}
+
+      {chartSymbols.length > 0 && (
+        <div className="manager-card chart-card">
+          <div className="card-header">
+            <h2>Simple Moving Average Chart</h2>
+            <div className="chart-select">
+              <label htmlFor="chart-symbol">Symbol</label>
+              <select
+                id="chart-symbol"
+                value={selectedSymbol}
+                onChange={(e) => setSelectedSymbol(e.target.value)}
+                disabled={loading}
+              >
+                {chartSymbols.map((s) => (
+                  <option key={s.id} value={s.symbol}>{s.symbol}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <PriceChart
+            symbol={selectedSymbol || chartSymbols[0]?.symbol}
+            currency={symbolInfo[selectedSymbol || chartSymbols[0]?.symbol]?.currency?.toUpperCase() ?? 'AUD'}
+            onLoading={onLoading}
+            currentPrice={allPrices.find((p) => p.symbol === (selectedSymbol || chartSymbols[0]?.symbol))?.price ?? null}
+            currentVolume={allPrices.find((p) => p.symbol === (selectedSymbol || chartSymbols[0]?.symbol))?.volume ?? null}
+            currentPriceDate={allPrices.find((p) => p.symbol === (selectedSymbol || chartSymbols[0]?.symbol))?.price_date ?? null}
+            markers={(() => {
+              const sym = selectedSymbol || chartSymbols[0]?.symbol
+              const entry = symbols.find((s) => s.symbol === sym)
+              const result: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }> = []
+              if (entry?.breakthrough_price) result.push({ price: entry.breakthrough_price, label: 'Breakthrough', mode: 'breakthrough', color: '#4caf50' })
+              if (entry?.stop_loss_price) result.push({ price: entry.stop_loss_price, label: 'Stop Loss', mode: 'stoploss', color: '#e91e63' })
+              return result.length > 0 ? result : undefined
+            })()}
+          />
+        </div>
+      )}
 
       <div className="manager-card">
         <div className="card-header">
@@ -609,38 +809,11 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
         ) : listSymbols.length === 0 ? (
           <p className="empty-text">No symbols in "{selectedList}" yet. Add one above.</p>
         ) : (
-          <ul className="symbols-list">{listSymbols.map(renderItem)}</ul>
+          <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+            <ul className="symbols-list">{listSymbols.map(renderItem)}</ul>
+          </div>
         )}
       </div>
-
-      {chartSymbols.length > 0 && (
-        <div className="manager-card chart-card">
-          <div className="card-header">
-            <h2>Simple Moving Average Chart</h2>
-            <div className="chart-select">
-              <label htmlFor="chart-symbol">Symbol</label>
-              <select
-                id="chart-symbol"
-                value={selectedSymbol}
-                onChange={(e) => setSelectedSymbol(e.target.value)}
-                disabled={loading}
-              >
-                {chartSymbols.map((s) => (
-                  <option key={s.id} value={s.symbol}>{s.symbol}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-          <PriceChart
-            symbol={selectedSymbol || chartSymbols[0]?.symbol}
-            currency={symbolInfo[selectedSymbol || chartSymbols[0]?.symbol]?.currency?.toUpperCase() ?? 'AUD'}
-            onLoading={onLoading}
-            currentPrice={allPrices.find((p) => p.symbol === (selectedSymbol || chartSymbols[0]?.symbol))?.price ?? null}
-            currentVolume={allPrices.find((p) => p.symbol === (selectedSymbol || chartSymbols[0]?.symbol))?.volume ?? null}
-            currentPriceDate={allPrices.find((p) => p.symbol === (selectedSymbol || chartSymbols[0]?.symbol))?.price_date ?? null}
-          />
-        </div>
-      )}
 
       {editingSymbol && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
@@ -662,7 +835,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                 </label>
               ))}
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: customFieldDefs.length > 0 ? 12 : 20 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
               <label style={{ fontSize: 13, color: '#666' }}>Notes (optional)</label>
               <input
                 type="text"
@@ -673,22 +846,57 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                 style={{ width: '100%' }}
               />
             </div>
-            {customFieldDefs.length > 0 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
-                {customFieldDefs.map((def) => (
-                  <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
-                    <input
-                      type={def.type}
-                      value={editCustomFields[def.key] ?? ''}
-                      onChange={(e) => setEditCustomFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
-                      className="symbol-input"
-                      style={{ width: '100%' }}
-                    />
-                  </div>
-                ))}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Breakthrough Price</label>
+                <input
+                  type="number"
+                  value={editCustomFields['breakthrough_price'] ?? ''}
+                  onChange={(e) => setEditCustomFields((prev) => ({ ...prev, breakthrough_price: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                />
               </div>
-            )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Stop Loss Price</label>
+                <input
+                  type="number"
+                  value={editCustomFields['stop_loss_price'] ?? ''}
+                  onChange={(e) => setEditCustomFields((prev) => ({ ...prev, stop_loss_price: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Sector</label>
+                <select
+                  value={editCustomFields['sector'] ?? ''}
+                  onChange={(e) => setEditCustomFields((prev) => ({ ...prev, sector: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                >
+                  <option value="">— None —</option>
+                  {(editCustomFields['sector'] ?? '') !== '' && !(SECTORS as readonly string[]).includes(editCustomFields['sector']) && (
+                    <option value={editCustomFields['sector']}>{editCustomFields['sector']}</option>
+                  )}
+                  {SECTORS.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              {extraCustomFieldDefs.map((def) => (
+                <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
+                  <input
+                    type={def.type}
+                    value={editCustomFields[def.key] ?? ''}
+                    onChange={(e) => setEditCustomFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                    className="symbol-input"
+                    style={{ width: '100%' }}
+                  />
+                </div>
+              ))}
+            </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button className="btn btn-outline" onClick={() => setEditingSymbol(null)}>Cancel</button>
               <button className="btn btn-primary" onClick={handleSaveEdit} disabled={loading || !lists.some((l) => editListChecks[l])}>
@@ -709,6 +917,14 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
           <li>Use full symbols: ASX stocks need <code>.AX</code> suffix (e.g. BHP.AX), US stocks use plain ticker (e.g. AAPL, MSFT)</li>
         </ul>
       </div>
+
+      {analyzingSymbol && (
+        <StockAnalysis
+          symbol={analyzingSymbol}
+          symbolName={symbolInfo[analyzingSymbol]?.long_name}
+          onClose={() => setAnalyzingSymbol(null)}
+        />
+      )}
     </div>
   )
 }

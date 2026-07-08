@@ -15,7 +15,12 @@ interface PriceChartProps {
   currentPrice?: number | null   // live price to inject if newer than history
   currentVolume?: number | null  // live volume to use alongside injected price
   currentPriceDate?: string | null  // actual trading date for the live price (may differ from today)
-  purchasePrice?: number | null  // avg cost per share (AUD) — shown in Holdings chart header
+  purchasePrice?: number | null  // avg cost per share — shown in Holdings chart header
+  purchaseDate?: string | null   // earliest purchase date (YYYY-MM-DD) for dot placement
+  markerPrice?: number | null    // price level to mark with a dot (e.g. breakthrough price, stop loss)
+  markerLabel?: string           // label for the marker (e.g. "Breakthrough", "Stop Loss")
+  markerMode?: 'breakthrough' | 'stoploss'
+  markers?: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }>
 }
 
 const CURRENCY_SYMBOL: Record<string, string> = {
@@ -41,7 +46,7 @@ function buildPath(points: Array<{ x: number; y: number | null }>) {
   return filtered.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
 }
 
-export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading, currentPrice, currentVolume, currentPriceDate, purchasePrice }: PriceChartProps) {
+export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading, currentPrice, currentVolume, currentPriceDate, purchasePrice, purchaseDate, markerPrice, markerLabel, markerMode = 'breakthrough', markers }: PriceChartProps) {
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -77,22 +82,17 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     loadHistory()
   }, [symbol])
 
-  // Resolve the true currency for this symbol, then fetch its FX rate.
-  // We fetch symbol info ourselves so this works even when the parent's cache is stale.
+  // Resolve the currency for this symbol, then fetch its FX rate. When the
+  // parent passes a non-AUD currency (from its symbolInfo cache) we trust it;
+  // only when the prop says AUD — which can also mean "unknown" — do we
+  // double-check against symbol_info.
   useEffect(() => {
     if (!symbol) return
     setShowInAud(false)
     setFxRate(null)
-    setDetectedCurrency('AUD')
 
-    // Use the prop as an immediate hint if it looks reliable
-    const hint = currencyProp !== 'AUD' ? currencyProp : null
-
-    apiClient.getSymbolInfo().then((symbols) => {
-      const info = symbols.find((s) => s.symbol === symbol)
-      const resolved = (info?.currency?.toUpperCase() ?? hint ?? 'AUD')
+    const applyCurrency = (resolved: string) => {
       setDetectedCurrency(resolved)
-
       if (resolved !== 'AUD') {
         const today = new Date().toISOString().slice(0, 10)
         setFxLoading(true)
@@ -100,18 +100,18 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           .then((result) => { if (result) setFxRate(result.rate) })
           .finally(() => setFxLoading(false))
       }
-    }).catch(() => {
-      // If symbol info fetch fails, fall back to the prop
-      const fallback = currencyProp.toUpperCase()
-      setDetectedCurrency(fallback)
-      if (fallback !== 'AUD') {
-        const today = new Date().toISOString().slice(0, 10)
-        setFxLoading(true)
-        apiClient.getFxRateForDate(fallback, today)
-          .then((result) => { if (result) setFxRate(result.rate) })
-          .finally(() => setFxLoading(false))
-      }
-    })
+    }
+
+    const propCurrency = currencyProp.toUpperCase()
+    if (propCurrency !== 'AUD') {
+      applyCurrency(propCurrency)
+      return
+    }
+    setDetectedCurrency('AUD')
+    apiClient.getSymbolInfo().then((symbols) => {
+      const info = symbols.find((s) => s.symbol === symbol)
+      applyCurrency(info?.currency?.toUpperCase() ?? 'AUD')
+    }).catch(() => applyCurrency('AUD'))
   }, [symbol, currencyProp])
 
   const togglePeriod = (period: SmaPeriod) => {
@@ -189,8 +189,15 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
 
     const closeValues = trimmedHistory.map((item) => item.close)
     const validValues = closeValues.filter((val): val is number => val !== null).map((v) => v * fxMultiplier)
-    const rawMin = Math.min(...validValues)
-    const rawMax = Math.max(...validValues)
+    // Include marker and purchase prices in the range so dots are always visible
+    const markerValues: number[] = []
+    if (markerPrice != null) markerValues.push(markerPrice * fxMultiplier)
+    if (markers) markers.forEach((m) => markerValues.push(m.price * fxMultiplier))
+    if (purchasePrice != null) {
+      markerValues.push(purchasePrice * fxMultiplier)
+    }
+    const rawMin = Math.min(...validValues, ...markerValues)
+    const rawMax = Math.max(...validValues, ...markerValues)
     const padding = (rawMax - rawMin) * 0.05 || 1
     const minValue = rawMin - padding
     const maxValue = rawMax + padding
@@ -265,9 +272,70 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       width: 1100, height: volumeTop + volumeHeight,
       points, smaLines, volumeBars, yLabels, xLabels,
       left, right, top, bottom, plotWidth, plotHeight,
-      pricePlotHeight: plotHeight, axisY, labelY,
+      pricePlotHeight: plotHeight, axisY, labelY, toY, minValue, maxValue,
     }
-  }, [trimmedHistory, effectiveHistory.length, allSmas, fxMultiplier, currSym])
+  }, [trimmedHistory, effectiveHistory.length, allSmas, fxMultiplier, currSym, markerPrice, markers, purchasePrice, isInternational, showInAud, fxRate])
+
+  const allMarkers = useMemo(() => {
+    const defs: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }> = []
+    if (markers) defs.push(...markers)
+    if (markerPrice != null) defs.push({ price: markerPrice, label: markerLabel ?? 'Marker', mode: markerMode, color: markerMode === 'stoploss' ? '#e91e63' : '#4caf50' })
+    return defs
+  }, [markers, markerPrice, markerLabel, markerMode])
+
+  const markerDots = useMemo(() => {
+    if (trimmedHistory.length === 0) return []
+    const latestClose = trimmedHistory[trimmedHistory.length - 1]?.close
+    if (latestClose == null) return []
+    const lastIdx = trimmedHistory.length - 1
+    const todayX = chartData.left + chartData.plotWidth
+    const tomorrowX = chartData.left + chartData.plotWidth + 15
+
+    return allMarkers.map((m) => {
+      const mp = m.price * fxMultiplier
+      const y = chartData.toY(mp)
+      const priceAbove = latestClose * fxMultiplier >= mp
+
+      if (m.mode === 'stoploss') {
+        const x = priceAbove ? tomorrowX : todayX
+        return { x, y, label: m.label, color: m.color, price: mp }
+      }
+
+      // Breakthrough mode
+      if (priceAbove) {
+        for (let i = lastIdx; i >= 0; i--) {
+          const close = trimmedHistory[i].close
+          if (close !== null && close * fxMultiplier < mp) {
+            const crossIdx = Math.min(i + 1, lastIdx)
+            const x = chartData.left + (chartData.plotWidth * crossIdx) / Math.max(lastIdx, 1)
+            return { x, y, label: m.label, color: m.color, price: mp }
+          }
+        }
+        return { x: chartData.left, y, label: m.label, color: m.color, price: mp }
+      } else {
+        return { x: tomorrowX, y, label: m.label, color: m.color, price: mp }
+      }
+    }).filter((d): d is NonNullable<typeof d> => d !== null)
+  }, [allMarkers, trimmedHistory, chartData, fxMultiplier])
+
+  const purchaseDot = useMemo(() => {
+    if (purchasePrice == null || trimmedHistory.length === 0) return null
+    const displayPrice = purchasePrice * fxMultiplier
+    const y = chartData.toY(displayPrice)
+
+    if (purchaseDate) {
+      const firstDate = trimmedHistory[0].date
+      if (purchaseDate >= firstDate) {
+        // Purchase date is within chart range — find the x position
+        const idx = trimmedHistory.findIndex((h) => h.date >= purchaseDate)
+        const i = idx >= 0 ? idx : trimmedHistory.length - 1
+        const x = chartData.left + (chartData.plotWidth * i) / Math.max(trimmedHistory.length - 1, 1)
+        return { x, y, price: displayPrice, onAxis: false }
+      }
+    }
+    // Purchase date is before chart range or not provided — show on Y axis
+    return { x: chartData.left, y, price: displayPrice, onAxis: true }
+  }, [purchasePrice, purchaseDate, trimmedHistory, chartData, fxMultiplier, isInternational, showInAud, fxRate])
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current
@@ -311,7 +379,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       : hoverData.x + 10
     : 0
   const activeSmaValues = hoverData?.smaValues ?? []
-  const tooltipHeight = 38 + (hoverData?.price !== null ? 18 : 0) + activeSmaValues.length * 18 + 4
+  const tooltipHeight = 38 + (hoverData?.price !== null ? 18 : 0) + activeSmaValues.length * 18 + markerDots.length * 18 + (purchaseDot ? 18 : 0) + 4
 
   const activePeriodsArray = Array.from(activePeriods).sort((a, b) => a - b)
 
@@ -322,10 +390,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           <span className="chart-symbol">{symbol}</span>
           <span className="chart-value">{latestPrice !== null ? `${currSym}${latestPrice.toFixed(2)}` : 'Price unavailable'}</span>
           {purchasePrice != null && latestPrice !== null && (() => {
-            // purchasePrice is always in AUD; convert to native currency when chart is in native mode
-            const displayPurchase = (isInternational && !showInAud && fxRate)
-              ? purchasePrice / fxRate
-              : purchasePrice
+            const displayPurchase = purchasePrice * fxMultiplier
             const pl = ((latestPrice - displayPurchase) / displayPurchase) * 100
             return (
               <>
@@ -431,6 +496,16 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           {/* Price line */}
           <path d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
 
+          {/* Marker dots (breakthrough price / stop loss) */}
+          {markerDots.map((dot, i) => (
+            <circle key={i} cx={dot.x} cy={dot.y} r="6" fill={dot.color} stroke="#fff" strokeWidth="2" />
+          ))}
+
+          {/* Purchase price dot */}
+          {purchaseDot && (
+            <circle cx={purchaseDot.x} cy={purchaseDot.y} r="6" fill={purchaseDot.onAxis ? '#ff9800' : '#4caf50'} stroke="#fff" strokeWidth="2" />
+          )}
+
           {/* Volume bars */}
           {chartData.volumeBars.map((bar, index) => (
             <rect key={index} x={bar.x} y={bar.y} width={bar.width} height={bar.height} fill={bar.color} opacity="0.85" />
@@ -465,6 +540,16 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                     SMA {period}: {currSym}{value.toFixed(2)}
                   </text>
                 ) : null
+              )}
+              {markerDots.map((dot, i) => (
+                <text key={`m${i}`} x={tooltipX + 10} y={chartData.top + 56 + activeSmaValues.length * 18 + i * 18} fontSize="12" fill={dot.color} fontFamily="inherit">
+                  {dot.label}: {currSym}{dot.price.toFixed(2)}
+                </text>
+              ))}
+              {purchaseDot && (
+                <text x={tooltipX + 10} y={chartData.top + 56 + activeSmaValues.length * 18 + markerDots.length * 18} fontSize="12" fill={purchaseDot.onAxis ? '#ff9800' : '#4caf50'} fontFamily="inherit">
+                  Purchase: {currSym}{purchaseDot.price.toFixed(2)}
+                </text>
               )}
             </g>
           )}

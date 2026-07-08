@@ -5,6 +5,17 @@ use serde::Deserialize;
 use std::{collections::HashMap, env, path::PathBuf, time::Duration};
 use tokio::time;
 
+/// Open the SQLite database with WAL mode and a busy timeout so the API,
+/// price daemon and dividends daemon can write concurrently without
+/// intermittent "database is locked" failures.
+fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    Ok(conn)
+}
+
+#[allow(dead_code)] // several columns are loaded for completeness but not read by this daemon
 #[derive(Debug, Clone)]
 struct HoldingTransaction {
     id: i64,
@@ -29,6 +40,7 @@ struct DividendEvent {
     fetched_at: String,
 }
 
+#[allow(dead_code)] // symbol kept for Debug output symmetry with the API binary
 #[derive(Debug)]
 struct DividendPayment {
     symbol: String,
@@ -47,7 +59,6 @@ struct YahooChartResponse {
 #[derive(Debug, Deserialize)]
 struct YahooChart {
     result: Option<Vec<YahooResult>>,
-    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,7 +79,6 @@ struct YahooDividendEntry {
     ex_date: Option<i64>,
     payment_date: Option<i64>,
     record_date: Option<i64>,
-    symbol: Option<String>,
 }
 
 #[tokio::main]
@@ -177,7 +187,7 @@ fn print_dividend_payments(symbol: &str, payments: &[DividendPayment]) {
 }
 
 fn load_holdings_transactions(db_path: &PathBuf) -> anyhow::Result<Vec<HoldingTransaction>> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_db(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at
          FROM holdings_transactions
@@ -310,7 +320,7 @@ fn calculate_shares_on_date(transactions: &[HoldingTransaction], date: NaiveDate
 }
 
 fn init_db(path: &PathBuf) -> anyhow::Result<()> {
-    let conn = Connection::open(path)?;
+    let conn = open_db(path)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS dividend_events (
             id INTEGER PRIMARY KEY,
@@ -343,7 +353,7 @@ fn store_dividend_events(
     symbol: &str,
     events: &[DividendEvent],
 ) -> anyhow::Result<()> {
-    let mut conn = Connection::open(db_path)?;
+    let mut conn = open_db(db_path)?;
     let tx = conn.transaction()?;
     {
         let mut insert = tx.prepare(
@@ -383,7 +393,7 @@ fn insert_event_log(
     symbol: Option<&str>,
     details: &str,
 ) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+    let conn = open_db(db_path)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

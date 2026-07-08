@@ -9,8 +9,9 @@ import EventLogViewer from './components/EventLogViewer'
 import Dashboard from './components/Dashboard'
 import SoldStocks from './components/SoldStocks'
 import Transactions from './components/Transactions'
+import Analysis from './components/Analysis'
 
-type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'sold' | 'transactions' | 'events' | 'config'
+type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'analysis' | 'sold' | 'transactions' | 'events' | 'config'
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
@@ -20,6 +21,9 @@ function App() {
   const [configVersion, setConfigVersion] = useState(0)
   const [watchlistFocusSymbol, setWatchlistFocusSymbol] = useState<string | null>(null)
   const [holdingsPrefill, setHoldingsPrefill] = useState<{ symbol: string; price?: number; notes?: string; customFields?: Record<string, string> } | null>(null)
+  // Set when a "Move to Holdings" transaction is saved — tells the watchlist
+  // it is now safe to remove the symbol's memberships.
+  const [watchlistRemoveSymbol, setWatchlistRemoveSymbol] = useState<string | null>(null)
   const startupRefreshTriggered = useRef(false)
 
   const handleNavigateToWatchlist = (symbol: string) => {
@@ -63,12 +67,8 @@ function App() {
   }, [])
 
   const testBackendConnection = async () => {
-    try {
-      const response = await fetch('http://localhost:3001/api/health')
-      if (!response.ok) {
-        setError('Backend server not available')
-      }
-    } catch (err) {
+    const healthy = await apiClient.checkHealth()
+    if (!healthy) {
       setError('Cannot connect to backend. Make sure the API server is running.')
     }
   }
@@ -109,6 +109,13 @@ function App() {
           Holdings
         </button>
         <button
+          className={`tab-button ${activeTab === 'analysis' ? 'active' : ''}`}
+          onClick={() => setActiveTab('analysis')}
+          disabled={loading}
+        >
+          Analysis
+        </button>
+        <button
           className={`tab-button ${activeTab === 'sold' ? 'active' : ''}`}
           onClick={() => setActiveTab('sold')}
           disabled={loading}
@@ -143,10 +150,13 @@ function App() {
           <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} onNavigateToWatchlist={handleNavigateToWatchlist} />
         </div>
         <div style={{ display: activeTab === 'watchlist' ? 'block' : 'none' }}>
-          <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} onMoveToHoldings={handleMoveToHoldings} />
+          <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} onMoveToHoldings={handleMoveToHoldings} removeSymbolRequest={watchlistRemoveSymbol} onRemoveSymbolConsumed={() => setWatchlistRemoveSymbol(null)} />
         </div>
         <div style={{ display: activeTab === 'holdings' ? 'block' : 'none' }}>
-          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} prefill={holdingsPrefill} onPrefillConsumed={() => setHoldingsPrefill(null)} />
+          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} prefill={holdingsPrefill} onPrefillConsumed={() => setHoldingsPrefill(null)} onPrefillSaved={(symbol) => setWatchlistRemoveSymbol(symbol)} />
+        </div>
+        <div style={{ display: activeTab === 'analysis' ? 'block' : 'none' }}>
+          <Analysis onLoading={setLoading} holdingsVersion={holdingsVersion} />
         </div>
         <div style={{ display: activeTab === 'sold' ? 'block' : 'none' }}>
           <SoldStocks onLoading={setLoading} holdingsVersion={holdingsVersion} />
