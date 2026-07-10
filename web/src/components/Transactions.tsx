@@ -1,32 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { apiClient, type HoldingTransactionPayload } from '../services/api'
+import { apiClient, type HoldingTransactionPayload, type LedgerRow } from '../services/api'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
-
-interface HoldingTransaction {
-  id: number
-  symbol: string
-  transaction_type: 'purchase' | 'sale' | 'dividend'
-  date: string
-  quantity: number | null
-  price: number | null
-  amount: number | null
-  brokerage: number | null
-  notes: string | null
-  created_at: string
-  dividends_total: number
-  currency: string
-  original_price: number | null
-  fx_rate: number | null
-  custom_fields: Record<string, string>
-}
-
-interface DividendEvent {
-  symbol: string
-  ex_date: string
-  payment_date: string | null
-  amount: number
-}
 
 interface TransactionRow {
   key: string
@@ -68,9 +43,12 @@ interface HoldingsFieldDef {
 
 type FilterType = 'all' | 'purchase' | 'sale' | 'dividend'
 
+// Thin client: the transaction/dividend-event merge (dedupe by symbol+date,
+// first-purchase filter, per-share flag) is computed by the API server
+// (GET /api/transactions/ledger).
+
 export default function Transactions({ onLoading, holdingsVersion }: { onLoading: (loading: boolean) => void; holdingsVersion?: number }) {
-  const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
-  const [dividends, setDividends] = useState<DividendEvent[]>([])
+  const [ledger, setLedger] = useState<LedgerRow[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -86,22 +64,22 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const editFxSeed = useRef<{ currency: string; date: string; rate: number | null } | null>(null)
   const [holdingsFieldDefs, setHoldingsFieldDefs] = useState<HoldingsFieldDef[]>([])
 
+  const loadLedger = async () => {
+    const data = await apiClient.getTransactionsLedger()
+    setLedger(data.rows)
+  }
+
   useEffect(() => {
     const load = async () => {
       try {
         setLoading(true)
         setError(null)
         onLoading(true)
-        const [txData, divData, configData] = await Promise.all([
-          apiClient.getHoldings(),
-          apiClient.getDividends(),
-          apiClient.getConfig(),
+        const [, meta] = await Promise.all([
+          loadLedger(),
+          apiClient.getMeta(),
         ])
-        setTransactions(txData)
-        setDividends(divData)
-        try {
-          setHoldingsFieldDefs(JSON.parse(configData['holdings_custom_fields'] ?? '[]'))
-        } catch { setHoldingsFieldDefs([]) }
+        setHoldingsFieldDefs((meta.holdings_custom_fields ?? []) as HoldingsFieldDef[])
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load transactions')
       } finally {
@@ -137,68 +115,29 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   }, [editing?.currency, editing?.date, editing?.type])
 
   const rows = useMemo((): TransactionRow[] => {
-    // Track the earliest purchase date per symbol
-    const firstPurchaseDate: Record<string, string> = {}
-    transactions.forEach((tx) => {
-      if (tx.transaction_type === 'purchase') {
-        if (!firstPurchaseDate[tx.symbol] || tx.date < firstPurchaseDate[tx.symbol]) {
-          firstPurchaseDate[tx.symbol] = tx.date
-        }
-      }
-    })
-
-    const txRows: TransactionRow[] = transactions.map((tx) => ({
-      key: `tx-${tx.id}`,
-      id: tx.id,
-      symbol: tx.symbol,
-      type: tx.transaction_type,
-      date: tx.date,
-      quantity: tx.quantity,
-      price: tx.price,
-      currency: tx.currency || 'AUD',
-      original_price: tx.original_price ?? null,
-      amount: tx.amount,
-      brokerage: tx.brokerage,
-      notes: tx.notes,
-      perShare: false,
-    }))
-
-    // Skip fetched dividend events already recorded as a manual dividend
-    // transaction on the same day, so the same dividend isn't listed twice.
-    const manualDividendKeys = new Set(
-      transactions
-        .filter((tx) => tx.transaction_type === 'dividend')
-        .map((tx) => `${tx.symbol}|${tx.date}`)
-    )
-
-    const divRows: TransactionRow[] = dividends
-      .filter((d) => firstPurchaseDate[d.symbol] && d.ex_date >= firstPurchaseDate[d.symbol])
-      .filter((d) => !manualDividendKeys.has(`${d.symbol}|${d.ex_date}`))
-      .map((d, i) => ({
-        key: `div-${d.symbol}-${d.ex_date}-${i}`,
-        id: null,
-        symbol: d.symbol,
-        type: 'dividend' as const,
-        date: d.ex_date,
-        quantity: null,
-        price: null,
-        currency: 'AUD',
-        original_price: null,
-        amount: d.amount,
-        brokerage: null,
-        notes: d.payment_date ? `Payment: ${new Date(d.payment_date).toLocaleDateString()}` : null,
-        perShare: true,
-      }))
-
-    return [...txRows, ...divRows]
-      .filter((r) => filter === 'all' || r.type === filter)
+    return ledger
+      .filter((r) => filter === 'all' || r.transaction_type === filter)
       .filter((r) => !symbolFilter || r.symbol.includes(symbolFilter.toUpperCase()))
-      .sort((a, b) => b.date.localeCompare(a.date))
-  }, [transactions, dividends, filter, symbolFilter])
+      .map((r) => ({
+        key: r.key,
+        id: r.id,
+        symbol: r.symbol,
+        type: r.transaction_type,
+        date: r.date,
+        quantity: r.quantity,
+        price: r.price,
+        currency: r.currency || 'AUD',
+        original_price: r.original_price,
+        amount: r.amount,
+        brokerage: r.brokerage,
+        notes: r.per_share && r.payment_date ? `Payment: ${new Date(r.payment_date).toLocaleDateString()}` : r.notes,
+        perShare: r.per_share,
+      }))
+  }, [ledger, filter, symbolFilter])
 
   const startEdit = (row: TransactionRow) => {
     if (row.id === null) return
-    const tx = transactions.find((t) => t.id === row.id)
+    const tx = ledger.find((t) => t.id === row.id)
     const currency = tx?.currency || 'AUD'
     const displayPrice = currency !== 'AUD' && tx?.original_price != null
       ? tx.original_price.toString()
@@ -226,7 +165,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     try {
       setSaving(true)
       await apiClient.removeHoldingTransaction(id)
-      setTransactions((prev) => prev.filter((tx) => tx.id !== id))
+      await loadLedger()
       if (editing?.id === id) setEditing(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete transaction')
@@ -268,8 +207,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       if (Object.keys(editing.custom_fields).length > 0) {
         payload.custom_fields = editing.custom_fields
       }
-      const updated = await apiClient.updateHoldingTransaction(editing.id, payload)
-      setTransactions((prev) => prev.map((tx) => tx.id === editing.id ? updated : tx))
+      await apiClient.updateHoldingTransaction(editing.id, payload)
+      await loadLedger()
       setEditing(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save transaction')

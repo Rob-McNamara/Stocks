@@ -15,6 +15,7 @@ log = "0.4"
 env_logger = "0.10"
 actix-web = "4.4"
 actix-cors = "0.6"
+utoipa = "5"
 
 [dev-dependencies]
 tempfile = "3"

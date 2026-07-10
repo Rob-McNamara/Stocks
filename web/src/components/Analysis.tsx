@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import { apiClient } from '../services/api'
-import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate } from '../utils/holdings'
-import { calculateSMA, getLatestSMA } from '../utils/sma'
-import { mapLimit } from '../utils/async'
+import { apiClient, type RiskRow, type RiskTotals } from '../services/api'
+import { getEarliestRemainingPurchaseDate } from '../utils/holdings'
 import PriceChart from './PriceChart'
+
+// Thin client: FIFO cost basis, stop-loss/trailing-sell triggers, SMAs and
+// the 30-day high are all computed by the API server
+// (GET /api/portfolio/risk). This component renders server rows and manages
+// the chart and the stop-loss edit modal.
 
 interface HoldingTransaction {
   id: number
@@ -45,12 +48,9 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
   const [volumes, setVolumes] = useState<Record<string, number | null>>({})
   const [symbolFields, setSymbolFields] = useState<Record<string, Record<string, string>>>({})
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
-  const [sma50Map, setSma50Map] = useState<Record<string, number | null>>({})
-  const [sma150Map, setSma150Map] = useState<Record<string, number | null>>({})
-  const [high30dMap, setHigh30dMap] = useState<Record<string, number | null>>({})
-  const [priceHistoryMap, setPriceHistoryMap] = useState<Record<string, Array<{ date: string; close: number | null }>>>({})
-  /** AUD per 1 unit of each foreign currency, keyed by ISO code (e.g. USD, GBP) */
-  const [fxRates, setFxRates] = useState<Record<string, number | null>>({})
+  /** Server-computed risk rows from /api/portfolio/risk */
+  const [riskRows, setRiskRows] = useState<RiskRow[]>([])
+  const [riskTotals, setRiskTotals] = useState<RiskTotals | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [selectedSymbol, setSelectedSymbol] = useState('')
@@ -71,26 +71,24 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
       setError(null)
       onLoading(true)
 
-      const [txData, symFields, infoData] = await Promise.all([
+      const [txData, symFields, infoData, riskData] = await Promise.all([
         apiClient.getHoldings(),
         apiClient.getHoldingsSymbolFields(),
         apiClient.getSymbolInfo(),
+        apiClient.getPortfolioRisk(),
       ])
       setTransactions(txData)
       setSymbolFields(symFields)
       const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
       infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
       setSymbolInfo(infoMap)
+      setRiskRows(riskData.rows)
+      setRiskTotals(riskData.totals)
 
-      // Fetch an AUD rate for every foreign currency actually present
-      const currencies = Array.from(new Set(
-        infoData.map((i) => i.currency?.toUpperCase()).filter((c): c is string => !!c && c !== 'AUD')
-      ))
-      apiClient.getFxRates(currencies).then(setFxRates).catch(() => setFxRates({}))
-
-      const activeSymbols = getActiveHoldingSymbols(txData)
+      const activeSymbols = riskData.rows.map((r) => r.symbol)
       if (!selectedSymbol && activeSymbols.length > 0) setSelectedSymbol(activeSymbols[0])
 
+      // Native cached prices/volumes are only needed as chart inputs
       const cachedPrices = await apiClient.getCachedPrices(activeSymbols)
       const priceMap: Record<string, number | null> = {}
       const volumeMap: Record<string, number | null> = {}
@@ -103,30 +101,6 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
 
       setLoading(false)
       onLoading(false)
-
-      const sma50: Record<string, number | null> = {}
-      const sma150: Record<string, number | null> = {}
-      const high30d: Record<string, number | null> = {}
-      const histMap: Record<string, Array<{ date: string; close: number | null }>> = {}
-      await mapLimit(activeSymbols, 6, async (sym) => {
-        try {
-          const history = await apiClient.getPriceHistory(sym, 300)
-          histMap[sym] = history
-          sma50[sym] = getLatestSMA(calculateSMA(history, 50))
-          sma150[sym] = getLatestSMA(calculateSMA(history, 150))
-          const recent30 = history.slice(-30)
-          const closes = recent30.map((p) => p.close).filter((c): c is number => c !== null)
-          high30d[sym] = closes.length > 0 ? Math.max(...closes) : null
-        } catch {
-          sma50[sym] = null
-          sma150[sym] = null
-          high30d[sym] = null
-        }
-      })
-      setPriceHistoryMap(histMap)
-      setSma50Map(sma50)
-      setSma150Map(sma150)
-      setHigh30dMap(high30d)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load analysis data')
       setLoading(false)
@@ -134,98 +108,22 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
     }
   }
 
-  const rows: AnalysisRow[] = useMemo(() => {
-    const activeSymbols = getActiveHoldingSymbols(transactions)
-    return activeSymbols.map((symbol) => {
-      const rawPrice = prices[symbol] ?? null
-      const symbolCurrency = symbolInfo[symbol]?.currency?.toUpperCase() ?? null
-
-      // FIFO cost basis for avg purchase price
-      // Determine display currency from the transactions: if all purchases were recorded
-      // in AUD (even for a foreign-listed stock), display in AUD
-      const sorted = [...transactions]
-        .filter((tx) => tx.symbol === symbol)
-        .sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id)
-      const purchaseTxs = sorted.filter((tx) => tx.transaction_type === 'purchase')
-      const allPurchasedInAud = purchaseTxs.length > 0 && purchaseTxs.every((tx) => (tx.currency ?? 'AUD') === 'AUD')
-      const displayCurrency = allPurchasedInAud ? 'AUD' : symbolCurrency
-      const isForeign = !!displayCurrency && displayCurrency !== 'AUD'
-
-      // Convert market prices to AUD when the stock was purchased in AUD but trades in a foreign currency
-      const symbolFxRate = symbolCurrency && symbolCurrency !== 'AUD' ? fxRates[symbolCurrency] ?? null : null
-      const needsConversion = allPurchasedInAud && symbolFxRate != null
-      const toDisplay = (p: number | null) => {
-        if (p === null) return null
-        return needsConversion ? p * symbolFxRate : p
-      }
-      const currentPrice = toDisplay(rawPrice)
-      const lots: Array<{ quantity: number; price: number }> = []
-      sorted.forEach((tx) => {
-        if (tx.transaction_type === 'purchase' && tx.quantity && tx.price) {
-          const nativePrice = isForeign && tx.original_price != null ? tx.original_price : tx.price
-          lots.push({ quantity: tx.quantity, price: nativePrice })
-        } else if (tx.transaction_type === 'sale' && tx.quantity) {
-          let remaining = tx.quantity
-          while (remaining > 0 && lots.length > 0) {
-            const used = Math.min(remaining, lots[0].quantity)
-            lots[0].quantity -= used
-            remaining -= used
-            if (lots[0].quantity <= 0) lots.shift()
-          }
-        }
-      })
-      const totalShares = lots.reduce((s, l) => s + l.quantity, 0)
-      const totalCost = lots.reduce((s, l) => s + l.quantity * l.price, 0)
-      const purchasePrice = totalShares > 0 ? totalCost / totalShares : null
-
-      const plPct = purchasePrice && currentPrice ? ((currentPrice - purchasePrice) / purchasePrice) * 100 : null
-
-      const stopLossStr = symbolFields[symbol]?.['stop_loss']
-      const trailingSellPctStr = symbolFields[symbol]?.['trailing_sell_pct']
-      const trailingSellPct = trailingSellPctStr ? parseFloat(trailingSellPctStr) : null
-      const high30d = toDisplay(high30dMap[symbol] ?? null)
-
-      let stopLoss: number | null = null
-      let isTrailingSell = false
-      if (stopLossStr && parseFloat(stopLossStr)) {
-        stopLoss = parseFloat(stopLossStr)
-      } else if (trailingSellPct && trailingSellPct > 0) {
-        const trailingSellDate = symbolFields[symbol]?.['trailing_sell_date'] ?? null
-        let referencePrice: number | null = currentPrice
-        if (trailingSellDate && priceHistoryMap[symbol]) {
-          const closes = priceHistoryMap[symbol]
-            .filter((p) => p.date >= trailingSellDate && p.close !== null)
-            .map((p) => toDisplay(p.close) as number)
-          if (currentPrice !== null) closes.push(currentPrice)
-          referencePrice = closes.length > 0 ? Math.max(...closes) : currentPrice
-        }
-        if (referencePrice) {
-          stopLoss = referencePrice * (1 - trailingSellPct / 100)
-          isTrailingSell = true
-        }
-      }
-
-      const stopLossPct = purchasePrice && stopLoss ? ((stopLoss - purchasePrice) / purchasePrice) * 100 : null
-      const stopLossDollarNative = purchasePrice && stopLoss && totalShares > 0 ? (stopLoss - purchasePrice) * totalShares : null
-      const stopLossDollar = stopLossDollarNative !== null && isForeign && symbolFxRate ? stopLossDollarNative * symbolFxRate : stopLossDollarNative
-
-      return {
-        symbol,
-        currentPrice,
-        purchasePrice,
-        plPct,
-        stopLoss,
-        stopLossPct,
-        stopLossDollar,
-        totalInvested: purchasePrice && totalShares > 0 ? purchasePrice * totalShares : null,
-        isTrailingSell,
-        sma50: toDisplay(sma50Map[symbol] ?? null),
-        sma150: toDisplay(sma150Map[symbol] ?? null),
-        high30d,
-        currency: displayCurrency,
-      }
-    })
-  }, [transactions, prices, symbolFields, symbolInfo, sma50Map, sma150Map, high30dMap, priceHistoryMap, fxRates])
+  // Adapt server risk rows to the shape the JSX renders
+  const rows: AnalysisRow[] = useMemo(() => riskRows.map((r) => ({
+    symbol: r.symbol,
+    currentPrice: r.current_price,
+    purchasePrice: r.purchase_price,
+    plPct: r.pl_pct,
+    stopLoss: r.stop_loss,
+    stopLossPct: r.stop_loss_pct,
+    stopLossDollar: r.stop_loss_dollar,
+    totalInvested: r.total_invested,
+    isTrailingSell: r.is_trailing_sell,
+    sma50: r.sma50,
+    sma150: r.sma150,
+    high30d: r.high30d,
+    currency: r.currency,
+  })), [riskRows])
 
   const handleSort = (column: string) => {
     if (sortColumn === column) {
@@ -384,8 +282,8 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
                 ))}
               </tbody>
               {(() => {
-                const totalInvested = rows.reduce((s, r) => s + (r.totalInvested ?? 0), 0)
-                const totalSlDollar = rows.reduce((s, r) => s + (r.stopLossDollar ?? 0), 0)
+                const totalInvested = riskTotals?.total_invested ?? 0
+                const totalSlDollar = riskTotals?.total_sl_dollar ?? 0
                 const totalSlPct = totalInvested > 0 ? (totalSlDollar / totalInvested) * 100 : null
                 return (
                   <tfoot>
@@ -474,6 +372,11 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
                       [editingStopLossSymbol]: { ...prev[editingStopLossSymbol], ...fields },
                     }))
                     setEditingStopLossSymbol(null)
+                    // Recompute stop-loss/trailing rows server-side
+                    apiClient.getPortfolioRisk().then((d) => {
+                      setRiskRows(d.rows)
+                      setRiskTotals(d.totals)
+                    }).catch(() => {})
                   } catch {
                     // keep dialog open on error
                   }

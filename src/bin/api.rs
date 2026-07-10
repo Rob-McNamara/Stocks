@@ -5,6 +5,7 @@ use reqwest::Client;
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, path::PathBuf};
+use stocks::portfolio::{self, PortfolioTx, TxType};
 
 #[derive(Serialize)]
 struct EventLogEntry {
@@ -161,6 +162,100 @@ struct NewHoldingTransaction {
     original_price: Option<f64>,
     fx_rate: Option<f64>,
     custom_fields: Option<std::collections::HashMap<String, String>>,
+    /// Set true to record a sale of more shares than currently held
+    /// (the API responds 409 with a warning otherwise).
+    confirm: Option<bool>,
+}
+
+/// Shared pre-processing for holding create/update:
+/// - Server-side FX: a foreign-currency payload may send just `original_price`
+///   and `currency`; the AUD price and rate are resolved here so thin clients
+///   never do currency math.
+/// - Over-sell guard (create only, when `check_oversell`): selling more than
+///   held returns 409 unless `confirm: true` is supplied.
+async fn prepare_holding_payload(
+    db_path: &PathBuf,
+    symbol: &str,
+    payload: &mut NewHoldingTransaction,
+    check_oversell: bool,
+) -> Result<(), HttpResponse> {
+    let currency = payload.currency.clone().unwrap_or_else(|| "AUD".to_string());
+    if currency != "AUD" && payload.price.is_none() {
+        let Some(original_price) = payload.original_price else {
+            return Err(err_bad_request("original_price is required for foreign-currency transactions"));
+        };
+        let target_date = NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d")
+            .map_err(|_| err_bad_request("Invalid date format. Use YYYY-MM-DD."))?;
+        match fetch_fx_rate_on_date(&currency, target_date).await {
+            Ok((rate, _)) => {
+                payload.fx_rate = Some(rate);
+                payload.price = Some(original_price * rate);
+            }
+            Err(err) => {
+                let _ = insert_event_log(db_path, "error", "fx_fetch", "api", Some(symbol), &err);
+                return Err(err_unprocessable(format!(
+                    "No {}/AUD exchange rate available for {}: {}",
+                    currency, payload.date, err
+                )));
+            }
+        }
+    }
+
+    if check_oversell && payload.transaction_type == "sale" && payload.confirm != Some(true) {
+        let held: f64 = open_db(db_path)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(SUM(CASE WHEN transaction_type = 'purchase' THEN quantity ELSE -quantity END), 0)
+                     FROM holdings_transactions
+                     WHERE symbol = ?1 AND transaction_type IN ('purchase', 'sale')",
+                    params![symbol],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0.0);
+        if let Some(qty) = payload.quantity {
+            if qty > held + 1e-9 {
+                return Err(HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "code": "oversell_confirmation_required",
+                        "message": format!("Selling {} shares but only {:.2} held for {}. Re-submit with confirm=true to record anyway.", qty, held, symbol),
+                        "held": held,
+                    }
+                })));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Consistent v1 error envelope: every non-2xx response carries
+// {"error": {"code": "...", "message": "..."}} so all clients (web, iOS,
+// Android) parse failures the same way.
+// ---------------------------------------------------------------------------
+fn api_error(status: actix_web::http::StatusCode, code: &str, message: impl Into<String>) -> HttpResponse {
+    HttpResponse::build(status).json(serde_json::json!({
+        "error": { "code": code, "message": message.into() }
+    }))
+}
+
+fn err_internal(message: impl Into<String>) -> HttpResponse {
+    api_error(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+}
+
+fn err_bad_request(message: impl Into<String>) -> HttpResponse {
+    api_error(actix_web::http::StatusCode::BAD_REQUEST, "bad_request", message)
+}
+
+fn err_not_found(message: impl Into<String>) -> HttpResponse {
+    api_error(actix_web::http::StatusCode::NOT_FOUND, "not_found", message)
+}
+
+fn err_unprocessable(message: impl Into<String>) -> HttpResponse {
+    api_error(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, "unprocessable", message)
 }
 
 /// Open the SQLite database with WAL mode and a busy timeout so the API,
@@ -173,33 +268,37 @@ fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::E
     Ok(conn)
 }
 
+#[utoipa::path(get, path = "/api/v1/health", tag = "system", responses((status = 200, description = "Health")))]
 #[get("/api/health")]
 async fn health() -> impl Responder {
     HttpResponse::Ok().json(HealthResponse { status: "ok" })
 }
 
+#[utoipa::path(get, path = "/api/v1/watchlist", tag = "watchlist", responses((status = 200, description = "Get watchlist")))]
 #[get("/api/watchlist")]
 async fn get_watchlist(db_path: web::Data<PathBuf>, query: web::Query<WatchlistQuery>) -> impl Responder {
     match load_watchlist_symbols(&db_path, query.list.as_deref()) {
         Ok(symbols) => HttpResponse::Ok().json(symbols),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "watchlist_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/watchlist/lists", tag = "watchlist", responses((status = 200, description = "Get watchlist lists")))]
 #[get("/api/watchlist/lists")]
 async fn get_watchlist_lists(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_watchlist_lists(&db_path) {
         Ok(lists) => HttpResponse::Ok().json(lists),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "watchlist_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/watchlist", tag = "watchlist", responses((status = 200, description = "Add watchlist symbol")))]
 #[post("/api/watchlist")]
 async fn add_watchlist_symbol(
     db_path: web::Data<PathBuf>,
@@ -207,7 +306,7 @@ async fn add_watchlist_symbol(
 ) -> impl Responder {
     let symbol = payload.symbol.trim();
     if symbol.is_empty() {
-        return HttpResponse::BadRequest().body("Symbol is required");
+        return err_bad_request("Symbol is required");
     }
 
     let normalized = normalize_symbol(symbol);
@@ -241,11 +340,12 @@ async fn add_watchlist_symbol(
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "watchlist_add", "api", Some(&normalized), &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(put, path = "/api/v1/watchlist/{id}", tag = "watchlist", params(("id" = i64, Path, description = "id")), responses((status = 200, description = "Update watchlist symbol")))]
 #[put("/api/watchlist/{id}")]
 async fn update_watchlist_symbol(
     db_path: web::Data<PathBuf>,
@@ -258,11 +358,12 @@ async fn update_watchlist_symbol(
         Ok(row) => HttpResponse::Ok().json(row),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "watchlist_update", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(delete, path = "/api/v1/watchlist/{id}", tag = "watchlist", params(("id" = i64, Path, description = "id")), responses((status = 200, description = "Delete watchlist symbol")))]
 #[delete("/api/watchlist/{id}")]
 async fn delete_watchlist_symbol(
     db_path: web::Data<PathBuf>,
@@ -271,10 +372,10 @@ async fn delete_watchlist_symbol(
     let id = path.into_inner();
     match remove_watchlist_symbol(&db_path, id) {
         Ok(true) => HttpResponse::NoContent().finish(),
-        Ok(false) => HttpResponse::NotFound().body("Symbol not found"),
+        Ok(false) => err_not_found("Symbol not found"),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "watchlist_delete", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
@@ -285,6 +386,7 @@ struct RenameWatchlistList {
     new_name: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/watchlist/lists/rename", tag = "watchlist", responses((status = 200, description = "Rename watchlist list")))]
 #[put("/api/watchlist/lists/rename")]
 async fn rename_watchlist_list(
     db_path: web::Data<PathBuf>,
@@ -293,14 +395,14 @@ async fn rename_watchlist_list(
     let old_name = payload.old_name.trim();
     let new_name = payload.new_name.trim();
     if old_name.is_empty() || new_name.is_empty() {
-        return HttpResponse::BadRequest().body("Both old and new list names are required");
+        return err_bad_request("Both old and new list names are required");
     }
     if old_name == new_name {
         return HttpResponse::Ok().json("ok");
     }
     let mut conn = match open_db(db_path.as_ref()) {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     // Renaming onto an existing list merges the two: memberships that would
     // collide with UNIQUE(symbol, list_name) are dropped, the rest are moved.
@@ -323,14 +425,15 @@ async fn rename_watchlist_list(
             let _ = insert_event_log(&db_path, "info", "watchlist_list_rename", "api", None, &format!("Renamed list '{}' to '{}'", old_name, new_name));
             HttpResponse::Ok().json("ok")
         }
-        Ok(_) => HttpResponse::NotFound().body(format!("List '{}' not found", old_name)),
+        Ok(_) => err_not_found(format!("List '{}' not found", old_name)),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "watchlist_list_rename", "api", None, &format!("Failed to rename list: {}", err));
-            HttpResponse::InternalServerError().body(err.to_string())
+            err_internal(err.to_string())
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/config", tag = "config", responses((status = 200, description = "Get config")))]
 #[get("/api/config")]
 async fn get_config(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_config(&db_path) {
@@ -343,11 +446,12 @@ async fn get_config(db_path: web::Data<PathBuf>) -> impl Responder {
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "config_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(put, path = "/api/v1/config", tag = "config", responses((status = 200, description = "Update config")))]
 #[put("/api/config")]
 async fn update_config(
     db_path: web::Data<PathBuf>,
@@ -356,7 +460,7 @@ async fn update_config(
     let key = payload.key.trim();
     let value = payload.value.trim();
     if key.is_empty() {
-        return HttpResponse::BadRequest().body("Config key is required");
+        return err_bad_request("Config key is required");
     }
 
     match upsert_config(&db_path, key, value) {
@@ -366,18 +470,19 @@ async fn update_config(
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "config_update", "api", Some(key), &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/watchlist/prices", tag = "watchlist", responses((status = 200, description = "Get watchlist prices")))]
 #[get("/api/watchlist/prices")]
 async fn get_watchlist_prices(db_path: web::Data<PathBuf>, query: web::Query<WatchlistQuery>) -> impl Responder {
     match fetch_watchlist_current_prices(&db_path, query.list.as_deref()).await {
         Ok(prices) => HttpResponse::Ok().json(prices),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "price_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
@@ -387,6 +492,7 @@ struct CurrentPricesQuery {
     symbols: String,
 }
 
+#[utoipa::path(get, path = "/api/v1/watchlist/cached-prices", tag = "watchlist", responses((status = 200, description = "Get watchlist cached prices")))]
 #[get("/api/watchlist/cached-prices")]
 async fn get_watchlist_cached_prices(db_path: web::Data<PathBuf>, query: web::Query<WatchlistQuery>) -> impl Responder {
     let symbols_result = load_watchlist_symbols(&db_path, query.list.as_deref());
@@ -397,17 +503,18 @@ async fn get_watchlist_cached_prices(db_path: web::Data<PathBuf>, query: web::Qu
                 Ok(prices) => HttpResponse::Ok().json(prices),
                 Err(err) => {
                     let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
-                    HttpResponse::InternalServerError().body(err)
+                    err_internal(err)
                 }
             }
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/cached-prices", tag = "prices", responses((status = 200, description = "Get cached prices")))]
 #[get("/api/cached-prices")]
 async fn get_cached_prices(db_path: web::Data<PathBuf>, query: web::Query<CurrentPricesQuery>) -> impl Responder {
     let symbols: Vec<String> = query.symbols.split(',')
@@ -419,11 +526,12 @@ async fn get_cached_prices(db_path: web::Data<PathBuf>, query: web::Query<Curren
         Ok(prices) => HttpResponse::Ok().json(prices),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/current-prices", tag = "prices", responses((status = 200, description = "Get current prices")))]
 #[get("/api/current-prices")]
 async fn get_current_prices(
     db_path: web::Data<PathBuf>,
@@ -445,33 +553,35 @@ async fn get_current_prices(
         Ok(prices) => HttpResponse::Ok().json(prices),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "price_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/holdings", tag = "holdings", responses((status = 200, description = "Get holdings")))]
 #[get("/api/holdings")]
 async fn get_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
     match fetch_holdings(&db_path) {
         Ok(history) => HttpResponse::Ok().json(history),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holdings_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/symbol-info", tag = "meta", responses((status = 200, description = "Get symbol info")))]
 #[get("/api/symbol-info")]
 async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
     let conn = match open_db(db_path.as_ref()) {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     let mut stmt = match conn.prepare(
         "SELECT symbol, instrument_type, long_name, currency FROM symbol_info ORDER BY symbol",
     ) {
         Ok(s) => s,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     let rows = stmt.query_map([], |row| {
         Ok(serde_json::json!({
@@ -486,7 +596,7 @@ async fn get_symbol_info(db_path: web::Data<PathBuf>) -> impl Responder {
             let items: Vec<_> = mapped.filter_map(|r| r.ok()).collect();
             HttpResponse::Ok().json(items)
         }
-        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => err_internal(err.to_string()),
     }
 }
 
@@ -496,18 +606,11 @@ struct FxRateQuery {
     date: String,
 }
 
-#[get("/api/fx-rate")]
-async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web::Query<FxRateQuery>) -> impl Responder {
-    let currency = query.currency.trim().to_uppercase();
-    let pair = format!("{}AUD=X", currency);
-    let client = match Client::builder().user_agent("stocks-api/1.0").build() {
-        Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
-    };
-    let target_date = match NaiveDate::parse_from_str(&query.date, "%Y-%m-%d") {
-        Ok(d) => d,
-        Err(_) => return HttpResponse::BadRequest().body("Invalid date format, use YYYY-MM-DD"),
-    };
+/// Closest AUD rate on or before `target_date` for `currency` (e.g. "USD").
+/// Returns (rate, rate_date).
+async fn fetch_fx_rate_on_date(currency: &str, target_date: NaiveDate) -> Result<(f64, String), String> {
+    let pair = format!("{}AUD=X", currency.trim().to_uppercase());
+    let client = Client::builder().user_agent("stocks-api/1.0").build().map_err(|e| e.to_string())?;
     // Fetch a week around the target date to cover weekends/holidays
     let period1 = Utc.from_utc_datetime(&(target_date - chrono::Duration::days(7)).and_hms_opt(0, 0, 0).unwrap()).timestamp();
     let period2 = Utc.from_utc_datetime(&(target_date + chrono::Duration::days(2)).and_hms_opt(0, 0, 0).unwrap()).timestamp();
@@ -515,36 +618,31 @@ async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web::Query<FxR
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&period1={}&period2={}",
         pair, period1, period2
     );
-    let response = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(err) => {
-            let _ = insert_event_log(&db_path, "error", "fx_fetch", "api", None, &format!("FX fetch failed for {}: {}", pair, err));
-            return HttpResponse::InternalServerError().body(err.to_string());
-        }
-    };
-    let payload: YahooHistoryResponse = match response.json().await {
-        Ok(p) => p,
-        Err(err) => {
-            let _ = insert_event_log(&db_path, "error", "fx_fetch", "api", None, &format!("FX response parse failed for {}: {}", pair, err));
-            return HttpResponse::InternalServerError().body(err.to_string());
-        }
-    };
-    let result = match payload.chart.result.as_ref().and_then(|r| r.first()) {
-        Some(r) => r,
-        None => return HttpResponse::NotFound().body(format!("No FX data for {}", pair)),
-    };
-    let timestamps = match result.timestamp.as_ref() {
-        Some(t) => t,
-        None => return HttpResponse::NotFound().body("No timestamp data"),
-    };
-    let closes = match result.indicators.quote.first().and_then(|q| q.close.as_ref()) {
-        Some(c) => c,
-        None => return HttpResponse::NotFound().body("No close data"),
-    };
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("FX fetch failed for {}: {}", pair, err))?;
+    let payload: YahooHistoryResponse = response
+        .json()
+        .await
+        .map_err(|err| format!("FX response parse failed for {}: {}", pair, err))?;
+    let result = payload
+        .chart
+        .result
+        .as_ref()
+        .and_then(|r| r.first())
+        .ok_or_else(|| format!("No FX data for {}", pair))?;
+    let timestamps = result.timestamp.as_ref().ok_or_else(|| "No timestamp data".to_string())?;
+    let closes = result
+        .indicators
+        .quote
+        .first()
+        .and_then(|q| q.close.as_ref())
+        .ok_or_else(|| "No close data".to_string())?;
     // Find the entry closest to and on-or-before the target date
     let target_str = target_date.format("%Y-%m-%d").to_string();
-    let mut best_date = String::new();
-    let mut best_rate: Option<f64> = None;
+    let mut best: Option<(f64, String)> = None;
     for (i, ts) in timestamps.iter().enumerate() {
         let date_str = Utc.timestamp_opt(*ts, 0)
             .single()
@@ -552,14 +650,31 @@ async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web::Query<FxR
             .unwrap_or_default();
         if date_str <= target_str {
             if let Some(Some(rate)) = closes.get(i) {
-                best_date = date_str;
-                best_rate = Some(*rate);
+                best = Some((*rate, date_str));
             }
         }
     }
-    match best_rate {
-        Some(rate) => HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": best_date })),
-        None => HttpResponse::NotFound().body(format!("No FX rate found on or before {}", target_str)),
+    best.ok_or_else(|| format!("No FX rate found on or before {}", target_str))
+}
+
+#[utoipa::path(get, path = "/api/v1/fx-rate", tag = "fx", responses((status = 200, description = "Get fx rate for date")))]
+#[get("/api/fx-rate")]
+async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web::Query<FxRateQuery>) -> impl Responder {
+    let currency = query.currency.trim().to_uppercase();
+    let target_date = match NaiveDate::parse_from_str(&query.date, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return err_bad_request("Invalid date format, use YYYY-MM-DD"),
+    };
+    match fetch_fx_rate_on_date(&currency, target_date).await {
+        Ok((rate, date)) => HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": date })),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "fx_fetch", "api", None, &err);
+            if err.starts_with("No ") {
+                err_not_found(err)
+            } else {
+                err_internal(err)
+            }
+        }
     }
 }
 
@@ -568,11 +683,12 @@ struct FxRatesQuery {
     currencies: Option<String>,
 }
 
+#[utoipa::path(get, path = "/api/v1/fx-rates", tag = "fx", responses((status = 200, description = "Get fx rates")))]
 #[get("/api/fx-rates")]
 async fn get_fx_rates(db_path: web::Data<PathBuf>, query: web::Query<FxRatesQuery>) -> impl Responder {
     let client = match Client::builder().user_agent("stocks-api/1.0").build() {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     // Rates are AUD per 1 unit of each requested currency (e.g. USD → "USDAUD=X").
     let mut currencies: Vec<String> = query
@@ -601,17 +717,18 @@ async fn get_fx_rates(db_path: web::Data<PathBuf>, query: web::Query<FxRatesQuer
     HttpResponse::Ok().json(serde_json::Value::Object(rates))
 }
 
+#[utoipa::path(get, path = "/api/v1/dividends", tag = "dividends", responses((status = 200, description = "Get dividends")))]
 #[get("/api/dividends")]
 async fn get_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     let conn = match open_db(db_path.as_ref()) {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     let mut stmt = match conn.prepare(
         "SELECT symbol, ex_date, payment_date, amount FROM dividend_events ORDER BY ex_date DESC",
     ) {
         Ok(s) => s,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     let rows = stmt.query_map([], |row| {
         Ok(serde_json::json!({
@@ -626,25 +743,30 @@ async fn get_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
             let items: Vec<_> = mapped.filter_map(|r| r.ok()).collect();
             HttpResponse::Ok().json(items)
         }
-        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => err_internal(err.to_string()),
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/events", tag = "events", responses((status = 200, description = "Get events")))]
 #[get("/api/events")]
 async fn get_events(db_path: web::Data<PathBuf>, query: web::Query<EventQuery>) -> impl Responder {
     match fetch_event_log(&db_path, &query.into_inner()) {
         Ok((items, total)) => HttpResponse::Ok().json(serde_json::json!({"items": items, "total": total})),
-        Err(err) => HttpResponse::InternalServerError().body(err),
+        Err(err) => err_internal(err),
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/holdings", tag = "holdings", responses((status = 200, description = "Add holding transaction")))]
 #[post("/api/holdings")]
 async fn add_holding_transaction(
     db_path: web::Data<PathBuf>,
     payload: web::Json<NewHoldingTransaction>,
 ) -> impl Responder {
-    let payload = payload.into_inner();
+    let mut payload = payload.into_inner();
     let symbol = normalize_symbol(&payload.symbol);
+    if let Err(response) = prepare_holding_payload(&db_path, &symbol, &mut payload, true).await {
+        return response;
+    }
     match insert_holding_transaction(&db_path, &symbol, payload) {
         Ok(record) => {
             let _ = insert_event_log(&db_path, "info", "holding_create", "api", Some(&record.symbol), &format!("Created holding id {}", record.id));
@@ -652,11 +774,12 @@ async fn add_holding_transaction(
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holding_create", "api", Some(&symbol), &err);
-            HttpResponse::BadRequest().body(err)
+            err_bad_request(err)
         }
     }
 }
 
+#[utoipa::path(put, path = "/api/v1/holdings/{id}", tag = "holdings", params(("id" = i64, Path, description = "id")), responses((status = 200, description = "Update holding transaction")))]
 #[put("/api/holdings/{id}")]
 async fn update_holding_transaction(
     db_path: web::Data<PathBuf>,
@@ -664,8 +787,11 @@ async fn update_holding_transaction(
     payload: web::Json<NewHoldingTransaction>,
 ) -> impl Responder {
     let id = path.into_inner();
-    let payload = payload.into_inner();
+    let mut payload = payload.into_inner();
     let symbol = normalize_symbol(&payload.symbol);
+    if let Err(response) = prepare_holding_payload(&db_path, &symbol, &mut payload, false).await {
+        return response;
+    }
 
     match modify_holding_transaction(&db_path, id, &symbol, payload) {
         Ok(record) => {
@@ -674,11 +800,12 @@ async fn update_holding_transaction(
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holding_update", "api", Some(&symbol), &err);
-            HttpResponse::BadRequest().body(err)
+            err_bad_request(err)
         }
     }
 }
 
+#[utoipa::path(delete, path = "/api/v1/holdings/{id}", tag = "holdings", params(("id" = i64, Path, description = "id")), responses((status = 200, description = "Delete holding transaction")))]
 #[delete("/api/holdings/{id}")]
 async fn delete_holding_transaction(
     db_path: web::Data<PathBuf>,
@@ -692,11 +819,11 @@ async fn delete_holding_transaction(
         }
         Ok(false) => {
             let _ = insert_event_log(&db_path, "warn", "holding_delete", "api", None, &format!("Delete attempted for missing id {}", id));
-            HttpResponse::NotFound().body("Transaction not found")
+            err_not_found("Transaction not found")
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holding_delete", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
@@ -708,6 +835,7 @@ struct RenameHoldingSymbol {
 
 // Two-segment path so it can never collide with `PUT /api/holdings/{id}`
 // (which would otherwise try to parse "rename-symbol" as an i64).
+#[utoipa::path(put, path = "/api/v1/holdings/rename-symbol/{old_symbol}", tag = "holdings", params(("old_symbol" = String, Path, description = "old_symbol")), responses((status = 200, description = "Rename holding symbol")))]
 #[put("/api/holdings/rename-symbol/{old_symbol}")]
 async fn rename_holding_symbol(
     db_path: web::Data<PathBuf>,
@@ -717,7 +845,7 @@ async fn rename_holding_symbol(
     let old_symbol = normalize_symbol(&path.into_inner());
     let new_symbol = normalize_symbol(&payload.new_symbol);
     if new_symbol.is_empty() {
-        return HttpResponse::BadRequest().body("New symbol is required");
+        return err_bad_request("New symbol is required");
     }
     if old_symbol == new_symbol {
         return HttpResponse::Ok().json(serde_json::json!({ "renamed": 0 }));
@@ -727,10 +855,10 @@ async fn rename_holding_symbol(
             let _ = insert_event_log(&db_path, "info", "holding_rename", "api", Some(&new_symbol), &format!("Renamed holding symbol '{}' to '{}' across {} transaction(s)", old_symbol, new_symbol, affected));
             HttpResponse::Ok().json(serde_json::json!({ "renamed": affected }))
         }
-        Ok(_) => HttpResponse::NotFound().body(format!("No holdings found for '{}'", old_symbol)),
+        Ok(_) => err_not_found(format!("No holdings found for '{}'", old_symbol)),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holding_rename", "api", Some(&old_symbol), &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
@@ -777,6 +905,7 @@ struct HoldingsSymbolFieldsPayload {
     custom_fields: Option<std::collections::HashMap<String, String>>,
 }
 
+#[utoipa::path(put, path = "/api/v1/holdings/symbol-fields/{symbol}", tag = "holdings", params(("symbol" = String, Path, description = "symbol")), responses((status = 200, description = "Update holdings symbol fields")))]
 #[put("/api/holdings/symbol-fields/{symbol}")]
 async fn update_holdings_symbol_fields(
     db_path: web::Data<PathBuf>,
@@ -786,7 +915,7 @@ async fn update_holdings_symbol_fields(
     let symbol = normalize_symbol(&path.into_inner());
     let conn = match open_db(db_path.as_ref()) {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     // Save notes as a special field
     if let Some(ref notes) = payload.notes {
@@ -795,24 +924,25 @@ async fn update_holdings_symbol_fields(
             params![symbol, notes],
         ) {
             let _ = insert_event_log(&db_path, "error", "holdings_symbol_fields_update", "api", Some(&symbol), &format!("Failed to save notes: {}", err));
-            return HttpResponse::InternalServerError().body(err.to_string());
+            return err_internal(err.to_string());
         }
     }
     if let Some(ref fields) = payload.custom_fields {
         if let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
-            return HttpResponse::InternalServerError().body(err);
+            return err_internal(err);
         }
     }
     HttpResponse::Ok().json("ok")
 }
 
+#[utoipa::path(get, path = "/api/v1/holdings/symbol-fields", tag = "holdings", responses((status = 200, description = "Get holdings symbol fields")))]
 #[get("/api/holdings/symbol-fields")]
 async fn get_holdings_symbol_fields(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_holdings_symbol_fields(&db_path) {
         Ok(fields) => HttpResponse::Ok().json(fields),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "holdings_symbol_fields_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
@@ -821,6 +951,12 @@ async fn get_holdings_symbol_fields(db_path: web::Data<PathBuf>) -> impl Respond
 struct PriceHistoryQuery {
     symbol: String,
     days: Option<i64>,
+    /// Comma-separated SMA periods (e.g. "20,50,150"). When present the
+    /// response is `{ points, smas }` instead of a bare array.
+    smas: Option<String>,
+    /// Inject the cached live price as/over the latest point (server-side
+    /// equivalent of the chart's live-point injection).
+    include_live: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -830,6 +966,7 @@ struct PriceHistoryPoint {
     volume: Option<i64>,
 }
 
+#[utoipa::path(get, path = "/api/v1/price-history", tag = "prices", responses((status = 200, description = "Get price history")))]
 #[get("/api/price-history")]
 async fn get_price_history(
     db_path: web::Data<PathBuf>,
@@ -838,13 +975,56 @@ async fn get_price_history(
     let symbol = normalize_symbol(&query.symbol);
     // Clamp: a negative LIMIT in SQLite means "no limit"
     let days = query.days.unwrap_or(300).clamp(1, 2000);
-    match fetch_price_history(&db_path, &symbol, days).await {
-        Ok(history) => HttpResponse::Ok().json(history),
+    let mut history = match fetch_price_history(&db_path, &symbol, days).await {
+        Ok(history) => history,
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "price_history_fetch", "api", Some(&symbol), &err);
-            HttpResponse::InternalServerError().body(err)
+            return err_internal(err);
+        }
+    };
+
+    // Plain array response when no annotation was requested (back-compat)
+    let Some(smas_param) = query.smas.as_deref() else {
+        return HttpResponse::Ok().json(history);
+    };
+
+    if query.include_live == Some(true) {
+        // Replace or append the latest point with the cached live price so
+        // every client renders today's bar consistently.
+        let live: Option<(Option<f64>, Option<String>, Option<i64>)> = open_db(db_path.as_ref()).ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT price, price_date, volume FROM cached_current_prices WHERE symbol = ?1",
+                params![symbol],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+        if let Some((Some(price), price_date, volume)) = live {
+            let date = price_date.unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+            match history.last() {
+                None => history.push(PriceHistoryPoint { date, close: Some(price), volume }),
+                Some(last) if date == last.date => {
+                    let existing_volume = last.volume;
+                    let n = history.len();
+                    history[n - 1] = PriceHistoryPoint { date, close: Some(price), volume: volume.or(existing_volume) };
+                }
+                Some(last) if date > last.date.clone() => {
+                    history.push(PriceHistoryPoint { date, close: Some(price), volume });
+                }
+                _ => {}
+            }
         }
     }
+
+    let points = indicator_points(&history);
+    let mut smas = serde_json::Map::new();
+    for period in smas_param.split(',').filter_map(|s| s.trim().parse::<usize>().ok()).filter(|p| *p > 0 && *p <= 500) {
+        smas.insert(period.to_string(), serde_json::json!(stocks::indicators::calculate_sma(&points, period)));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "points": history, "smas": smas }))
 }
 
 #[derive(Serialize)]
@@ -1026,16 +1206,16 @@ fn load_sold_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
 }
 
 /// Fetch and store dividend events for the given symbols (in small concurrent
-/// batches) and report how many symbols were updated. Shared by the active and
-/// sold dividend refresh endpoints.
-async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) -> HttpResponse {
+/// batches) and report how many symbols were updated. Shared by the dividend
+/// refresh endpoints and /api/refresh.
+async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) -> DividendRefreshResult {
     if symbols.is_empty() {
-        return HttpResponse::Ok().json(DividendRefreshResult { updated: 0, errors: vec![] });
+        return DividendRefreshResult { updated: 0, errors: vec![] };
     }
 
     let client = match Client::builder().user_agent("stocks-api/1.0").build() {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return DividendRefreshResult { updated: 0, errors: vec![err.to_string()] },
     };
 
     let mut updated = 0;
@@ -1076,29 +1256,329 @@ async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) 
         }
     }
 
-    HttpResponse::Ok().json(DividendRefreshResult { updated, errors })
+    DividendRefreshResult { updated, errors }
 }
 
+#[utoipa::path(post, path = "/api/v1/dividends/refresh", tag = "dividends", responses((status = 200, description = "Refresh dividends")))]
 #[post("/api/dividends/refresh")]
 async fn refresh_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_holding_symbols(&db_path) {
-        Ok(symbols) => refresh_dividends_for_symbols(&db_path, symbols).await,
+        Ok(symbols) => HttpResponse::Ok().json(refresh_dividends_for_symbols(&db_path, symbols).await),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/dividends/refresh-sold", tag = "dividends", responses((status = 200, description = "Refresh sold dividends")))]
 #[post("/api/dividends/refresh-sold")]
 async fn refresh_sold_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_sold_symbols(&db_path) {
-        Ok(symbols) => refresh_dividends_for_symbols(&db_path, symbols).await,
+        Ok(symbols) => HttpResponse::Ok().json(refresh_dividends_for_symbols(&db_path, symbols).await),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", None, &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
+}
+
+/// Move a watchlist stock into holdings atomically: record the transaction,
+/// then remove every watchlist membership for the symbol. Replaces the
+/// multi-request handshake the browser used to orchestrate.
+#[utoipa::path(post, path = "/api/v1/holdings/from-watchlist", tag = "holdings", responses((status = 200, description = "Add holding from watchlist")))]
+#[post("/api/holdings/from-watchlist")]
+async fn add_holding_from_watchlist(
+    db_path: web::Data<PathBuf>,
+    payload: web::Json<NewHoldingTransaction>,
+) -> impl Responder {
+    let mut payload = payload.into_inner();
+    let symbol = normalize_symbol(&payload.symbol);
+    if let Err(response) = prepare_holding_payload(&db_path, &symbol, &mut payload, true).await {
+        return response;
+    }
+    let record = match insert_holding_transaction(&db_path, &symbol, payload) {
+        Ok(record) => record,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "holding_create", "api", Some(&symbol), &err);
+            return err_bad_request(err);
+        }
+    };
+
+    let removed = (|| -> Result<usize, String> {
+        let mut conn = open_db(db_path.as_ref()).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let n = tx
+            .execute("DELETE FROM watchlist_memberships WHERE symbol = ?1", params![symbol])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM watchlist_symbols WHERE symbol = ?1", params![symbol])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(n)
+    })();
+
+    match removed {
+        Ok(n) => {
+            let _ = insert_event_log(&db_path, "info", "holding_create", "api", Some(&record.symbol), &format!("Created holding id {} from watchlist ({} membership(s) removed)", record.id, n));
+            HttpResponse::Ok().json(serde_json::json!({ "transaction": record, "removed_memberships": n }))
+        }
+        Err(err) => {
+            // The holding exists — report the partial failure rather than lying
+            let _ = insert_event_log(&db_path, "error", "holding_create", "api", Some(&record.symbol), &format!("Holding id {} created but watchlist cleanup failed: {}", record.id, err));
+            HttpResponse::Ok().json(serde_json::json!({ "transaction": record, "removed_memberships": 0, "warning": format!("Holding recorded but watchlist cleanup failed: {}", err) }))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WatchlistSymbolUpdate {
+    lists: Vec<String>,
+    notes: Option<String>,
+    breakthrough_price: Option<f64>,
+    stop_loss_price: Option<f64>,
+    custom_fields: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Set a watchlist symbol's list memberships, notes and fields in one
+/// transactional call — replaces the parallel add/remove/update fan-out the
+/// browser used to perform.
+#[utoipa::path(put, path = "/api/v1/watchlist/symbol/{symbol}", tag = "watchlist", params(("symbol" = String, Path, description = "symbol")), responses((status = 200, description = "Update watchlist symbol lists")))]
+#[put("/api/watchlist/symbol/{symbol}")]
+async fn update_watchlist_symbol_lists(
+    db_path: web::Data<PathBuf>,
+    path: web::Path<String>,
+    payload: web::Json<WatchlistSymbolUpdate>,
+) -> impl Responder {
+    let symbol = normalize_symbol(&path.into_inner());
+    let payload = payload.into_inner();
+    let lists: Vec<String> = payload
+        .lists
+        .iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lists.is_empty() {
+        return err_bad_request("At least one list is required");
+    }
+
+    let result = (|| -> Result<(), String> {
+        let mut conn = open_db(db_path.as_ref()).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO watchlist_symbols (symbol, notes, breakthrough_price, stop_loss_price, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(symbol) DO UPDATE SET notes = excluded.notes, breakthrough_price = excluded.breakthrough_price, stop_loss_price = excluded.stop_loss_price, updated_at = excluded.updated_at",
+            params![symbol, payload.notes, payload.breakthrough_price, payload.stop_loss_price, now],
+        )
+        .map_err(|e| e.to_string())?;
+        // Remove memberships no longer wanted
+        let placeholders: Vec<String> = (0..lists.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "DELETE FROM watchlist_memberships WHERE symbol = ?1 AND list_name NOT IN ({})",
+            placeholders.join(",")
+        );
+        let mut delete_params: Vec<&dyn rusqlite::ToSql> = vec![&symbol];
+        for list in &lists {
+            delete_params.push(list);
+        }
+        tx.execute(&sql, rusqlite::params_from_iter(delete_params))
+            .map_err(|e| e.to_string())?;
+        // Add missing memberships
+        for list in &lists {
+            tx.execute(
+                "INSERT OR IGNORE INTO watchlist_memberships (symbol, list_name, added_at) VALUES (?1, ?2, ?3)",
+                params![symbol, list, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    })();
+    if let Err(err) = result {
+        let _ = insert_event_log(&db_path, "error", "watchlist_update", "api", Some(&symbol), &err);
+        return err_internal(err);
+    }
+
+    // Merge custom fields after the membership transaction (same semantics as
+    // the single-row update endpoint)
+    if let Some(fields) = payload.custom_fields.as_ref() {
+        if let Ok(conn) = open_db(db_path.as_ref()) {
+            if let Err(err) = save_custom_fields(&conn, &symbol, fields) {
+                let _ = insert_event_log(&db_path, "error", "watchlist_update", "api", Some(&symbol), &err);
+                return err_internal(err);
+            }
+        }
+    }
+
+    match load_watchlist_symbols(&db_path, None) {
+        Ok(rows) => {
+            let rows: Vec<WatchlistSymbol> = rows.into_iter().filter(|r| r.symbol == symbol).collect();
+            HttpResponse::Ok().json(rows)
+        }
+        Err(err) => err_internal(err),
+    }
+}
+
+/// Unified transaction ledger: manual transactions merged with fetched
+/// dividend events — deduped by (symbol, date), events filtered to on/after
+/// the symbol's first purchase, sorted newest-first. Replaces the merge the
+/// Transactions screen performed client-side.
+#[utoipa::path(get, path = "/api/v1/transactions/ledger", tag = "transactions", responses((status = 200, description = "Get transactions ledger")))]
+#[get("/api/transactions/ledger")]
+async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl Responder {
+    let txs = match fetch_holdings(&db_path) {
+        Ok(t) => t,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "ledger_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+
+    let mut first_purchase: HashMap<String, String> = HashMap::new();
+    let mut manual_dividend_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tx in &txs {
+        if tx.transaction_type == "purchase" {
+            match first_purchase.get(&tx.symbol) {
+                Some(existing) if *existing <= tx.date => {}
+                _ => {
+                    first_purchase.insert(tx.symbol.clone(), tx.date.clone());
+                }
+            }
+        }
+        if tx.transaction_type == "dividend" {
+            manual_dividend_keys.insert(format!("{}|{}", tx.symbol, tx.date));
+        }
+    }
+
+    let mut rows: Vec<serde_json::Value> = txs
+        .iter()
+        .map(|tx| serde_json::json!({
+            "key": format!("tx-{}", tx.id),
+            "id": tx.id,
+            "symbol": tx.symbol,
+            "transaction_type": tx.transaction_type,
+            "date": tx.date,
+            "quantity": tx.quantity,
+            "price": tx.price,
+            "currency": tx.currency,
+            "original_price": tx.original_price,
+            "fx_rate": tx.fx_rate,
+            "amount": tx.amount,
+            "brokerage": tx.brokerage,
+            "notes": tx.notes,
+            "per_share": false,
+            "payment_date": serde_json::Value::Null,
+            "custom_fields": tx.custom_fields,
+        }))
+        .collect();
+
+    if let Ok(conn) = open_db(db_path.as_ref()) {
+        if let Ok(mut stmt) = conn.prepare("SELECT symbol, ex_date, payment_date, amount FROM dividend_events ORDER BY ex_date DESC") {
+            if let Ok(event_rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, f64>(3)?))
+            }) {
+                for (symbol, ex_date, payment_date, amount) in event_rows.flatten() {
+                    let Some(first) = first_purchase.get(&symbol) else { continue };
+                    if ex_date < *first {
+                        continue;
+                    }
+                    if manual_dividend_keys.contains(&format!("{}|{}", symbol, ex_date)) {
+                        continue;
+                    }
+                    rows.push(serde_json::json!({
+                        "key": format!("div-{}-{}", symbol, ex_date),
+                        "id": serde_json::Value::Null,
+                        "symbol": symbol,
+                        "transaction_type": "dividend",
+                        "date": ex_date,
+                        "quantity": serde_json::Value::Null,
+                        "price": serde_json::Value::Null,
+                        "currency": "AUD",
+                        "original_price": serde_json::Value::Null,
+                        "fx_rate": serde_json::Value::Null,
+                        "amount": amount,
+                        "brokerage": serde_json::Value::Null,
+                        "notes": serde_json::Value::Null,
+                        "per_share": true,
+                        "payment_date": payment_date,
+                        "custom_fields": serde_json::json!({}),
+                    }));
+                }
+            }
+        }
+    }
+
+    rows.sort_by(|a, b| b["date"].as_str().unwrap_or("").cmp(a["date"].as_str().unwrap_or("")));
+    HttpResponse::Ok().json(serde_json::json!({ "rows": rows }))
+}
+
+#[derive(Deserialize)]
+struct RefreshQuery {
+    force: Option<bool>,
+}
+
+/// One-call startup refresh: watchlist prices, holdings prices and dividends,
+/// debounced server-side so a client opening repeatedly doesn't hammer Yahoo.
+#[utoipa::path(post, path = "/api/v1/refresh", tag = "system", responses((status = 200, description = "Refresh all")))]
+#[post("/api/refresh")]
+async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<RefreshQuery>) -> impl Responder {
+    const DEBOUNCE_SECS: i64 = 600;
+    if query.force != Some(true) {
+        let last = load_config(&db_path)
+            .ok()
+            .and_then(|c| c.into_iter().find(|i| i.key == "last_full_refresh_at").map(|i| i.value));
+        if let Some(last) = last {
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&last) {
+                if (Utc::now() - t.with_timezone(&Utc)).num_seconds() < DEBOUNCE_SECS {
+                    return HttpResponse::Ok().json(serde_json::json!({ "skipped": true, "last_refreshed_at": last }));
+                }
+            }
+        }
+    }
+    if let Err(err) = upsert_config(&db_path, "last_full_refresh_at", &Utc::now().to_rfc3339()) {
+        let _ = insert_event_log(&db_path, "error", "refresh_all", "api", None, &err);
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+
+    let watchlist_count = match fetch_watchlist_current_prices(&db_path, None).await {
+        Ok(prices) => {
+            errors.extend(prices.iter().filter_map(|p| p.error.clone()));
+            prices.len()
+        }
+        Err(err) => {
+            errors.push(err);
+            0
+        }
+    };
+
+    let holding_symbols = load_holding_symbols(&db_path).unwrap_or_default();
+    let holdings_count = if holding_symbols.is_empty() {
+        0
+    } else {
+        match fetch_and_cache_current_prices(&db_path, &holding_symbols, "holdings_prices_updated_at").await {
+            Ok(prices) => {
+                errors.extend(prices.iter().filter_map(|p| p.error.clone()));
+                prices.len()
+            }
+            Err(err) => {
+                errors.push(err);
+                0
+            }
+        }
+    };
+
+    let dividends = refresh_dividends_for_symbols(&db_path, holding_symbols).await;
+    errors.extend(dividends.errors.clone());
+
+    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, dividends for {} symbols ({} error(s))", watchlist_count, holdings_count, dividends.updated, errors.len()));
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "skipped": false,
+        "watchlist_prices": watchlist_count,
+        "holdings_prices": holdings_count,
+        "dividends_updated": dividends.updated,
+        "errors": errors,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1127,6 +1607,7 @@ struct AnalysisHistoryEntry {
     created_at: String,
 }
 
+#[utoipa::path(get, path = "/api/v1/stock-analysis/history", tag = "analysis", responses((status = 200, description = "Get analysis history")))]
 #[get("/api/stock-analysis/history")]
 async fn get_analysis_history(db_path: web::Data<PathBuf>, query: web::Query<AnalysisHistoryQuery>) -> impl Responder {
     // Messages are stored under the normalized symbol — query the same way.
@@ -1135,14 +1616,14 @@ async fn get_analysis_history(db_path: web::Data<PathBuf>, query: web::Query<Ana
         Ok(c) => c,
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "analysis_history_fetch", "api", Some(&symbol), &err.to_string());
-            return HttpResponse::InternalServerError().body(err.to_string());
+            return err_internal(err.to_string());
         }
     };
     let mut stmt = match conn.prepare(
         "SELECT id, role, content, model_used, created_at FROM stock_analysis_messages WHERE symbol = ?1 ORDER BY created_at ASC, id ASC"
     ) {
         Ok(s) => s,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     let rows = stmt.query_map(params![symbol], |row| {
         Ok(AnalysisHistoryEntry {
@@ -1158,26 +1639,28 @@ async fn get_analysis_history(db_path: web::Data<PathBuf>, query: web::Query<Ana
             let entries: Vec<AnalysisHistoryEntry> = mapped.filter_map(|r| r.ok()).collect();
             HttpResponse::Ok().json(entries)
         }
-        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => err_internal(err.to_string()),
     }
 }
 
+#[utoipa::path(delete, path = "/api/v1/stock-analysis/history", tag = "analysis", responses((status = 200, description = "Delete analysis history")))]
 #[delete("/api/stock-analysis/history")]
 async fn delete_analysis_history(db_path: web::Data<PathBuf>, query: web::Query<AnalysisHistoryQuery>) -> impl Responder {
     let symbol = normalize_symbol(&query.symbol);
     let conn = match open_db(db_path.as_ref()) {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
     match conn.execute("DELETE FROM stock_analysis_messages WHERE symbol = ?1", params![symbol]) {
         Ok(_) => HttpResponse::NoContent().finish(),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "analysis_history_delete", "api", Some(&symbol), &err.to_string());
-            HttpResponse::InternalServerError().body(err.to_string())
+            err_internal(err.to_string())
         }
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/stock-analysis", tag = "analysis", responses((status = 200, description = "Post stock analysis")))]
 #[post("/api/stock-analysis")]
 async fn post_stock_analysis(
     db_path: web::Data<PathBuf>,
@@ -1188,12 +1671,12 @@ async fn post_stock_analysis(
     // Load AI config
     let config = match load_config(&db_path) {
         Ok(items) => items.into_iter().map(|c| (c.key, c.value)).collect::<HashMap<String, String>>(),
-        Err(err) => return HttpResponse::InternalServerError().body(format!("Failed to load config: {}", err)),
+        Err(err) => return err_internal(format!("Failed to load config: {}", err)),
     };
     let provider = config.get("ai_provider").map(|s| s.as_str()).unwrap_or("anthropic");
     let api_key = match config.get("ai_api_key") {
         Some(k) if !k.is_empty() => k.clone(),
-        _ => return HttpResponse::BadRequest().body("AI API key not configured. Set it in Configuration."),
+        _ => return err_bad_request("AI API key not configured. Set it in Configuration."),
     };
     let model = config.get("ai_model").map(|s| s.as_str()).unwrap_or("claude-sonnet-4-20250514").to_string();
 
@@ -1275,7 +1758,7 @@ async fn post_stock_analysis(
 
     let client = match Client::builder().user_agent("stocks-api/1.0").build() {
         Ok(c) => c,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+        Err(err) => return err_internal(err.to_string()),
     };
 
     // Save user message to history
@@ -1309,7 +1792,7 @@ async fn post_stock_analysis(
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "stock_analysis", "api", Some(&symbol), &err);
-            HttpResponse::InternalServerError().body(err)
+            err_internal(err)
         }
     }
 }
@@ -1415,6 +1898,72 @@ async fn call_openai_api(
         .ok_or_else(|| format!("No content in OpenAI response: {}", response_text))
 }
 
+// ---------------------------------------------------------------------------
+// OpenAPI document — generated from the #[utoipa::path] annotations on every
+// handler. Native clients (Swift/Kotlin) can be generated from this spec
+// instead of hand-writing API layers.
+// ---------------------------------------------------------------------------
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearer_token",
+            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
+        );
+        openapi.security = Some(vec![utoipa::openapi::security::SecurityRequirement::new(
+            "bearer_token",
+            Vec::<String>::new(),
+        )]);
+    }
+}
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Stocks API",
+        version = "1.0.0",
+        description = "Portfolio, watchlist and market-data API for the Stocks app. \
+            All endpoints are served under /api/v1 (an alias of /api). \
+            Every derived number — FIFO P/L, dividends attribution, FX conversion, \
+            technical indicators — is computed server-side so all clients render \
+            identical values. Errors use a consistent envelope: \
+            {\"error\": {\"code\", \"message\"}}. Authentication is an optional \
+            Bearer token (enabled when the server sets API_TOKEN); /api/v1/health \
+            and /api/v1/openapi.json are exempt. Amounts are numeric (AUD unless \
+            stated otherwise) and dates are ISO 8601 — formatting is left to clients."
+    ),
+    paths(
+        health, get_meta, get_sync_state, openapi_spec,
+        get_portfolio_holdings, get_portfolio_overview, get_portfolio_lots,
+        get_portfolio_sold, get_portfolio_risk,
+        get_watchlist, get_watchlist_lists, get_watchlist_enriched,
+        add_watchlist_symbol, update_watchlist_symbol, delete_watchlist_symbol,
+        rename_watchlist_list, update_watchlist_symbol_lists,
+        get_watchlist_prices, get_watchlist_cached_prices,
+        get_holdings, add_holding_transaction, update_holding_transaction,
+        delete_holding_transaction, rename_holding_symbol,
+        add_holding_from_watchlist, update_holdings_symbol_fields,
+        get_holdings_symbol_fields, get_transactions_ledger,
+        get_cached_prices, get_current_prices, get_price_history,
+        get_symbol_info, get_fx_rate_for_date, get_fx_rates,
+        get_dividends, refresh_dividends, refresh_sold_dividends, refresh_all,
+        get_analysis_history, post_stock_analysis, delete_analysis_history,
+        get_config, update_config, get_events,
+    ),
+    modifiers(&SecurityAddon)
+)]
+struct ApiDoc;
+
+#[utoipa::path(get, path = "/api/v1/openapi.json", tag = "system", responses((status = 200, description = "This OpenAPI document")))]
+#[get("/api/openapi.json")]
+async fn openapi_spec() -> impl Responder {
+    use utoipa::OpenApi as _;
+    HttpResponse::Ok().json(ApiDoc::openapi())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let database_path = env::var("DATABASE_PATH").unwrap_or_else(|_| "stocks.db".to_string());
@@ -1430,10 +1979,20 @@ async fn main() -> std::io::Result<()> {
     // Comma-separated list of origins allowed to call the API from a browser.
     let cors_origins = env::var("CORS_ALLOWED_ORIGINS")
         .unwrap_or_else(|_| "http://localhost:5173,http://127.0.0.1:5173".to_string());
+    // Optional bearer-token authentication. CORS only protects browsers; any
+    // native client (or curl) on the network can reach the API, so set
+    // API_TOKEN before exposing the server beyond localhost.
+    let api_token = env::var("API_TOKEN").ok().filter(|t| !t.is_empty());
+    if api_token.is_some() {
+        println!("API token authentication enabled");
+    } else {
+        println!("API token authentication disabled (set API_TOKEN to enable)");
+    }
 
     println!("Starting stock API server at http://{bind}");
 
     HttpServer::new(move || {
+        use actix_web::dev::Service as _;
         let mut cors = Cors::default()
             .allow_any_method()
             .allow_any_header()
@@ -1441,7 +2000,56 @@ async fn main() -> std::io::Result<()> {
         for origin in cors_origins.split(',').map(str::trim).filter(|o| !o.is_empty()) {
             cors = cors.allowed_origin(origin);
         }
+        let token = api_token.clone();
         App::new()
+            // Auth runs inside CORS so 401 responses still carry CORS headers.
+            .wrap_fn(move |req, srv| {
+                let authorized = match token.as_deref() {
+                    None => true,
+                    Some(expected) => {
+                        req.method() == actix_web::http::Method::OPTIONS
+                            || req.path() == "/api/health"
+                            || req.path() == "/api/openapi.json"
+                            || req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|h| h.to_str().ok())
+                                .and_then(|h| h.strip_prefix("Bearer "))
+                                .map(|t| t == expected)
+                                .unwrap_or(false)
+                    }
+                };
+                let fut = if authorized { Some(srv.call(req)) } else { None };
+                async move {
+                    match fut {
+                        Some(f) => f.await,
+                        None => Err(actix_web::error::InternalError::from_response(
+                            "unauthorized",
+                            api_error(actix_web::http::StatusCode::UNAUTHORIZED, "unauthorized", "Missing or invalid API token"),
+                        )
+                        .into()),
+                    }
+                }
+            })
+            // Versioned surface: /api/v1/* is an alias of /api/*. Native
+            // clients pin the stable v1 prefix; breaking changes get a new
+            // version. Runs before auth so exemptions see normalized paths.
+            .wrap_fn(|mut req, srv| {
+                if let Some(rest) = req.path().strip_prefix("/api/v1/").map(str::to_owned) {
+                    let path_and_query = if req.query_string().is_empty() {
+                        format!("/api/{}", rest)
+                    } else {
+                        format!("/api/{}?{}", rest, req.query_string())
+                    };
+                    if let Ok(uri) = path_and_query.parse::<actix_web::http::Uri>() {
+                        req.head_mut().uri = uri.clone();
+                        // The router matches against the cached path object,
+                        // not head.uri — update both (as NormalizePath does).
+                        req.match_info_mut().get_mut().update(&uri);
+                    }
+                }
+                srv.call(req)
+            })
             .wrap(cors)
             .app_data(web::Data::new(db_path.clone()))
             .service(health)
@@ -1458,6 +2066,11 @@ async fn main() -> std::io::Result<()> {
             .service(get_cached_prices)
             .service(get_current_prices)
             .service(rename_holding_symbol)
+            .service(add_holding_from_watchlist)
+            .service(update_watchlist_symbol_lists)
+            .service(get_watchlist_enriched)
+            .service(get_transactions_ledger)
+            .service(refresh_all)
             .service(update_holdings_symbol_fields)
             .service(get_holdings_symbol_fields)
             .service(get_holdings)
@@ -1475,6 +2088,14 @@ async fn main() -> std::io::Result<()> {
             .service(get_analysis_history)
             .service(post_stock_analysis)
             .service(delete_analysis_history)
+            .service(get_portfolio_holdings)
+            .service(get_portfolio_overview)
+            .service(get_portfolio_lots)
+            .service(get_portfolio_sold)
+            .service(get_portfolio_risk)
+            .service(get_meta)
+            .service(get_sync_state)
+            .service(openapi_spec)
     })
     .bind(bind)?
     .run()
@@ -1610,6 +2231,13 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
          ON p.symbol = latest.symbol AND p.date = latest.max_date
          WHERE p.symbol NOT IN (SELECT symbol FROM cached_current_prices);"
     ).map_err(|err| err.to_string())?;
+
+    // Seed the sector list used by /api/meta and the sector dropdowns
+    conn.execute(
+        "INSERT OR IGNORE INTO app_config (key, value) VALUES ('sectors', ?1)",
+        params![DEFAULT_SECTORS_JSON],
+    )
+    .map_err(|err| err.to_string())?;
 
     // holdings_custom_fields: per-transaction values for user-defined custom fields
     conn.execute_batch(
@@ -2869,27 +3497,31 @@ async fn fetch_and_cache_current_prices(
 }
 
 async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Result<Vec<PriceHistoryPoint>, String> {
-    let conn = open_db(db_path).map_err(|err| err.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT date, close, volume FROM prices
-             WHERE symbol = ?1 AND close IS NOT NULL
-             ORDER BY date DESC
-             LIMIT ?2",
-        )
-        .map_err(|err| err.to_string())?;
+    // Scope the connection so this future stays Send — it can then be run
+    // concurrently for many symbols via JoinSet.
+    let mut history = {
+        let conn = open_db(db_path).map_err(|err| err.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT date, close, volume FROM prices
+                 WHERE symbol = ?1 AND close IS NOT NULL
+                 ORDER BY date DESC
+                 LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
 
-    let rows = stmt
-        .query_map(params![symbol, days], |row| {
-            Ok(PriceHistoryPoint {
-                date: row.get(0)?,
-                close: row.get(1)?,
-                volume: row.get(2)?,
+        let rows = stmt
+            .query_map(params![symbol, days], |row| {
+                Ok(PriceHistoryPoint {
+                    date: row.get(0)?,
+                    close: row.get(1)?,
+                    volume: row.get(2)?,
+                })
             })
-        })
-        .map_err(|err| err.to_string())?;
+            .map_err(|err| err.to_string())?;
 
-    let mut history = rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|err| err.to_string())?
+    };
     history.reverse();
 
     // Determine the last weekday (most recent expected trading day) in UTC
@@ -2918,7 +3550,9 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
         match fetch_price_history_from_yahoo(&client, symbol, days).await {
             Ok(records) => {
                 if records.len() > history.len() {
-                    persist_price_history(&conn, symbol, &records);
+                    if let Ok(conn) = open_db(db_path) {
+                        persist_price_history(&conn, symbol, &records);
+                    }
                     return Ok(records);
                 }
             }
@@ -2931,7 +3565,9 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
         match fetch_price_history_from_yahoo(&client, symbol, days).await {
             Ok(yahoo) => {
                 let new_records: Vec<_> = yahoo.into_iter().filter(|r| r.date > last_stored).collect();
-                persist_price_history(&conn, symbol, &new_records);
+                if let Ok(conn) = open_db(db_path) {
+                    persist_price_history(&conn, symbol, &new_records);
+                }
                 history.extend(new_records);
             }
             Err(err) => {
@@ -2941,6 +3577,171 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
     }
 
     Ok(history)
+}
+
+/// Fetch daily history for many symbols with bounded concurrency.
+async fn fetch_histories(db_path: &PathBuf, symbols: &[String], days: i64) -> HashMap<String, Vec<PriceHistoryPoint>> {
+    let mut out = HashMap::new();
+    for chunk in symbols.chunks(5) {
+        let mut set = tokio::task::JoinSet::new();
+        for sym in chunk {
+            let db = db_path.clone();
+            let sym = sym.clone();
+            set.spawn(async move {
+                let result = fetch_price_history(&db, &sym, days).await;
+                (sym, result)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((sym, result)) = joined {
+                match result {
+                    Ok(history) => {
+                        out.insert(sym, history);
+                    }
+                    Err(err) => {
+                        let _ = insert_event_log(db_path, "warn", "price_history_fetch", "api", Some(&sym), &err);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn indicator_points(history: &[PriceHistoryPoint]) -> Vec<stocks::indicators::PricePoint> {
+    history
+        .iter()
+        .map(|p| stocks::indicators::PricePoint { close: p.close, volume: p.volume })
+        .collect()
+}
+
+/// Full indicator block for one symbol — the server-side equivalent of the
+/// watchlist enrichment previously computed in the browser.
+fn compute_symbol_indicators(history: &[PriceHistoryPoint], price: Option<f64>, volume: Option<i64>) -> serde_json::Value {
+    use stocks::indicators as ind;
+    let points = indicator_points(history);
+    let sma50_arr = ind::calculate_sma(&points, 50);
+    let sma150_arr = ind::calculate_sma(&points, 150);
+    let sma50 = ind::latest_sma(&sma50_arr);
+    let sma150 = ind::latest_sma(&sma150_arr);
+
+    let mut days_50 = None;
+    let mut vol_50 = None;
+    if let (Some(p), Some(s)) = (price, sma50) {
+        if p > s {
+            let stats = ind::crossover_stats(&points, &sma50_arr, volume);
+            days_50 = Some(stats.days);
+            vol_50 = stats.volume_pct;
+        }
+    }
+    let mut days_150 = None;
+    let mut vol_150 = None;
+    if let (Some(p), Some(s)) = (price, sma150) {
+        if p > s {
+            let stats = ind::crossover_stats(&points, &sma150_arr, volume);
+            days_150 = Some(stats.days);
+            vol_150 = stats.volume_pct;
+        }
+    }
+
+    serde_json::json!({
+        "sma50": sma50,
+        "sma150": sma150,
+        "sma50_trend": ind::sma_trend(&sma50_arr, 5),
+        "sma150_trend": ind::sma_trend(&sma150_arr, 5),
+        "days_since_50sma": days_50,
+        "volume_pct_50sma": vol_50,
+        "days_since_150sma": days_150,
+        "volume_pct_150sma": vol_150,
+        "volume_change_pct": ind::volume_change_pct(&points),
+    })
+}
+
+/// Watchlist rows with prices and server-computed indicators — one call
+/// replaces the N price-history requests the browser used to make.
+#[utoipa::path(get, path = "/api/v1/watchlist/enriched", tag = "watchlist", responses((status = 200, description = "Get watchlist enriched")))]
+#[get("/api/watchlist/enriched")]
+async fn get_watchlist_enriched(db_path: web::Data<PathBuf>, query: web::Query<WatchlistQuery>) -> impl Responder {
+    let rows = match load_watchlist_symbols(&db_path, query.list.as_deref()) {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "watchlist_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let mut unique: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in &rows {
+        if seen.insert(r.symbol.clone()) {
+            unique.push(r.symbol.clone());
+        }
+    }
+    let prices = match load_cached_prices_with_fallback(&db_path, &unique) {
+        Ok(p) => p,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "cached_prices_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let price_map: HashMap<String, CurrentPrice> = prices.into_iter().map(|p| (p.symbol.clone(), p)).collect();
+
+    let mut info: HashMap<String, (Option<String>, Option<String>, Option<String>)> = HashMap::new();
+    if let Ok(conn) = open_db(db_path.as_ref()) {
+        if let Ok(mut stmt) = conn.prepare("SELECT symbol, instrument_type, long_name, currency FROM symbol_info") {
+            if let Ok(info_rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))
+            }) {
+                for r in info_rows.flatten() {
+                    info.insert(r.0, (r.1, r.2, r.3));
+                }
+            }
+        }
+    }
+
+    let histories = fetch_histories(&db_path, &unique, 300).await;
+    let empty: Vec<PriceHistoryPoint> = Vec::new();
+    let indicator_map: HashMap<&String, serde_json::Value> = unique
+        .iter()
+        .map(|sym| {
+            let p = price_map.get(sym);
+            let hist = histories.get(sym).unwrap_or(&empty);
+            (sym, compute_symbol_indicators(hist, p.and_then(|x| x.price), p.and_then(|x| x.volume)))
+        })
+        .collect();
+
+    let prices_updated_at = load_config(&db_path)
+        .ok()
+        .and_then(|c| c.into_iter().find(|i| i.key == "watchlist_prices_updated_at").map(|i| i.value));
+
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let p = price_map.get(&r.symbol);
+            let i = info.get(&r.symbol);
+            serde_json::json!({
+                "id": r.id,
+                "symbol": r.symbol,
+                "list_name": r.list_name,
+                "added_at": r.added_at,
+                "notes": r.notes,
+                "breakthrough_price": r.breakthrough_price,
+                "stop_loss_price": r.stop_loss_price,
+                "custom_fields": r.custom_fields,
+                "instrument_type": i.and_then(|x| x.0.clone()),
+                "long_name": i.and_then(|x| x.1.clone()),
+                "currency": i.and_then(|x| x.2.clone()),
+                "price": p.and_then(|x| x.price),
+                "change": p.and_then(|x| x.change),
+                "change_percent": p.and_then(|x| x.change_percent),
+                "volume": p.and_then(|x| x.volume),
+                "price_date": p.and_then(|x| x.price_date.clone()),
+                "last_updated": p.map(|x| x.last_updated.clone()),
+                "indicators": indicator_map.get(&r.symbol).cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({ "items": items, "prices_updated_at": prices_updated_at }))
 }
 
 fn fetch_latest_close_price(db_path: &PathBuf, symbol: &str) -> Result<Option<f64>, String> {
@@ -3235,6 +4036,960 @@ fn fetch_event_log(db_path: &PathBuf, q: &EventQuery) -> Result<(Vec<EventLogEnt
     Ok((items, total))
 }
 
+// ---------------------------------------------------------------------------
+// Thin-client portfolio endpoints — expose the shared portfolio engine
+// (stocks::portfolio) with server-side FX conversion, manual-price and
+// instrument-type overrides so every client renders the same numbers.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SECTORS_JSON: &str = r#"["Energy","Materials","Industrials","Consumer Discretionary","Consumer Staples","Health Care","Financials","Information Technology","Communication Services","Utilities","Real Estate","Others"]"#;
+const SUPPORTED_CURRENCIES: [&str; 9] = ["AUD", "USD", "GBP", "EUR", "JPY", "CAD", "HKD", "SGD", "NZD"];
+
+fn to_portfolio_txs(rows: &[HoldingTransaction]) -> Vec<PortfolioTx> {
+    rows.iter()
+        .map(|t| PortfolioTx {
+            id: t.id,
+            symbol: t.symbol.clone(),
+            tx_type: TxType::parse(&t.transaction_type),
+            date: t.date.clone(),
+            quantity: t.quantity,
+            price: t.price,
+            native_price: t.original_price,
+            amount: t.amount,
+            brokerage: t.brokerage,
+            dividends_total: t.dividends_total,
+        })
+        .collect()
+}
+
+/// AUD rate per currency, served from the price cache when fresh (<1h),
+/// refreshed from Yahoo and re-cached otherwise, falling back to a stale
+/// cached value when Yahoo is unreachable.
+async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -> HashMap<String, Option<f64>> {
+    let mut rates = HashMap::new();
+    if currencies.is_empty() {
+        return rates;
+    }
+    let client = Client::builder().user_agent("stocks-api/1.0").build().ok();
+    for currency in currencies {
+        let pair = format!("{}AUD=X", currency);
+        let cached: Option<(Option<f64>, String)> = open_db(db_path).ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT price, last_updated FROM cached_current_prices WHERE symbol = ?1",
+                params![pair],
+                |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+        let fresh = cached
+            .as_ref()
+            .map(|(price, updated)| {
+                price.is_some()
+                    && chrono::DateTime::parse_from_rfc3339(updated)
+                        .map(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds() < 3600)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if fresh {
+            rates.insert(currency.clone(), cached.and_then(|c| c.0));
+            continue;
+        }
+        let mut live: Option<f64> = None;
+        if let Some(client) = &client {
+            match fetch_current_price(client, &pair).await {
+                Ok(meta) => {
+                    live = meta.regular_market_price;
+                    if live.is_some() {
+                        if let Ok(conn) = open_db(db_path) {
+                            let _ = cache_current_price(&conn, &CurrentPrice {
+                                symbol: pair.clone(),
+                                price: live,
+                                change: None,
+                                change_percent: None,
+                                volume: None,
+                                last_updated: Utc::now().to_rfc3339(),
+                                price_date: None,
+                                error: None,
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = insert_event_log(db_path, "warn", "fx_fetch", "api", None, &format!("FX rate fetch failed for {}, using cached value if available: {}", currency, err));
+                }
+            }
+        }
+        rates.insert(currency.clone(), live.or(cached.and_then(|c| c.0)));
+    }
+    rates
+}
+
+/// Latest N-day simple moving average from stored daily closes (no network).
+fn stored_sma(conn: &Connection, symbol: &str, period: usize) -> Option<f64> {
+    let mut stmt = conn
+        .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL ORDER BY date DESC LIMIT ?2")
+        .ok()?;
+    let closes: Vec<f64> = stmt
+        .query_map(params![symbol, period as i64], |row| row.get::<_, f64>(0))
+        .ok()?
+        .flatten()
+        .collect();
+    if closes.len() < period {
+        return None;
+    }
+    Some(closes.iter().sum::<f64>() / period as f64)
+}
+
+struct EffectivePrice {
+    native: Option<f64>,
+    aud: Option<f64>,
+    source: &'static str, // "cache" | "manual" | "none"
+    price_date: Option<String>,
+    change: Option<f64>,
+    change_percent: Option<f64>,
+    volume: Option<i64>,
+}
+
+struct PortfolioContext {
+    groups: Vec<(String, Vec<PortfolioTx>)>,
+    prices: HashMap<String, EffectivePrice>,
+    /// symbol -> (instrument_type, long_name, currency)
+    info: HashMap<String, (Option<String>, Option<String>, Option<String>)>,
+    fields: HashMap<String, HashMap<String, String>>,
+    intl: HashMap<String, bool>,
+    etf: HashMap<String, bool>,
+    /// true when every purchase for the symbol was recorded in AUD — such
+    /// stocks are displayed in AUD even if they trade in a foreign currency
+    all_aud: HashMap<String, bool>,
+    fx_rates: HashMap<String, Option<f64>>,
+}
+
+impl PortfolioContext {
+    fn currency_of(&self, symbol: &str) -> String {
+        self.info
+            .get(symbol)
+            .and_then(|i| i.2.clone())
+            .map(|c| c.to_uppercase())
+            .unwrap_or_else(|| "AUD".to_string())
+    }
+
+    fn to_aud(&self, symbol: &str, value: f64) -> f64 {
+        let currency = self.currency_of(symbol);
+        if currency == "AUD" {
+            return value;
+        }
+        match self.fx_rates.get(&currency).copied().flatten() {
+            Some(rate) if rate != 0.0 => value * rate,
+            _ => value,
+        }
+    }
+
+    fn sector_of(&self, symbol: &str) -> Option<String> {
+        self.fields
+            .get(symbol)
+            .and_then(|f| f.get("sector").cloned())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+async fn build_portfolio_context(db_path: &PathBuf) -> Result<PortfolioContext, String> {
+    let rows = fetch_holdings(db_path)?;
+    let txs = to_portfolio_txs(&rows);
+    let groups = portfolio::group_by_symbol(&txs);
+    let symbols: Vec<String> = groups.iter().map(|(s, _)| s.clone()).collect();
+
+    let config: HashMap<String, String> = load_config(db_path)?.into_iter().map(|c| (c.key, c.value)).collect();
+    let fields = load_holdings_symbol_fields(db_path)?;
+
+    let conn = open_db(db_path).map_err(|e| e.to_string())?;
+    let mut info: HashMap<String, (Option<String>, Option<String>, Option<String>)> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT symbol, instrument_type, long_name, currency FROM symbol_info")
+            .map_err(|e| e.to_string())?;
+        let info_rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for r in info_rows.flatten() {
+            info.insert(r.0, (r.1, r.2, r.3));
+        }
+    }
+
+    // Effective classification per symbol: instrument_type_* config override,
+    // and the "purchased entirely in AUD ⇒ domestic" rule from the UI.
+    let mut intl = HashMap::new();
+    let mut etf = HashMap::new();
+    let mut all_aud_map = HashMap::new();
+    for symbol in &symbols {
+        let purchases: Vec<&HoldingTransaction> = rows
+            .iter()
+            .filter(|t| &t.symbol == symbol && t.transaction_type == "purchase")
+            .collect();
+        let all_aud = !purchases.is_empty() && purchases.iter().all(|t| t.currency == "AUD");
+        all_aud_map.insert(symbol.clone(), all_aud);
+        let yahoo_currency = info.get(symbol).and_then(|i| i.2.clone()).map(|c| c.to_uppercase());
+        let is_intl = if all_aud { false } else { matches!(&yahoo_currency, Some(c) if c != "AUD") };
+        intl.insert(symbol.clone(), is_intl);
+        let itype = config
+            .get(&format!("instrument_type_{}", symbol))
+            .cloned()
+            .filter(|v| !v.is_empty())
+            .or_else(|| info.get(symbol).and_then(|i| i.0.clone()))
+            .unwrap_or_default();
+        etf.insert(symbol.clone(), itype == "ETF" || itype == "MUTUALFUND");
+    }
+
+    let currencies: Vec<String> = symbols
+        .iter()
+        .filter_map(|s| info.get(s).and_then(|i| i.2.clone()))
+        .map(|c| c.to_uppercase())
+        .filter(|c| c != "AUD")
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let fx_rates = resolve_fx_rates(db_path, &currencies).await;
+
+    let cached = load_cached_prices(db_path, &symbols)?;
+    let cached_map: HashMap<String, CurrentPrice> = cached.into_iter().map(|p| (p.symbol.clone(), p)).collect();
+    let mut prices: HashMap<String, EffectivePrice> = HashMap::new();
+    for symbol in &symbols {
+        let c = cached_map.get(symbol);
+        let mut native = c.and_then(|p| p.price);
+        let mut source = if native.is_some() { "cache" } else { "none" };
+        if native.is_none() || native == Some(0.0) {
+            if let Some(manual) = config.get(&format!("manual_price_{}", symbol)) {
+                if let Ok(v) = manual.parse::<f64>() {
+                    native = Some(v);
+                    source = "manual";
+                }
+            }
+        }
+        let currency = info.get(symbol).and_then(|i| i.2.clone()).map(|c| c.to_uppercase());
+        let aud = match (&native, &currency) {
+            (Some(n), Some(cur)) if cur != "AUD" => match fx_rates.get(cur).copied().flatten() {
+                Some(rate) if rate != 0.0 => Some(n * rate),
+                _ => Some(*n),
+            },
+            (Some(n), _) => Some(*n),
+            _ => None,
+        };
+        prices.insert(symbol.clone(), EffectivePrice {
+            native,
+            aud,
+            source,
+            price_date: c.and_then(|p| p.price_date.clone()),
+            change: c.and_then(|p| p.change),
+            change_percent: c.and_then(|p| p.change_percent),
+            volume: c.and_then(|p| p.volume),
+        });
+    }
+
+    Ok(PortfolioContext { groups, prices, info, fields, intl, etf, all_aud: all_aud_map, fx_rates })
+}
+
+#[utoipa::path(get, path = "/api/v1/portfolio/holdings", tag = "portfolio", responses((status = 200, description = "Get portfolio holdings")))]
+#[get("/api/portfolio/holdings")]
+async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
+    let ctx = match build_portfolio_context(&db_path).await {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "portfolio_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    let mut holdings = Vec::new();
+    for (symbol, txs) in &ctx.groups {
+        let summary = portfolio::calc_symbol_summary(txs);
+        if summary.remaining_shares <= 0.0 {
+            continue;
+        }
+        let dividends = portfolio::symbol_dividends(&portfolio::sort_transactions(txs));
+        let ep = ctx.prices.get(symbol);
+        let price_aud = ep.and_then(|p| p.aud);
+        let current_value = price_aud.filter(|p| *p != 0.0).map(|p| summary.remaining_shares * p).unwrap_or(0.0);
+        let invested = summary.remaining_cost;
+        let pl = current_value - invested + dividends;
+        let sym_fields = ctx.fields.get(symbol);
+        let fields: HashMap<&String, &String> = sym_fields
+            .map(|f| f.iter().filter(|(k, _)| k.as_str() != "_notes").collect())
+            .unwrap_or_default();
+        let sma150 = stored_sma(&conn, symbol, 150).map(|v| ctx.to_aud(symbol, v));
+        let itype = ctx.info.get(symbol).and_then(|i| i.0.clone());
+        holdings.push(serde_json::json!({
+            "symbol": symbol,
+            "long_name": ctx.info.get(symbol).and_then(|i| i.1.clone()),
+            "instrument_type": itype,
+            "is_etf": ctx.etf.get(symbol).copied().unwrap_or(false),
+            "is_international": ctx.intl.get(symbol).copied().unwrap_or(false),
+            "currency": ctx.currency_of(symbol),
+            "sector": ctx.sector_of(symbol),
+            "notes": sym_fields.and_then(|f| f.get("_notes").cloned()),
+            "fields": fields,
+            "shares": summary.remaining_shares,
+            "invested": invested,
+            "avg_cost": if summary.remaining_shares > 0.0 { Some(invested / summary.remaining_shares) } else { None },
+            "native_avg_cost": if summary.remaining_shares > 0.0 { Some(summary.native_remaining_cost / summary.remaining_shares) } else { None },
+            "current_price": price_aud,
+            "native_current_price": ep.and_then(|p| p.native),
+            "price_source": ep.map(|p| p.source).unwrap_or("none"),
+            "price_date": ep.and_then(|p| p.price_date.clone()),
+            "change": ep.and_then(|p| p.change),
+            "change_percent": ep.and_then(|p| p.change_percent),
+            "volume": ep.and_then(|p| p.volume),
+            "current_value": current_value,
+            "dividends": dividends,
+            "pl": pl,
+            "pl_pct": if invested > 0.0 { Some(pl / invested * 100.0) } else { None },
+            "sma150": sma150,
+        }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "holdings": holdings, "fx_rates": ctx.fx_rates }))
+}
+
+#[utoipa::path(get, path = "/api/v1/portfolio/overview", tag = "portfolio", responses((status = 200, description = "Get portfolio overview")))]
+#[get("/api/portfolio/overview")]
+async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
+    let ctx = match build_portfolio_context(&db_path).await {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "portfolio_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+
+    #[derive(Default)]
+    struct Agg {
+        count: usize,
+        value: f64,
+        dividends: f64,
+        pl: f64,
+        cost: f64,
+    }
+    impl Agg {
+        fn add(&mut self, value: f64, dividends: f64, pl: f64, cost: f64) {
+            self.count += 1;
+            self.value += value;
+            self.dividends += dividends;
+            self.pl += pl;
+            self.cost += cost;
+        }
+        fn json(&self) -> serde_json::Value {
+            serde_json::json!({ "count": self.count, "value": self.value, "dividends": self.dividends, "pl": self.pl, "cost": self.cost })
+        }
+    }
+
+    let mut holdings_agg = Agg::default();
+    let mut equity_agg = Agg::default();
+    let mut etf_agg = Agg::default();
+    let mut sector_aggs: HashMap<String, Agg> = HashMap::new();
+    let mut sold_agg = Agg::default();
+    let mut sold_pl = 0.0;
+
+    for (symbol, txs) in &ctx.groups {
+        let pos = portfolio::calc_symbol_position(txs);
+
+        if pos.remaining_shares > 0.0 {
+            let price = ctx.prices.get(symbol).and_then(|p| p.aud).filter(|p| *p != 0.0);
+            let current_value = price.map(|p| pos.remaining_shares * p).unwrap_or(0.0);
+            let sym_pl = current_value - pos.remaining_cost + pos.dividends;
+            holdings_agg.add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+            if ctx.etf.get(symbol).copied().unwrap_or(false) {
+                etf_agg.add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+            } else {
+                equity_agg.add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+            }
+            let sector = ctx.sector_of(symbol).unwrap_or_else(|| "Unallocated".to_string());
+            sector_aggs.entry(sector).or_default().add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+        }
+
+        let sym_sold_pl = pos.sold_pl();
+        if pos.sold_proceeds > 0.0 {
+            sold_agg.add(
+                pos.sold_proceeds,
+                pos.sold_dividends,
+                sym_sold_pl,
+                pos.sold_proceeds - sym_sold_pl + pos.sold_dividends,
+            );
+        }
+        sold_pl += sym_sold_pl;
+    }
+
+    let mut sectors: Vec<(String, Agg)> = sector_aggs.into_iter().collect();
+    sectors.sort_by(|a, b| b.1.value.partial_cmp(&a.1.value).unwrap_or(std::cmp::Ordering::Equal));
+    let sectors_json: Vec<serde_json::Value> = sectors
+        .into_iter()
+        .map(|(name, agg)| {
+            let mut v = agg.json();
+            v["name"] = serde_json::json!(name);
+            v
+        })
+        .collect();
+
+    // ------------------------------------------------------------------
+    // Dashboard lists — previously computed in the browser from N price
+    // history requests; now derived server-side.
+    // ------------------------------------------------------------------
+    let config: HashMap<String, String> = load_config(&db_path)
+        .map(|c| c.into_iter().map(|i| (i.key, i.value)).collect())
+        .unwrap_or_default();
+
+    // Worst holdings vs their 150-day SMA
+    let mut worst_holdings: Vec<serde_json::Value> = Vec::new()
+;
+    if let Ok(conn) = open_db(db_path.as_ref()) {
+        let mut scored: Vec<(f64, serde_json::Value)> = Vec::new();
+        for (symbol, txs) in &ctx.groups {
+            let pos = portfolio::calc_symbol_position(txs);
+            if pos.remaining_shares <= 0.0 {
+                continue;
+            }
+            let price = ctx.prices.get(symbol).and_then(|p| p.aud).filter(|p| *p != 0.0);
+            let sma150 = stored_sma(&conn, symbol, 150).map(|v| ctx.to_aud(symbol, v));
+            if let (Some(p), Some(s)) = (price, sma150) {
+                if s != 0.0 {
+                    let pct = (p - s) / s * 100.0;
+                    scored.push((pct, serde_json::json!({ "symbol": symbol, "price": p, "sma150": s, "pct_diff": pct })));
+                }
+            }
+        }
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        worst_holdings = scored.into_iter().take(15).map(|(_, v)| v).collect();
+    }
+
+    // Watchlist rows are needed for both best-watchlist and custom lists
+    let watchlist_rows = load_watchlist_symbols(&db_path, None).unwrap_or_default();
+    let mut watch_unique: Vec<String> = Vec::new();
+    let mut watch_seen = std::collections::HashSet::new();
+    for r in &watchlist_rows {
+        if watch_seen.insert(r.symbol.clone()) {
+            watch_unique.push(r.symbol.clone());
+        }
+    }
+    let watch_prices: HashMap<String, CurrentPrice> = load_cached_prices(&db_path, &watch_unique)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.symbol.clone(), p))
+        .collect();
+
+    // Best watchlist — most recently crossed above their 50-day SMA
+    let histories = fetch_histories(&db_path, &watch_unique, 300).await;
+    let mut best: Vec<(i64, serde_json::Value)> = Vec::new();
+    {
+        use stocks::indicators as ind;
+        for sym in &watch_unique {
+            let Some(p) = watch_prices.get(sym).and_then(|x| x.price) else { continue };
+            let Some(hist) = histories.get(sym) else { continue };
+            let points = indicator_points(hist);
+            let sma50_arr = ind::calculate_sma(&points, 50);
+            let Some(sma50) = ind::latest_sma(&sma50_arr) else { continue };
+            if p <= sma50 {
+                continue;
+            }
+            let stats = ind::crossover_stats(&points, &sma50_arr, watch_prices.get(sym).and_then(|x| x.volume));
+            best.push((stats.days, serde_json::json!({
+                "symbol": sym,
+                "price": p,
+                "sma50": sma50,
+                "sma50_trend": ind::sma_trend(&sma50_arr, 5),
+                "days_since_50sma": stats.days,
+                "volume_pct_50sma": stats.volume_pct,
+            })));
+        }
+    }
+    best.sort_by_key(|(days, _)| *days);
+    let best_watchlist: Vec<serde_json::Value> = best.into_iter().take(15).map(|(_, v)| v).collect();
+
+    // Custom dashboard lists: price vs a user-defined field
+    #[derive(Deserialize)]
+    struct DashboardListDef {
+        key: String,
+        label: String,
+        source: String,
+        field_key: String,
+        operator: String,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        sort: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct FieldDef {
+        key: String,
+        label: String,
+    }
+    let list_defs: Vec<DashboardListDef> = config
+        .get("dashboard_custom_lists")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let holdings_field_defs: Vec<FieldDef> = config
+        .get("holdings_custom_fields")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let watchlist_field_defs: Vec<FieldDef> = config
+        .get("watchlist_custom_fields")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let custom_lists: Vec<serde_json::Value> = list_defs
+        .iter()
+        .map(|def| {
+            let (field_source, field_key) = def.field_key.split_once(':').unwrap_or(("", ""));
+            struct Entry {
+                symbol: String,
+                price: f64,
+                field_value: f64,
+                diff: f64,
+                pct_diff: f64,
+                currency: Option<String>,
+            }
+            let matches_op = |diff: f64| match def.operator.as_str() {
+                "above" | "pct_below" => diff > 0.0,
+                "below" | "pct_above" => diff < 0.0,
+                _ => false,
+            };
+            let mut entries: Vec<Entry> = Vec::new();
+
+            if (def.source == "holdings" || def.source == "both") && field_source == "holdings" {
+                for (symbol, txs) in &ctx.groups {
+                    let pos = portfolio::calc_symbol_position(txs);
+                    if pos.remaining_shares <= 0.0 {
+                        continue;
+                    }
+                    let Some(price) = ctx.prices.get(symbol).and_then(|p| p.native) else { continue };
+                    let Some(fv) = ctx.fields.get(symbol).and_then(|f| f.get(field_key)).and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) else { continue };
+                    let diff = price - fv;
+                    if matches_op(diff) {
+                        entries.push(Entry {
+                            symbol: symbol.clone(),
+                            price,
+                            field_value: fv,
+                            diff,
+                            pct_diff: diff / fv * 100.0,
+                            currency: ctx.info.get(symbol).and_then(|i| i.2.clone()),
+                        });
+                    }
+                }
+            }
+
+            if (def.source == "watchlist" || def.source == "both") && field_source == "watchlist" {
+                for row in &watchlist_rows {
+                    if entries.iter().any(|e| e.symbol == row.symbol) {
+                        continue;
+                    }
+                    let Some(price) = watch_prices.get(&row.symbol).and_then(|p| p.price) else { continue };
+                    let fv = match field_key {
+                        "breakthrough_price" => row.breakthrough_price,
+                        "stop_loss_price" => row.stop_loss_price,
+                        _ => row.custom_fields.get(field_key).and_then(|v| v.parse::<f64>().ok()),
+                    };
+                    let Some(fv) = fv.filter(|v| *v > 0.0) else { continue };
+                    let diff = price - fv;
+                    if matches_op(diff) {
+                        entries.push(Entry {
+                            symbol: row.symbol.clone(),
+                            price,
+                            field_value: fv,
+                            diff,
+                            pct_diff: diff / fv * 100.0,
+                            currency: None,
+                        });
+                    }
+                }
+            }
+
+            let pct_op = def.operator == "pct_above" || def.operator == "pct_below";
+            entries.sort_by(|a, b| {
+                let cmp = if pct_op {
+                    a.pct_diff.abs().partial_cmp(&b.pct_diff.abs())
+                } else {
+                    a.pct_diff.partial_cmp(&b.pct_diff)
+                }
+                .unwrap_or(std::cmp::Ordering::Equal);
+                if def.sort.as_deref() == Some("desc") { cmp.reverse() } else { cmp }
+            });
+            entries.truncate(def.limit.unwrap_or(15));
+
+            let builtin_labels: HashMap<&str, &str> = HashMap::from([
+                ("breakthrough_price", "Breakthrough Price"),
+                ("stop_loss_price", "Stop Loss Price"),
+                ("stop_loss", "Stop Loss Price"),
+                ("trailing_sell_pct", "Trailing Sell %"),
+            ]);
+            let field_defs = if field_source == "holdings" { &holdings_field_defs } else { &watchlist_field_defs };
+            let field_label = field_defs
+                .iter()
+                .find(|f| f.key == field_key)
+                .map(|f| f.label.clone())
+                .or_else(|| builtin_labels.get(field_key).map(|s| s.to_string()))
+                .unwrap_or_else(|| field_key.to_string());
+
+            serde_json::json!({
+                "key": def.key,
+                "label": def.label,
+                "source": def.source,
+                // Where the entry symbols actually live (holdings vs watchlist),
+                // derived from the field_key prefix. Drives click navigation.
+                "field_source": field_source,
+                "operator": def.operator,
+                "field_label": field_label,
+                "entries": entries.iter().map(|e| serde_json::json!({
+                    "symbol": e.symbol,
+                    "price": e.price,
+                    "field_value": e.field_value,
+                    "diff": e.diff,
+                    "pct_diff": e.pct_diff,
+                    "currency": e.currency,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "totals": {
+            "stock_count": holdings_agg.count,
+            "total_value": holdings_agg.value,
+            "total_pl": holdings_agg.pl + sold_pl,
+            "holdings_pl": holdings_agg.pl,
+            "sold_pl": sold_pl,
+        },
+        "breakdowns": {
+            "equities": equity_agg.json(),
+            "etfs": etf_agg.json(),
+            "holdings": holdings_agg.json(),
+            "sold": {
+                "count": sold_agg.count,
+                "value": sold_agg.value,
+                "dividends": sold_agg.dividends,
+                "pl": sold_pl,
+                "cost": sold_agg.cost,
+            },
+        },
+        "sectors": sectors_json,
+        "worst_holdings": worst_holdings,
+        "best_watchlist": best_watchlist,
+        "custom_lists": custom_lists,
+    }))
+}
+
+#[utoipa::path(get, path = "/api/v1/portfolio/lots", tag = "portfolio", responses((status = 200, description = "Get portfolio lots")))]
+#[get("/api/portfolio/lots")]
+async fn get_portfolio_lots(db_path: web::Data<PathBuf>) -> impl Responder {
+    let ctx = match build_portfolio_context(&db_path).await {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "portfolio_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+
+    let all_txs: Vec<PortfolioTx> = ctx.groups.iter().flat_map(|(_, txs)| txs.clone()).collect();
+    let remaining = portfolio::calc_remaining_by_lot(&all_txs);
+
+    let mut lots = Vec::new();
+    for (symbol, txs) in &ctx.groups {
+        let price_aud = ctx.prices.get(symbol).and_then(|p| p.aud);
+        for tx in txs {
+            if tx.tx_type != TxType::Purchase {
+                continue;
+            }
+            let rem = remaining.get(&tx.id).copied().unwrap_or(0.0);
+            let (current_value, unrealised_pl) = match (price_aud, tx.price) {
+                (Some(p), Some(cost)) if rem > 0.0 => {
+                    let value = rem * p;
+                    (Some(value), Some(value - (rem * cost + tx.brokerage.unwrap_or(0.0))))
+                }
+                _ => (None, None),
+            };
+            lots.push(serde_json::json!({
+                "transaction_id": tx.id,
+                "symbol": symbol,
+                "date": tx.date,
+                "remaining": rem,
+                "current_value": current_value,
+                "unrealised_pl": unrealised_pl,
+            }));
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "lots": lots }))
+}
+
+#[utoipa::path(get, path = "/api/v1/portfolio/sold", tag = "portfolio", responses((status = 200, description = "Get portfolio sold")))]
+#[get("/api/portfolio/sold")]
+async fn get_portfolio_sold(db_path: web::Data<PathBuf>) -> impl Responder {
+    let rows = match fetch_holdings(&db_path) {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "portfolio_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let txs = to_portfolio_txs(&rows);
+    let mut entries: Vec<portfolio::SoldEntry> = Vec::new();
+    for (_, group) in portfolio::group_by_symbol(&txs) {
+        entries.extend(portfolio::calc_sold_entries(&group));
+    }
+    entries.sort_by(|a, b| b.date.cmp(&a.date));
+
+    let total_realised_pl: f64 = entries.iter().map(|e| e.realised_pl).sum();
+    let total_cost: f64 = entries.iter().map(|e| e.avg_purchase_price * e.quantity).sum();
+    let entries_json: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| serde_json::json!({
+            "symbol": e.symbol,
+            "date": e.date,
+            "quantity": e.quantity,
+            "avg_purchase_price": e.avg_purchase_price,
+            "sale_price": e.sale_price,
+            "brokerage": e.brokerage,
+            "dividends": e.dividends,
+            "days_held": e.days_held,
+            "realised_pl": e.realised_pl,
+        }))
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "entries": entries_json,
+        "total_realised_pl": total_realised_pl,
+        "total_cost": total_cost,
+    }))
+}
+
+/// Risk / stop-loss analysis per active holding — the server-side port of the
+/// Analysis screen's row computation. Display-currency rule: a stock purchased
+/// entirely in AUD is shown in AUD (market prices converted); otherwise it is
+/// shown in its native trading currency.
+#[utoipa::path(get, path = "/api/v1/portfolio/risk", tag = "portfolio", responses((status = 200, description = "Get portfolio risk")))]
+#[get("/api/portfolio/risk")]
+async fn get_portfolio_risk(db_path: web::Data<PathBuf>) -> impl Responder {
+    let ctx = match build_portfolio_context(&db_path).await {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "portfolio_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    let mut rows = Vec::new();
+    let mut total_invested = 0.0;
+    let mut total_sl_dollar = 0.0;
+
+    for (symbol, txs) in &ctx.groups {
+        let summary = portfolio::calc_symbol_summary(txs);
+        if summary.remaining_shares <= 0.0 {
+            continue;
+        }
+        let shares = summary.remaining_shares;
+        let symbol_currency = ctx.currency_of(symbol);
+        let all_aud = ctx.all_aud.get(symbol).copied().unwrap_or(true);
+        let display_currency = if all_aud { "AUD".to_string() } else { symbol_currency.clone() };
+        let is_foreign = display_currency != "AUD";
+        let rate = ctx.fx_rates.get(&symbol_currency).copied().flatten().filter(|r| *r != 0.0);
+        let needs_conversion = all_aud && symbol_currency != "AUD" && rate.is_some();
+        let to_display = |p: f64| if needs_conversion { p * rate.unwrap() } else { p };
+
+        // Average purchase price in the display currency: AUD lots when
+        // purchased in AUD, native-currency lots otherwise.
+        let purchase_price = if is_foreign {
+            summary.native_remaining_cost / shares
+        } else {
+            summary.remaining_cost / shares
+        };
+
+        let current_price = ctx.prices.get(symbol).and_then(|p| p.native).map(&to_display);
+        let pl_pct = match current_price {
+            Some(c) if purchase_price != 0.0 && c != 0.0 => Some((c - purchase_price) / purchase_price * 100.0),
+            _ => None,
+        };
+
+        let sym_fields = ctx.fields.get(symbol);
+        let stop_loss_manual = sym_fields
+            .and_then(|f| f.get("stop_loss"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v != 0.0);
+        let trailing_pct = sym_fields
+            .and_then(|f| f.get("trailing_sell_pct"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0);
+
+        let mut stop_loss: Option<f64> = stop_loss_manual;
+        let mut is_trailing = false;
+        if stop_loss.is_none() {
+            if let Some(pct) = trailing_pct {
+                // Trailing trigger: highest close since placement date (plus
+                // the live price) minus the trailing percentage.
+                let mut reference = current_price;
+                if let Some(since) = sym_fields.and_then(|f| f.get("trailing_sell_date")).filter(|d| !d.is_empty()) {
+                    let mut closes: Vec<f64> = conn
+                        .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL AND date >= ?2")
+                        .ok()
+                        .and_then(|mut stmt| {
+                            stmt.query_map(params![symbol, since], |row| row.get::<_, f64>(0))
+                                .ok()
+                                .map(|r| r.flatten().map(&to_display).collect())
+                        })
+                        .unwrap_or_default();
+                    if let Some(c) = current_price {
+                        closes.push(c);
+                    }
+                    if !closes.is_empty() {
+                        reference = closes.into_iter().reduce(f64::max);
+                    }
+                }
+                if let Some(r) = reference.filter(|r| *r != 0.0) {
+                    stop_loss = Some(r * (1.0 - pct / 100.0));
+                    is_trailing = true;
+                }
+            }
+        }
+
+        let stop_loss_pct = stop_loss
+            .filter(|_| purchase_price != 0.0)
+            .map(|sl| (sl - purchase_price) / purchase_price * 100.0);
+        let sl_dollar_native = stop_loss
+            .filter(|_| purchase_price != 0.0 && shares > 0.0)
+            .map(|sl| (sl - purchase_price) * shares);
+        let stop_loss_dollar = sl_dollar_native.map(|v| match (is_foreign, rate) {
+            (true, Some(r)) => v * r,
+            _ => v,
+        });
+
+        let sma50 = stored_sma(&conn, symbol, 50).map(&to_display);
+        let sma150 = stored_sma(&conn, symbol, 150).map(&to_display);
+        let high30d: Option<f64> = conn
+            .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL ORDER BY date DESC LIMIT 30")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map(params![symbol], |row| row.get::<_, f64>(0))
+                    .ok()
+                    .and_then(|r| r.flatten().map(&to_display).reduce(f64::max))
+            });
+
+        let invested = if purchase_price != 0.0 && shares > 0.0 { purchase_price * shares } else { 0.0 };
+        total_invested += invested;
+        total_sl_dollar += stop_loss_dollar.unwrap_or(0.0);
+
+        rows.push(serde_json::json!({
+            "symbol": symbol,
+            "currency": display_currency,
+            "current_price": current_price,
+            "purchase_price": if purchase_price != 0.0 { Some(purchase_price) } else { None },
+            "pl_pct": pl_pct,
+            "stop_loss": stop_loss,
+            "is_trailing_sell": is_trailing,
+            "stop_loss_pct": stop_loss_pct,
+            "stop_loss_dollar": stop_loss_dollar,
+            "sma50": sma50,
+            "sma150": sma150,
+            "high30d": high30d,
+            "total_invested": invested,
+        }));
+    }
+
+    let total_sl_pct = if total_invested > 0.0 { Some(total_sl_dollar / total_invested * 100.0) } else { None };
+    HttpResponse::Ok().json(serde_json::json!({
+        "rows": rows,
+        "totals": {
+            "total_invested": total_invested,
+            "total_sl_dollar": total_sl_dollar,
+            "total_sl_pct": total_sl_pct,
+        },
+    }))
+}
+
+/// Cheap change-detection for polling clients: last-modified stamps per data
+/// domain, sourced from the audit log (every tracked table has triggers) and
+/// the price-refresh timestamps. A mobile app polls this one tiny endpoint
+/// and refetches a domain's payload only when its stamp moves.
+#[utoipa::path(get, path = "/api/v1/sync-state", tag = "system", responses((status = 200, description = "Get sync state")))]
+#[get("/api/sync-state")]
+async fn get_sync_state(db_path: web::Data<PathBuf>) -> impl Responder {
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let mut latest: HashMap<String, String> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT table_name, MAX(timestamp) FROM audit_log GROUP BY table_name") {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        }) {
+            for (table, ts) in rows.flatten() {
+                if let Some(ts) = ts {
+                    latest.insert(table, ts);
+                }
+            }
+        }
+    }
+    let max_of = |tables: &[&str]| -> Option<String> {
+        tables.iter().filter_map(|t| latest.get(*t)).max().cloned()
+    };
+    let config: HashMap<String, String> = load_config(&db_path)
+        .map(|c| c.into_iter().map(|i| (i.key, i.value)).collect())
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "holdings": max_of(&["holdings_transactions", "holdings_symbol_fields", "holdings_custom_fields"]),
+        "watchlist": max_of(&["watchlist_symbols", "watchlist_memberships", "watchlist_symbol_fields"]),
+        "dividends": max_of(&["dividend_events"]),
+        "symbol_info": max_of(&["symbol_info"]),
+        "config": max_of(&["app_config"]),
+        "watchlist_prices_updated_at": config.get("watchlist_prices_updated_at"),
+        "holdings_prices_updated_at": config.get("holdings_prices_updated_at"),
+        "last_full_refresh_at": config.get("last_full_refresh_at"),
+        "server_time": Utc::now().to_rfc3339(),
+    }))
+}
+
+#[utoipa::path(get, path = "/api/v1/meta", tag = "meta", responses((status = 200, description = "Get meta")))]
+#[get("/api/meta")]
+async fn get_meta(db_path: web::Data<PathBuf>) -> impl Responder {
+    let config: HashMap<String, String> = match load_config(&db_path) {
+        Ok(c) => c.into_iter().map(|c| (c.key, c.value)).collect(),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "meta_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let sectors: serde_json::Value = config
+        .get("sectors")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::from_str(DEFAULT_SECTORS_JSON).unwrap());
+    let parse_defs = |key: &str| -> serde_json::Value {
+        config
+            .get(key)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!([]))
+    };
+    HttpResponse::Ok().json(serde_json::json!({
+        "sectors": sectors,
+        "currencies": SUPPORTED_CURRENCIES,
+        "holdings_custom_fields": parse_defs("holdings_custom_fields"),
+        "watchlist_custom_fields": parse_defs("watchlist_custom_fields"),
+        "dashboard_custom_lists": parse_defs("dashboard_custom_lists"),
+        "reserved_holdings_keys": ["stop_loss", "trailing_sell_pct", "trailing_sell_date", "sector"],
+        "reserved_watchlist_keys": ["breakthrough_price", "stop_loss_price", "sector"],
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3488,6 +5243,7 @@ mod tests {
             original_price: None,
             fx_rate: None,
             custom_fields: None,
+            confirm: None,
         };
 
         let result = insert_holding_transaction(&db_path, "TST.AX", payload);
@@ -3520,6 +5276,7 @@ mod tests {
             original_price: None,
             fx_rate: None,
             custom_fields: None,
+            confirm: None,
         };
 
         let result = insert_holding_transaction(&db_path, "TST.AX", payload);

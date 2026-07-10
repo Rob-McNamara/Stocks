@@ -1,10 +1,12 @@
 import { useState, useEffect } from 'react'
-import { apiClient } from '../services/api'
-import { calculateSMA, crossoverStats, getLatestSMA, smaTrend } from '../utils/sma'
-import { mapLimit } from '../utils/async'
+import { apiClient, type EnrichedWatchlistItem } from '../services/api'
 import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
 import StockAnalysis from './StockAnalysis'
+
+// Thin client: SMA/crossover/volume indicators are computed by the API server
+// (GET /api/watchlist/enriched) — one request replaces the N price-history
+// calls this screen used to make.
 
 interface WatchlistSymbol {
   id: number
@@ -54,47 +56,6 @@ interface WatchlistManagerProps {
 }
 
 
-async function enrichOne(price: CurrentPrice): Promise<CurrentPrice> {
-  try {
-    const history = await apiClient.getPriceHistory(price.symbol, 300)
-    const sma50Array = calculateSMA(history, 50)
-    const sma150Array = calculateSMA(history, 150)
-    const sma50 = getLatestSMA(sma50Array)
-    const sma150 = getLatestSMA(sma150Array)
-    const volPoints = history.filter((p) => p.volume !== null && p.volume > 0).slice(-10)
-    const last5 = volPoints.slice(-5)
-    const prev5 = volPoints.slice(-10, -5)
-    let volumeChangePct: number | null = null
-    if (last5.length === 5 && prev5.length === 5) {
-      const avg = (pts: typeof volPoints) => pts.reduce((s, p) => s + p.volume!, 0) / pts.length
-      const prevAvg = avg(prev5)
-      if (prevAvg > 0) volumeChangePct = ((avg(last5) - prevAvg) / prevAvg) * 100
-    }
-    let daysSince50SMA: number | null = null
-    let volumePct50SMA: number | null = null
-    if (price.price !== null && sma50 !== null && price.price > sma50) {
-      const stats = crossoverStats(history, sma50Array, price.volume)
-      daysSince50SMA = stats.days
-      volumePct50SMA = stats.volumePct
-    }
-    let daysSince150SMA: number | null = null
-    let volumePct150SMA: number | null = null
-    if (price.price !== null && sma150 !== null && price.price > sma150) {
-      const stats = crossoverStats(history, sma150Array, price.volume)
-      daysSince150SMA = stats.days
-      volumePct150SMA = stats.volumePct
-    }
-    const sma50Trend = smaTrend(sma50Array)
-    const sma150Trend = smaTrend(sma150Array)
-    return { ...price, sma50, sma150, volumeChangePct, daysSince50SMA, volumePct50SMA, daysSince150SMA, volumePct150SMA, sma50Trend, sma150Trend }
-  } catch {
-    return price
-  }
-}
-
-async function enrichWithSMA(pricesData: CurrentPrice[]): Promise<CurrentPrice[]> {
-  return mapLimit(pricesData, 6, enrichOne)
-}
 
 export default function WatchlistManager({ onLoading, initialSymbol, onInitialSymbolConsumed, onMoveToHoldings, removeSymbolRequest, onRemoveSymbolConsumed }: WatchlistManagerProps) {
   const [lists, setLists] = useState<string[]>(['Default'])
@@ -123,6 +84,8 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
   const extraCustomFieldDefs = customFieldDefs.filter((def) => !builtInWatchlistKeys.includes(def.key))
   const [newSymbolFields, setNewSymbolFields] = useState<Record<string, string>>({})
   const [editCustomFields, setEditCustomFields] = useState<Record<string, string>>({})
+  // Server-driven sector list from /api/meta; static list is the offline fallback
+  const [sectorOptions, setSectorOptions] = useState<string[]>([...SECTORS])
 
   useEffect(() => {
     loadWatchlistData()
@@ -138,41 +101,81 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     }
   }, [initialSymbol, symbols])
 
-  // A "Move to Holdings" transaction was saved — now it's safe to drop the
-  // symbol from all watchlists.
+  // A "Move to Holdings" transaction was saved. The server removed the
+  // memberships atomically (POST /api/holdings/from-watchlist) — just resync.
   useEffect(() => {
     if (!removeSymbolRequest) return
-    const entries = symbols.filter((s) => s.symbol === removeSymbolRequest)
     onRemoveSymbolConsumed?.()
-    if (entries.length === 0) return
-    const removeAll = async () => {
+    const resync = async () => {
       try {
-        for (const entry of entries) {
-          await apiClient.removeWatchlistSymbol(entry.id)
-        }
-        const remaining = symbols.filter((s) => s.symbol !== removeSymbolRequest)
-        setSymbols(remaining)
-        if (selectedSymbol === removeSymbolRequest) setSelectedSymbol(remaining[0]?.symbol || '')
-        const listsData = await apiClient.getWatchlistLists()
+        if (selectedSymbol === removeSymbolRequest) setSelectedSymbol('')
+        const [listsData, enriched] = await Promise.all([
+          apiClient.getWatchlistLists(),
+          apiClient.getWatchlistEnriched(),
+        ])
         setLists(listsData.length > 0 ? listsData : ['Default'])
+        applyEnriched(enriched)
         setSuccess(`${removeSymbolRequest} moved to Holdings and removed from watchlist`)
         setTimeout(() => setSuccess(null), 3000)
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to remove from watchlist')
+        setError(err instanceof Error ? err.message : 'Failed to refresh watchlist')
       }
     }
-    removeAll()
+    resync()
   }, [removeSymbolRequest])
+
+  /** Map the enriched server response into component state. */
+  const applyEnriched = (data: { items: EnrichedWatchlistItem[]; prices_updated_at: string | null }) => {
+    const items = data.items
+    setSymbols(items.map((i) => ({
+      id: i.id,
+      symbol: i.symbol,
+      list_name: i.list_name,
+      added_at: i.added_at,
+      notes: i.notes,
+      breakthrough_price: i.breakthrough_price,
+      stop_loss_price: i.stop_loss_price,
+      custom_fields: i.custom_fields,
+    })))
+    const seen = new Set<string>()
+    const prices: CurrentPrice[] = []
+    const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
+    items.forEach((i) => {
+      infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency }
+      if (seen.has(i.symbol)) return
+      seen.add(i.symbol)
+      prices.push({
+        symbol: i.symbol,
+        price: i.price,
+        change: i.change,
+        change_percent: i.change_percent,
+        volume: i.volume,
+        last_updated: i.last_updated ?? '',
+        price_date: i.price_date,
+        sma50: i.indicators?.sma50 ?? null,
+        sma150: i.indicators?.sma150 ?? null,
+        sma50Trend: i.indicators?.sma50_trend ?? null,
+        sma150Trend: i.indicators?.sma150_trend ?? null,
+        daysSince50SMA: i.indicators?.days_since_50sma ?? null,
+        volumePct50SMA: i.indicators?.volume_pct_50sma ?? null,
+        daysSince150SMA: i.indicators?.days_since_150sma ?? null,
+        volumePct150SMA: i.indicators?.volume_pct_150sma ?? null,
+        volumeChangePct: i.indicators?.volume_change_pct ?? null,
+      })
+    })
+    setAllPrices(prices)
+    setSymbolInfo(infoMap)
+    if (data.prices_updated_at) setPricesUpdatedAt(data.prices_updated_at)
+  }
 
   const loadWatchlistData = async () => {
     try {
       setLoading(true)
       setError(null)
-      const [listsData, symbolsData, pricesData, infoData, configData] = await Promise.all([
+      apiClient.getMeta().then((m) => { if (m.sectors?.length) setSectorOptions(m.sectors) }).catch(() => {})
+      const [listsData, enriched, configData] = await Promise.all([
         apiClient.getWatchlistLists(),
-        apiClient.getWatchlistSymbols(),
-        apiClient.getWatchlistCachedPrices(),
-        apiClient.getSymbolInfo(),
+        apiClient.getWatchlistEnriched(),
         apiClient.getConfig(),
       ])
       try {
@@ -185,20 +188,11 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       const effectiveDefault = effectiveLists.includes(savedDefault) ? savedDefault : effectiveLists[0]
       setDefaultList(effectiveDefault)
       if (!selectedSymbol) setSelectedList(effectiveDefault)
-      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
-      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
-      setSymbolInfo(infoMap)
       setLists(effectiveLists)
-      setSymbols(symbolsData)
-      setAllPrices(pricesData)
-      if (symbolsData.length && !selectedSymbol) {
-        setSelectedSymbol(symbolsData[0].symbol)
+      applyEnriched(enriched)
+      if (enriched.items.length && !selectedSymbol) {
+        setSelectedSymbol(enriched.items[0].symbol)
       }
-      // Show UI immediately, then enrich with SMA data in the background
-      setLoading(false)
-      onLoading(false)
-      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
-      return
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load watchlist')
     } finally {
@@ -268,21 +262,15 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       setNewSymbolFields({})
       if (!selectedSymbol) setSelectedSymbol(result.symbol)
       setSuccess(`Added ${result.symbol} to "${selectedList}"`)
-      // Fetch live price for just the new symbol, use cache for the rest
-      const [listsData, symbolsData, cachedPrices, newSymbolPrices] = await Promise.all([
+      // Fetch a live price for the new symbol (populates the server cache),
+      // then reload the enriched watchlist
+      await apiClient.getCurrentPrices([result.symbol]).catch(() => [])
+      const [listsData, enriched] = await Promise.all([
         apiClient.getWatchlistLists(),
-        apiClient.getWatchlistSymbols(),
-        apiClient.getWatchlistCachedPrices(),
-        apiClient.getCurrentPrices([result.symbol]),
+        apiClient.getWatchlistEnriched(),
       ])
-      // Merge: replace cached entry for the new symbol with live data
-      const priceMap = new Map(cachedPrices.map((p) => [p.symbol, p]))
-      newSymbolPrices.forEach((p) => priceMap.set(p.symbol, p))
-      const pricesData = Array.from(priceMap.values())
-      setLists(listsData)
-      setSymbols(symbolsData)
-      setAllPrices(pricesData)
-      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
+      setLists(listsData.length > 0 ? listsData : ['Default'])
+      applyEnriched(enriched)
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add symbol')
@@ -298,10 +286,9 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       setError(null)
       setSuccess(null)
       const pricesData = await apiClient.getWatchlistPrices()
-      setAllPrices(pricesData)
-      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
-      // Reload config to get updated timestamp
-      apiClient.getConfig().then((cfg) => setPricesUpdatedAt(cfg['watchlist_prices_updated_at'] ?? null))
+      // Live fetch has updated the server cache — reload enriched rows
+      const enriched = await apiClient.getWatchlistEnriched()
+      applyEnriched(enriched)
       const hasPrice = pricesData.some((item) => item.price !== null)
       const errorDetails = pricesData.filter((item) => item.error).map((item) => `${item.symbol}: ${item.error}`).join(' | ')
       if (!hasPrice) {
@@ -326,18 +313,15 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       setError(null)
       setSuccess(null)
       await apiClient.removeWatchlistSymbol(id)
-      const remaining = symbols.filter((s) => s.id !== id)
-      setSymbols(remaining)
-      if (selectedSymbol === symbol) setSelectedSymbol(remaining[0]?.symbol || '')
+      if (selectedSymbol === symbol) setSelectedSymbol('')
       setSuccess(`Removed ${symbol} from "${selectedList}"`)
       // Refresh lists (list may now be empty and removed from DB)
-      const [listsData, pricesData] = await Promise.all([
+      const [listsData, enriched] = await Promise.all([
         apiClient.getWatchlistLists(),
-        apiClient.getWatchlistCachedPrices(),
+        apiClient.getWatchlistEnriched(),
       ])
       setLists(listsData.length > 0 ? listsData : ['Default'])
-      setAllPrices(pricesData)
-      enrichWithSMA(pricesData).then((enriched) => setAllPrices(enriched))
+      applyEnriched(enriched)
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to remove symbol')
@@ -366,30 +350,26 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     try {
       setLoading(true)
       setError(null)
-      const toAdd = lists.filter((l) => editListChecks[l] && !symbols.some((s) => s.symbol === editingSymbol && s.list_name === l))
-      const toRemove = symbols.filter((s) => s.symbol === editingSymbol && !editListChecks[s.list_name])
-      // Update notes on all existing rows for this symbol
-      const existingRows = symbols.filter((s) => s.symbol === editingSymbol && editListChecks[s.list_name])
       const { breakthrough_price: bpStr, stop_loss_price: slStr, ...cfFields } = editCustomFields
       const parsePrice = (s: string | undefined) => {
         const n = parseFloat(s ?? '')
         return Number.isNaN(n) ? null : n
       }
-      const bp = parsePrice(bpStr)
-      const sl = parsePrice(slStr)
-      const opts = { breakthroughPrice: bp, stopLossPrice: sl, customFields: cfFields }
-      await Promise.all([
-        ...toAdd.map((l) => apiClient.addWatchlistSymbol(editingSymbol, l, editNotes.trim() || undefined, opts)),
-        ...toRemove.map((s) => apiClient.removeWatchlistSymbol(s.id)),
-        ...existingRows.map((s) => apiClient.updateWatchlistSymbol(s.id, editNotes.trim() || null, opts)),
-      ])
+      // Memberships, notes and fields are applied in one transactional call
+      await apiClient.updateWatchlistSymbolLists(editingSymbol, {
+        lists: lists.filter((l) => editListChecks[l]),
+        notes: editNotes.trim() || null,
+        breakthrough_price: parsePrice(bpStr),
+        stop_loss_price: parsePrice(slStr),
+        custom_fields: cfFields,
+      })
       setEditingSymbol(null)
-      const [listsData, symbolsData] = await Promise.all([
+      const [listsData, enriched] = await Promise.all([
         apiClient.getWatchlistLists(),
-        apiClient.getWatchlistSymbols(),
+        apiClient.getWatchlistEnriched(),
       ])
       setLists(listsData.length > 0 ? listsData : ['Default'])
-      setSymbols(symbolsData)
+      applyEnriched(enriched)
       setSuccess(`Updated lists for ${editingSymbol}`)
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
@@ -723,7 +703,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
               style={{ flex: 1, minWidth: 140 }}
             >
               <option value="">Sector (optional)</option>
-              {SECTORS.map((s) => (
+              {sectorOptions.map((s) => (
                 <option key={s} value={s}>{s}</option>
               ))}
             </select>
@@ -876,10 +856,10 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                   style={{ width: '100%' }}
                 >
                   <option value="">— None —</option>
-                  {(editCustomFields['sector'] ?? '') !== '' && !(SECTORS as readonly string[]).includes(editCustomFields['sector']) && (
+                  {(editCustomFields['sector'] ?? '') !== '' && !sectorOptions.includes(editCustomFields['sector']) && (
                     <option value={editCustomFields['sector']}>{editCustomFields['sector']}</option>
                   )}
-                  {SECTORS.map((s) => (
+                  {sectorOptions.map((s) => (
                     <option key={s} value={s}>{s}</option>
                   ))}
                 </select>
