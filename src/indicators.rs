@@ -41,15 +41,13 @@ pub fn sma_trend(sma: &[Option<f64>], lookback: usize) -> Option<&'static str> {
     let mut latest: Option<f64> = None;
     let mut earlier: Option<f64> = None;
     let mut non_null_count = 0;
-    for value in sma.iter().rev() {
-        if let Some(v) = value {
-            non_null_count += 1;
-            if latest.is_none() {
-                latest = Some(*v);
-            } else if non_null_count > lookback {
-                earlier = Some(*v);
-                break;
-            }
+    for v in sma.iter().rev().flatten() {
+        non_null_count += 1;
+        if latest.is_none() {
+            latest = Some(*v);
+        } else if non_null_count > lookback {
+            earlier = Some(*v);
+            break;
         }
     }
     match (latest, earlier) {
@@ -87,14 +85,13 @@ pub fn crossover_stats(history: &[PricePoint], sma: &[Option<f64>], today_volume
                 .filter(|v| *v > 0)
                 .collect();
             let mut volume_pct = None;
-            if let Some(cv) = crossover_vol.filter(|v| *v > 0) {
-                if !prev20.is_empty() {
+            if let Some(cv) = crossover_vol.filter(|v| *v > 0)
+                && !prev20.is_empty() {
                     let avg = prev20.iter().sum::<i64>() as f64 / prev20.len() as f64;
                     if avg > 0.0 {
                         volume_pct = Some(((cv as f64 - avg) / avg) * 100.0);
                     }
                 }
-            }
             return CrossoverStats { days, volume_pct };
         }
     }

@@ -1,8 +1,9 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use reqwest::Client;
-use rusqlite::{params, types::Type, Connection};
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use std::{collections::HashMap, env, path::PathBuf, time::Duration};
+use stocks::portfolio::{self, ImpliedDividendPayment, PortfolioTx, TxType};
 use tokio::time;
 
 /// Open the SQLite database with WAL mode and a busy timeout so the API,
@@ -15,40 +16,15 @@ fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::E
     Ok(conn)
 }
 
-#[allow(dead_code)] // several columns are loaded for completeness but not read by this daemon
-#[derive(Debug, Clone)]
-struct HoldingTransaction {
-    id: i64,
-    symbol: String,
-    transaction_type: String,
-    date: NaiveDate,
-    quantity: Option<f64>,
-    price: Option<f64>,
-    amount: Option<f64>,
-    brokerage: Option<f64>,
-    notes: Option<String>,
-    created_at: String,
-}
-
 #[derive(Debug)]
 struct DividendEvent {
+    #[allow(dead_code)] // set for Debug/log symmetry; storage passes the symbol separately
     symbol: String,
     ex_date: NaiveDate,
     payment_date: Option<NaiveDate>,
     record_date: Option<NaiveDate>,
     amount: f64,
     fetched_at: String,
-}
-
-#[allow(dead_code)] // symbol kept for Debug output symmetry with the API binary
-#[derive(Debug)]
-struct DividendPayment {
-    symbol: String,
-    ex_date: NaiveDate,
-    payment_date: Option<NaiveDate>,
-    amount_per_share: f64,
-    shares_held: f64,
-    total_payment: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +39,14 @@ struct YahooChart {
 
 #[derive(Debug, Deserialize)]
 struct YahooResult {
+    meta: Option<YahooResultMeta>,
     events: Option<YahooEvents>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooResultMeta {
+    /// Exchange UTC offset in seconds — needed to date events correctly
+    gmtoffset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,33 +121,43 @@ async fn run_dividend_check(client: &Client, db_path: &PathBuf) -> anyhow::Resul
             Ok(ev) => ev,
             Err(err) => {
                 log::error!("Dividend fetch failed for {}: {}", symbol, err);
-                let _ = insert_event_log(&db_path, "error", "dividend_fetch", "dividends_daemon", Some(&symbol), &format!("Fetch error: {}", err));
+                let _ = insert_event_log(db_path, "error", "dividend_fetch", "dividends_daemon", Some(&symbol), &format!("Fetch error: {}", err));
                 continue;
             }
         };
 
         if events.is_empty() {
             log::info!("No dividend events found for {}", symbol);
-            let _ = insert_event_log(&db_path, "info", "dividend_fetch", "dividends_daemon", Some(&symbol), "No dividend events found");
+            let _ = insert_event_log(db_path, "info", "dividend_fetch", "dividends_daemon", Some(&symbol), "No dividend events found");
             continue;
         }
 
         store_dividend_events(db_path, &symbol, &events)?;
 
-        let symbol_transactions: Vec<HoldingTransaction> = holdings
+        let symbol_transactions: Vec<PortfolioTx> = holdings
             .iter()
             .filter(|tx| tx.symbol == symbol)
             .cloned()
             .collect();
 
         let payments = calculate_dividend_payments(&symbol_transactions, &events);
-        print_dividend_payments(&symbol, &payments);
+        print_dividend_payments(&symbol, &payments, &events);
     }
 
     Ok(())
 }
 
-fn print_dividend_payments(symbol: &str, payments: &[DividendPayment]) {
+/// Shares-held and payment math live in stocks::portfolio (shared with the
+/// API); this only adapts the daemon's event type to (ex_date, amount) pairs.
+fn calculate_dividend_payments(transactions: &[PortfolioTx], events: &[DividendEvent]) -> Vec<ImpliedDividendPayment> {
+    let pairs: Vec<(String, f64)> = events
+        .iter()
+        .map(|e| (e.ex_date.format("%Y-%m-%d").to_string(), e.amount))
+        .collect();
+    portfolio::implied_dividend_payments(transactions, &pairs)
+}
+
+fn print_dividend_payments(symbol: &str, payments: &[ImpliedDividendPayment], events: &[DividendEvent]) {
     if payments.is_empty() {
         log::info!("No eligible dividend payments found for {}", symbol);
         return;
@@ -172,13 +165,14 @@ fn print_dividend_payments(symbol: &str, payments: &[DividendPayment]) {
 
     println!("\nDividend payment summary for {}:", symbol);
     for payment in payments {
+        let payment_date = events
+            .iter()
+            .find(|e| e.ex_date.format("%Y-%m-%d").to_string() == payment.ex_date)
+            .and_then(|e| e.payment_date);
         println!(
             "  Ex-date: {} | Payment: {} | Rate: ${:.4} | Shares: {:.2} | Total: ${:.2}",
             payment.ex_date,
-            payment
-                .payment_date
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "n/a".to_string()),
+            payment_date.map(|d| d.to_string()).unwrap_or_else(|| "n/a".to_string()),
             payment.amount_per_share,
             payment.shares_held,
             payment.total_payment,
@@ -186,34 +180,26 @@ fn print_dividend_payments(symbol: &str, payments: &[DividendPayment]) {
     }
 }
 
-fn load_holdings_transactions(db_path: &PathBuf) -> anyhow::Result<Vec<HoldingTransaction>> {
+fn load_holdings_transactions(db_path: &PathBuf) -> anyhow::Result<Vec<PortfolioTx>> {
     let conn = open_db(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at
+        "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage
          FROM holdings_transactions
          ORDER BY date ASC, id ASC",
     )?;
 
     let rows = stmt.query_map([], |row| {
-        let date_str: String = row.get(3)?;
-        let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                Type::Text,
-                Box::new(err),
-            )
-        })?;
-        Ok(HoldingTransaction {
+        Ok(PortfolioTx {
             id: row.get(0)?,
             symbol: row.get(1)?,
-            transaction_type: row.get(2)?,
-            date,
+            tx_type: TxType::parse(&row.get::<_, String>(2)?),
+            date: row.get(3)?,
             quantity: row.get(4)?,
             price: row.get(5)?,
+            native_price: None,
             amount: row.get(6)?,
             brokerage: row.get(7)?,
-            notes: row.get(8)?,
-            created_at: row.get(9)?,
+            dividends_total: 0.0,
         })
     })?;
 
@@ -239,8 +225,13 @@ async fn fetch_dividend_events(client: &Client, symbol: &str) -> anyhow::Result<
     let now = Utc::now().to_rfc3339();
     let mut events = Vec::new();
 
-    if let Some(events_payload) = result.events {
-        if let Some(dividends) = events_payload.dividends {
+    // Yahoo stamps dividend events at the market open; for exchanges ahead
+    // of UTC (e.g. ASX during daylight saving) the UTC date is one day
+    // early, so dates are taken in exchange time: UTC + meta.gmtoffset.
+    let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset).unwrap_or(0);
+
+    if let Some(events_payload) = result.events
+        && let Some(dividends) = events_payload.dividends {
             for entry in dividends.values() {
                 let amount = entry.amount.unwrap_or(0.0);
                 if amount <= 0.0 {
@@ -256,15 +247,15 @@ async fn fetch_dividend_events(client: &Client, symbol: &str) -> anyhow::Result<
 
                 let event = DividendEvent {
                     symbol: symbol.to_string(),
-                    ex_date: Utc.timestamp_opt(ex_date, 0)
+                    ex_date: Utc.timestamp_opt(ex_date + gmtoffset, 0)
                         .single()
                         .ok_or_else(|| anyhow::anyhow!("Invalid ex-date timestamp {}", ex_date))?
                         .date_naive(),
                     payment_date: payment_date
-                        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+                        .and_then(|ts| Utc.timestamp_opt(ts + gmtoffset, 0).single())
                         .map(|dt| dt.date_naive()),
                     record_date: record_date
-                        .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+                        .and_then(|ts| Utc.timestamp_opt(ts + gmtoffset, 0).single())
                         .map(|dt| dt.date_naive()),
                     amount,
                     fetched_at: now.clone(),
@@ -272,51 +263,9 @@ async fn fetch_dividend_events(client: &Client, symbol: &str) -> anyhow::Result<
                 events.push(event);
             }
         }
-    }
 
     events.sort_by_key(|event| event.ex_date);
     Ok(events)
-}
-
-fn calculate_dividend_payments(
-    transactions: &[HoldingTransaction],
-    events: &[DividendEvent],
-) -> Vec<DividendPayment> {
-    let mut payments = Vec::new();
-
-    for event in events {
-        let shares_held = calculate_shares_on_date(transactions, event.ex_date);
-        let total_payment = shares_held * event.amount;
-
-        if shares_held > 0.0 {
-            payments.push(DividendPayment {
-                symbol: event.symbol.clone(),
-                ex_date: event.ex_date,
-                payment_date: event.payment_date,
-                amount_per_share: event.amount,
-                shares_held,
-                total_payment,
-            });
-        }
-    }
-
-    payments
-}
-
-fn calculate_shares_on_date(transactions: &[HoldingTransaction], date: NaiveDate) -> f64 {
-    let mut shares = 0.0;
-    for tx in transactions {
-        if tx.date > date {
-            break;
-        }
-
-        match tx.transaction_type.as_str() {
-            "purchase" => shares += tx.quantity.unwrap_or(0.0),
-            "sale" => shares -= tx.quantity.unwrap_or(0.0),
-            _ => {}
-        }
-    }
-    shares.max(0.0)
 }
 
 fn init_db(path: &PathBuf) -> anyhow::Result<()> {
@@ -400,4 +349,99 @@ fn insert_event_log(
         params![now, level, source, event_type, symbol, details],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// gmtoffset must survive deserialisation of the dividends payload —
+    /// ASX ex-dividend dates are stamped at the market open (23:00 UTC the
+    /// previous day during daylight saving) and shift a day early without it.
+    #[test]
+    fn dividend_chart_response_parses_gmtoffset() {
+        let json = r#"{
+            "chart": {
+                "result": [{
+                    "meta": { "gmtoffset": 39600 },
+                    "events": {
+                        "dividends": {
+                            "1767564000": { "amount": 0.44, "date": 1767564000 }
+                        }
+                    }
+                }]
+            }
+        }"#;
+        let payload: YahooChartResponse = serde_json::from_str(json).unwrap();
+        let result = payload.chart.result.unwrap().into_iter().next().unwrap();
+        let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset).unwrap_or(0);
+        assert_eq!(gmtoffset, 39600);
+        let ts = result.events.unwrap().dividends.unwrap().values().next().unwrap().date.unwrap();
+        // 1767564000 = 2026-01-04 22:00 UTC = 2026-01-05 09:00 AEDT: the
+        // ex-date must land on the Sydney trading day, not the UTC day.
+        let ex_date = Utc.timestamp_opt(ts + gmtoffset, 0).single().unwrap().date_naive();
+        assert_eq!(ex_date, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap());
+    }
+
+    /// End-to-end through the daemon's own load path: seed a temp DB, load
+    /// transactions as the daemon does, and assert the computed payments
+    /// match the shared engine's hand-checked numbers — the same maths the
+    /// API reports, now from one definition.
+    #[test]
+    fn daemon_payment_totals_match_the_shared_engine() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = PathBuf::from(file.path());
+        init_db(&db_path).unwrap();
+
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE holdings_transactions (
+                id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                transaction_type TEXT NOT NULL,
+                date TEXT NOT NULL,
+                quantity REAL,
+                price REAL,
+                amount REAL,
+                brokerage REAL,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, created_at)
+            VALUES (1, 'TST.AX', 'purchase', '2026-01-05', 100.0, 10.0, '2026-01-05T00:00:00Z'),
+                   (2, 'TST.AX', 'sale', '2026-03-02', 40.0, 12.0, '2026-03-02T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let holdings = load_holdings_transactions(&db_path).unwrap();
+        assert_eq!(holdings.len(), 2);
+
+        let events = vec![
+            DividendEvent {
+                symbol: "TST.AX".to_string(),
+                ex_date: NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(), // 100 shares held
+                payment_date: NaiveDate::from_ymd_opt(2026, 2, 15),
+                record_date: None,
+                amount: 0.50,
+                fetched_at: "2026-07-11T00:00:00Z".to_string(),
+            },
+            DividendEvent {
+                symbol: "TST.AX".to_string(),
+                ex_date: NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(), // 60 after the sale
+                payment_date: None,
+                record_date: None,
+                amount: 0.50,
+                fetched_at: "2026-07-11T00:00:00Z".to_string(),
+            },
+        ];
+
+        let payments = calculate_dividend_payments(&holdings, &events);
+        assert_eq!(payments.len(), 2);
+        assert!((payments[0].total_payment - 50.0).abs() < 1e-9, "100 shares × $0.50");
+        assert!((payments[1].shares_held - 60.0).abs() < 1e-9);
+        assert!((payments[1].total_payment - 30.0).abs() < 1e-9, "60 shares × $0.50");
+        let total: f64 = payments.iter().map(|p| p.total_payment).sum();
+        assert!((total - 80.0).abs() < 1e-9);
+    }
 }

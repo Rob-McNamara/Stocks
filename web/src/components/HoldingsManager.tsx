@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { apiClient, type PortfolioHolding, type PortfolioLot } from '../services/api'
+import { apiClient, type HoldingTransactionPayload, type PortfolioHolding, type PortfolioLot } from '../services/api'
 import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate } from '../utils/holdings'
 import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
@@ -72,7 +72,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [fxLoading, setFxLoading] = useState(false)
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, string>>({})
   const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
-  const prefillJustApplied = useRef(false)
+  // Symbol whose form values came from a watchlist prefill. While the form
+  // still shows that symbol, the per-symbol pre-population effect must not
+  // overwrite the prefilled sector/custom fields — including when the
+  // holdings symbol fields finish loading after the prefill was applied.
+  const prefillAppliedSymbol = useRef<string | null>(null)
   // Symbol that arrived via "Move to Holdings" — the watchlist entry is only
   // removed (via onPrefillSaved) once a transaction for it is actually saved.
   const prefillPendingSymbol = useRef<string | null>(null)
@@ -86,7 +90,8 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [sectorOptions, setSectorOptions] = useState<string[]>([...SECTORS])
   const [editCardNotes, setEditCardNotes] = useState('')
   const [editCardFields, setEditCardFields] = useState<Record<string, string>>({})
-  const [editingId, setEditingId] = useState<number | null>(null)
+  // Server-driven currency list from /api/meta; static list is the offline fallback
+  const [currencyOptions, setCurrencyOptions] = useState<string[]>([...SUPPORTED_CURRENCIES])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -98,7 +103,6 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   // Pre-fill form when navigating from watchlist
   useEffect(() => {
     if (!prefill) return
-    setEditingId(null)
     setSymbol(prefill.symbol)
     setTransactionType('purchase')
     setDate(new Date().toISOString().slice(0, 10))
@@ -108,10 +112,11 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setAmount('')
     setBrokerage('')
     setNotes(prefill.notes ?? '')
-    // Map watchlist custom fields to holdings custom fields by matching key names
+    // Map watchlist custom fields to holdings custom fields by matching key
+    // names (built-in keys have dedicated inputs and are handled below)
     const mappedFields: Record<string, string> = {}
     if (prefill.customFields) {
-      const holdingsKeys = new Set([...holdingsFieldDefs.map((d) => d.key), 'stop_loss'])
+      const holdingsKeys = new Set(holdingsFieldDefs.map((d) => d.key))
       for (const [key, value] of Object.entries(prefill.customFields)) {
         if (holdingsKeys.has(key) && value) {
           mappedFields[key] = value
@@ -121,38 +126,38 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setCustomFieldValues(mappedFields)
     // Carry the watchlist sector across to the holding
     setSector(prefill.customFields?.['sector'] ?? '')
-    // If stop_loss came through prefill, also set it as a symbol-level field
-    if (prefill.customFields?.['stop_loss']) {
-      const updated = { ...holdingsSymbolFields }
-      if (!updated[prefill.symbol]) updated[prefill.symbol] = {}
-      updated[prefill.symbol]['stop_loss'] = prefill.customFields['stop_loss']
-      setHoldingsSymbolFields(updated)
-      apiClient.updateHoldingsSymbolFields(prefill.symbol, null, { stop_loss: prefill.customFields['stop_loss'] }).catch(() => {})
-    }
-    prefillJustApplied.current = true
+    // Carry the watchlist stop loss into the dedicated Stop Loss input so it
+    // is visible and editable; it's persisted as a symbol-level field when
+    // the transaction is saved (like any manually entered stop loss).
+    setStopLossPrice(prefill.customFields?.['stop_loss'] ?? '')
+    setTrailingSellPct('')
+    setTrailingSellDate('')
+    prefillAppliedSymbol.current = prefill.symbol.trim().toUpperCase()
     prefillPendingSymbol.current = prefill.symbol.trim().toUpperCase()
     onPrefillConsumed?.()
   }, [prefill])
 
   // Auto-detect currency from symbolInfo when adding a new transaction
   useEffect(() => {
-    if (editingId !== null) return // don't override currency when editing
     const detected = symbolInfo[symbol]?.currency?.toUpperCase()
-    if (detected && detected !== 'AUD' && SUPPORTED_CURRENCIES.includes(detected)) {
+    if (detected && detected !== 'AUD' && currencyOptions.includes(detected)) {
       setCurrency(detected)
     } else if (detected === 'AUD') {
       setCurrency('AUD')
     }
-  }, [symbol, symbolInfo])
+  }, [symbol, symbolInfo, currencyOptions])
 
   // Pre-populate custom fields from per-symbol values when entering a new transaction
   useEffect(() => {
-    if (editingId !== null) return
-    if (prefillJustApplied.current) {
-      prefillJustApplied.current = false
-      return
+    const sym = symbol.trim().toUpperCase()
+    if (prefillAppliedSymbol.current) {
+      // The prefilled values win while their symbol is in the form. An empty
+      // symbol is the render before the prefill's setSymbol lands (or a form
+      // reset) — not a user edit, so keep the guard armed through it.
+      if (prefillAppliedSymbol.current === sym || sym === '') return
+      prefillAppliedSymbol.current = null
     }
-    const symFields = holdingsSymbolFields[symbol.trim().toUpperCase()]
+    const symFields = holdingsSymbolFields[sym]
     if (symFields) {
       // Built-in symbol-level fields (_notes, stop_loss, sector, ...) have
       // dedicated inputs — only user-defined fields go into the custom inputs.
@@ -166,7 +171,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setCustomFieldValues({})
       setSector('')
     }
-  }, [symbol, holdingsSymbolFields, editingId])
+  }, [symbol, holdingsSymbolFields])
 
   useEffect(() => {
     if (currency === 'AUD') {
@@ -205,6 +210,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       onLoading(true)
       apiClient.getMeta().then((m) => {
         if (m.sectors?.length) setSectorOptions(m.sectors)
+        if (m.currencies?.length) setCurrencyOptions(m.currencies)
         setHoldingsFieldDefs(((m.holdings_custom_fields ?? []) as HoldingsFieldDef[]).filter((d) => !BUILT_IN_HOLDINGS_KEYS.includes(d.key)))
       }).catch(() => {})
       const data = await apiClient.getHoldings()
@@ -240,7 +246,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       return
     }
 
-    const payload: any = {
+    const payload: HoldingTransactionPayload = {
       symbol: symbol.trim(),
       transaction_type: transactionType,
       date,
@@ -262,7 +268,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         return
       }
 
-      if (transactionType === 'sale' && editingId === null) {
+      if (transactionType === 'sale') {
         const sym = symbol.trim().toUpperCase()
         const netShares: Record<string, number> = {}
         transactions.forEach((tx) => {
@@ -313,12 +319,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       // A stock arriving via "Move to Holdings" is recorded atomically —
       // the server creates the transaction and removes the watchlist entries
       // in one call.
-      const fromWatchlist = !editingId && prefillPendingSymbol.current === symbol.trim().toUpperCase()
-      const result = editingId
-        ? await apiClient.updateHoldingTransaction(editingId, payload)
-        : fromWatchlist
-          ? (await apiClient.addHoldingFromWatchlist(payload)).transaction
-          : await apiClient.addHoldingTransaction(payload)
+      const fromWatchlist = prefillPendingSymbol.current === symbol.trim().toUpperCase()
+      const result = fromWatchlist
+        ? (await apiClient.addHoldingFromWatchlist(payload)).transaction
+        : await apiClient.addHoldingTransaction(payload)
 
       // Save built-in symbol-level fields if provided
       const builtInUpdates: Record<string, string> = {}
@@ -337,7 +341,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       onTransactionsChanged?.()
       // If this symbol came from "Move to Holdings", the watchlist entry can
       // now be removed safely — the holding actually exists.
-      if (!editingId && prefillPendingSymbol.current && prefillPendingSymbol.current === result.symbol) {
+      if (prefillPendingSymbol.current && prefillPendingSymbol.current === result.symbol) {
         onPrefillSaved?.(result.symbol)
         prefillPendingSymbol.current = null
       }
@@ -345,7 +349,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       const refreshed = await apiClient.getHoldings()
       setTransactions(refreshed)
       await loadPortfolioData()
-      setSuccess(editingId ? 'Transaction updated successfully' : 'Transaction recorded successfully')
+      setSuccess('Transaction recorded successfully')
+      // The prefill is consumed by the save — later manual entry of the same
+      // symbol should pre-populate from its stored fields again
+      prefillAppliedSymbol.current = null
       setSymbol('')
       setQuantity('')
       setPrice('')
@@ -361,7 +368,6 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setCurrency('AUD')
       setFxRate(null)
       setFxRateDate(null)
-      setEditingId(null)
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save transaction')
@@ -369,26 +375,6 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setLoading(false)
       onLoading(false)
     }
-  }
-
-  const cancelEditing = () => {
-    setEditingId(null)
-    setSymbol('')
-    setTransactionType('purchase')
-    setDate(new Date().toISOString().slice(0, 10))
-    setQuantity('')
-    setPrice('')
-    setAmount('')
-    setBrokerage('')
-    setNotes('')
-    setCustomFieldValues({})
-    setStopLossPrice('')
-    setTrailingSellPct('')
-    setTrailingSellDate('')
-    setSector('')
-    setCurrency('AUD')
-    setFxRate(null)
-    setFxRateDate(null)
   }
 
   const refreshHoldingPrices = async () => {
@@ -615,7 +601,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   disabled={loading}
                   style={{ minWidth: 80 }}
                 >
-                  {SUPPORTED_CURRENCIES.map((c) => (
+                  {currencyOptions.map((c) => (
                     <option key={c} value={c}>{c}</option>
                   ))}
                 </select>
@@ -732,13 +718,8 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
               title="Date trailing sell was placed"
             />
             <button type="submit" className="btn btn-primary" disabled={loading}>
-              {loading ? 'Saving...' : editingId ? 'Save Changes' : 'Record Transaction'}
+              {loading ? 'Saving...' : 'Record Transaction'}
             </button>
-            {editingId !== null && (
-              <button type="button" className="btn btn-outline btn-small" onClick={cancelEditing} disabled={loading}>
-                Cancel
-              </button>
-            )}
           </div>
           {holdingsFieldDefs.filter((def) => def.actions.includes(transactionType)).length > 0 && (
             <div className="form-group" style={{ flexWrap: 'wrap' }}>
@@ -796,8 +777,8 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 currentPrice={sel?.native_current_price ?? null}
                 currentVolume={sel?.volume ?? null}
                 currentPriceDate={sel?.price_date ?? null}
-                markerPrice={(() => { const v = holdingsSymbolFields[selectedChartSymbol]?.['stop_loss']; return v ? parseFloat(v) : null })()}
-                markerLabel="Stop Loss"
+                markerPrice={sel?.stop_loss ?? null}
+                markerLabel={sel?.is_trailing_sell ? 'Trailing Sell' : 'Stop Loss'}
                 markerMode="stoploss"
               />
             )

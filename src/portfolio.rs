@@ -147,13 +147,61 @@ pub fn symbol_dividends(sorted: &[PortfolioTx]) -> f64 {
     for tx in sorted {
         if tx.dividends_total > 0.0 {
             from_total = tx.dividends_total;
-        } else if tx.tx_type == TxType::Dividend {
-            if let Some(amount) = tx.amount {
+        } else if tx.tx_type == TxType::Dividend
+            && let Some(amount) = tx.amount {
                 manual += amount;
             }
-        }
     }
     if from_total > 0.0 { from_total } else { manual }
+}
+
+/// Net shares held at the close of `date` (YYYY-MM-DD): purchases add,
+/// sales subtract, applied in (date, id) order and clamped at zero.
+/// Dividend transactions don't change the share count. A purchase on the
+/// ex-date itself counts as held.
+pub fn shares_on_date(txs: &[PortfolioTx], date: &str) -> f64 {
+    let sorted = sort_transactions(txs);
+    let mut shares = 0.0;
+    for tx in &sorted {
+        if tx.date.as_str() > date {
+            break;
+        }
+        match tx.tx_type {
+            TxType::Purchase => shares += tx.quantity.unwrap_or(0.0),
+            TxType::Sale => shares -= tx.quantity.unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    shares.max(0.0)
+}
+
+/// A payment implied by a per-share dividend event.
+#[derive(Debug, Clone)]
+pub struct ImpliedDividendPayment {
+    /// YYYY-MM-DD ex-dividend date
+    pub ex_date: String,
+    pub amount_per_share: f64,
+    pub shares_held: f64,
+    pub total_payment: f64,
+}
+
+/// Payments implied by per-share dividend events, given as
+/// `(ex_date, amount_per_share)` pairs: shares held at each ex-date ×
+/// amount. Events on dates with no shares held yield no payment.
+pub fn implied_dividend_payments(txs: &[PortfolioTx], events: &[(String, f64)]) -> Vec<ImpliedDividendPayment> {
+    let sorted = sort_transactions(txs);
+    events
+        .iter()
+        .filter_map(|(ex_date, amount)| {
+            let shares_held = shares_on_date(&sorted, ex_date);
+            (shares_held > 0.0).then(|| ImpliedDividendPayment {
+                ex_date: ex_date.clone(),
+                amount_per_share: *amount,
+                shares_held,
+                total_payment: shares_held * amount,
+            })
+        })
+        .collect()
 }
 
 /// Full per-symbol position: remaining lots plus the sold-side aggregates,
@@ -323,15 +371,14 @@ pub fn get_active_holding_symbols(transactions: &[PortfolioTx]) -> Vec<String> {
             order.push(tx.symbol.clone());
         }
         let entry = net.entry(tx.symbol.clone()).or_insert(0.0);
-        if let Some(qty) = tx.quantity {
-            if qty != 0.0 {
+        if let Some(qty) = tx.quantity
+            && qty != 0.0 {
                 match tx.tx_type {
                     TxType::Purchase => *entry += qty,
                     TxType::Sale => *entry -= qty,
                     _ => {}
                 }
             }
-        }
     }
     order.into_iter().filter(|s| net.get(s).copied().unwrap_or(0.0) > 0.0).collect()
 }
@@ -1069,5 +1116,51 @@ mod tests {
         assert!(close(entries[1].dividends, 45.0));
         assert!(close(entries[0].realised_pl, 15.0));
         assert!(close(entries[1].realised_pl, 45.0));
+    }
+
+    // -------------------------------------------------------------------------
+    // shares_on_date / implied_dividend_payments — the dividend-eligibility
+    // ledger walk shared by the API and the dividends daemon.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn shares_on_date_walks_the_ledger() {
+        let txs = vec![
+            make_tx(1, "purchase", "2026-01-05", Some(100.0), Some(10.0)),
+            make_tx(2, "sale", "2026-03-02", Some(40.0), Some(12.0)),
+            make_tx(3, "purchase", "2026-05-01", Some(10.0), Some(11.0)),
+        ];
+        assert!(close(shares_on_date(&txs, "2026-01-04"), 0.0), "before first purchase");
+        assert!(close(shares_on_date(&txs, "2026-01-05"), 100.0), "the purchase day itself counts");
+        assert!(close(shares_on_date(&txs, "2026-02-01"), 100.0));
+        assert!(close(shares_on_date(&txs, "2026-03-02"), 60.0), "sale applies on its day");
+        assert!(close(shares_on_date(&txs, "2026-06-01"), 70.0));
+    }
+
+    #[test]
+    fn shares_on_date_clamps_oversold_ledgers_at_zero() {
+        let txs = vec![
+            make_tx(1, "purchase", "2026-01-05", Some(10.0), Some(10.0)),
+            make_tx(2, "sale", "2026-02-01", Some(15.0), Some(12.0)), // recorded over-sell
+        ];
+        assert!(close(shares_on_date(&txs, "2026-03-01"), 0.0));
+    }
+
+    #[test]
+    fn implied_payments_skip_ineligible_ex_dates() {
+        let txs = vec![
+            make_tx(1, "purchase", "2026-01-05", Some(100.0), Some(10.0)),
+            make_tx(2, "sale", "2026-03-02", Some(100.0), Some(12.0)),
+        ];
+        let events = vec![
+            ("2026-01-01".to_string(), 0.50), // before purchase — no shares
+            ("2026-02-01".to_string(), 0.50), // 100 shares held
+            ("2026-04-01".to_string(), 0.50), // fully sold — no shares
+        ];
+        let payments = implied_dividend_payments(&txs, &events);
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].ex_date, "2026-02-01");
+        assert!(close(payments[0].shares_held, 100.0));
+        assert!(close(payments[0].total_payment, 50.0));
     }
 }

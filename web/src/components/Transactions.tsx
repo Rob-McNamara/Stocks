@@ -63,6 +63,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   // silently rewrites the historical rate.
   const editFxSeed = useRef<{ currency: string; date: string; rate: number | null } | null>(null)
   const [holdingsFieldDefs, setHoldingsFieldDefs] = useState<HoldingsFieldDef[]>([])
+  // Server-driven currency list from /api/meta; static list is the offline fallback
+  const [currencyOptions, setCurrencyOptions] = useState<string[]>([...SUPPORTED_CURRENCIES])
 
   const loadLedger = async () => {
     const data = await apiClient.getTransactionsLedger()
@@ -80,6 +82,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           apiClient.getMeta(),
         ])
         setHoldingsFieldDefs((meta.holdings_custom_fields ?? []) as HoldingsFieldDef[])
+        if (meta.currencies?.length) setCurrencyOptions(meta.currencies)
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load transactions')
       } finally {
@@ -370,7 +373,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                         value={editing.currency}
                         onChange={(e) => setEditing({ ...editing, currency: e.target.value })}
                       >
-                        {SUPPORTED_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                        {currencyOptions.map((c) => <option key={c} value={c}>{c}</option>)}
                       </select>
                     </div>
                   </div>

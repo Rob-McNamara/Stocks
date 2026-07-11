@@ -187,7 +187,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
               <tbody>
                 {worstHoldings.map((item) => (
                   <tr key={item.symbol}>
-                    <td><strong>{item.symbol}</strong></td>
+                    <td>{symbolButton(item.symbol, 'holdings')}</td>
                     <td>${item.price.toFixed(2)}</td>
                     <td>${item.sma150.toFixed(2)}</td>
                     <td style={{ color: item.pct_diff >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
@@ -275,7 +275,12 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
                           <span style={{ fontSize: 10, color: '#e65100', marginLeft: 4 }}>{item.currency.toUpperCase()}</span>
                         )}
                       </td>
-                      <td>${item.field_value.toFixed(2)}</td>
+                      <td>
+                        ${item.field_value.toFixed(2)}
+                        {item.is_trailing && (
+                          <span title="Trailing sell trigger" style={{ fontSize: 10, color: '#7a4fd0', marginLeft: 4, fontWeight: 600 }}>T</span>
+                        )}
+                      </td>
                       <td style={{ color: item.pct_diff >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
                         {item.pct_diff >= 0 ? '+' : ''}{item.pct_diff.toFixed(2)}%
                       </td>

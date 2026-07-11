@@ -215,8 +215,8 @@ async fn prepare_holding_payload(
                 .ok()
             })
             .unwrap_or(0.0);
-        if let Some(qty) = payload.quantity {
-            if qty > held + 1e-9 {
+        if let Some(qty) = payload.quantity
+            && qty > held + 1e-9 {
                 return Err(HttpResponse::Conflict().json(serde_json::json!({
                     "error": {
                         "code": "oversell_confirmation_required",
@@ -225,7 +225,6 @@ async fn prepare_holding_payload(
                     }
                 })));
             }
-        }
     }
 
     Ok(())
@@ -256,6 +255,89 @@ fn err_not_found(message: impl Into<String>) -> HttpResponse {
 
 fn err_unprocessable(message: impl Into<String>) -> HttpResponse {
     api_error(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, "unprocessable", message)
+}
+
+/// Constant-time token comparison: XOR-folds every byte instead of
+/// returning at the first mismatch, so response timing doesn't reveal
+/// how much of a guessed token was correct. The length check leaks only
+/// the token's length.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The bearer-token gate. No configured token means auth is disabled.
+/// /api/health and /api/openapi.json stay reachable without a token so
+/// clients can probe and discover the API; OPTIONS passes so CORS
+/// preflights (which cannot carry credentials) succeed.
+fn is_request_authorized(req: &actix_web::dev::ServiceRequest, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else { return true };
+    req.method() == actix_web::http::Method::OPTIONS
+        || req.path() == "/api/health"
+        || req.path() == "/api/openapi.json"
+        || req
+            .headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(|t| constant_time_eq(t, expected))
+            .unwrap_or(false)
+}
+
+/// Rewrite /api/v1/* to /api/* (query string preserved) so the versioned
+/// surface is an alias of the unversioned one. Native clients pin the
+/// stable v1 prefix; breaking changes get a new version.
+fn rewrite_v1_alias(req: &mut actix_web::dev::ServiceRequest) {
+    if let Some(rest) = req.path().strip_prefix("/api/v1/").map(str::to_owned) {
+        let path_and_query = if req.query_string().is_empty() {
+            format!("/api/{}", rest)
+        } else {
+            format!("/api/{}?{}", rest, req.query_string())
+        };
+        if let Ok(uri) = path_and_query.parse::<actix_web::http::Uri>() {
+            req.head_mut().uri = uri.clone();
+            // The router matches against the cached path object, not
+            // head.uri — update both (as NormalizePath does).
+            req.match_info_mut().get_mut().update(&uri);
+        }
+    }
+}
+
+/// Per-symbol metadata from the symbol_info table:
+/// (instrument_type, long_name, currency)
+type SymbolInfo = (Option<String>, Option<String>, Option<String>);
+
+/// A dividend_events row: (symbol, ex_date, payment_date, amount)
+type DividendEventRow = (String, String, Option<String>, f64);
+
+/// Tracks when each symbol's daily history was last checked against Yahoo.
+/// The DB is always read fresh; only the Yahoo *supplement attempt* is
+/// skipped inside the window, so simultaneous heavy endpoints (portfolio
+/// overview + enriched watchlist) don't re-fetch the same data.
+static HISTORY_CHECKED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+const HISTORY_CHECK_TTL_SECS: u64 = 600;
+
+fn history_recently_checked(symbol: &str) -> bool {
+    let map = HISTORY_CHECKED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(symbol)
+        .map(|t| t.elapsed().as_secs() < HISTORY_CHECK_TTL_SECS)
+        .unwrap_or(false)
+}
+
+fn mark_history_checked(symbol: &str) {
+    let mut map = HISTORY_CHECKED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(symbol.to_string(), std::time::Instant::now());
+    // Keep the map bounded even with pathological symbol churn
+    if map.len() > 2048 {
+        map.retain(|_, t| t.elapsed().as_secs() < HISTORY_CHECK_TTL_SECS);
+    }
 }
 
 /// Open the SQLite database with WAL mode and a busy timeout so the API,
@@ -324,8 +406,7 @@ async fn add_watchlist_symbol(
                 if let Ok(client) = Client::builder()
                     .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                     .build()
-                {
-                    if let Ok(meta) = fetch_current_price(&client, &sym_clone).await {
+                    && let Ok(meta) = fetch_current_price(&client, &sym_clone).await {
                         let _ = store_symbol_info(
                             &db_path_clone,
                             &sym_clone,
@@ -334,7 +415,6 @@ async fn add_watchlist_symbol(
                             meta.currency.as_deref(),
                         );
                     }
-                }
             });
             HttpResponse::Ok().json(row)
         }
@@ -643,16 +723,15 @@ async fn fetch_fx_rate_on_date(currency: &str, target_date: NaiveDate) -> Result
     // Find the entry closest to and on-or-before the target date
     let target_str = target_date.format("%Y-%m-%d").to_string();
     let mut best: Option<(f64, String)> = None;
+    let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
     for (i, ts) in timestamps.iter().enumerate() {
-        let date_str = Utc.timestamp_opt(*ts, 0)
-            .single()
-            .map(|dt| dt.format("%Y-%m-%d").to_string())
+        let date_str = yahoo_local_date(*ts, gmtoffset)
+            .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
-        if date_str <= target_str {
-            if let Some(Some(rate)) = closes.get(i) {
+        if date_str <= target_str
+            && let Some(Some(rate)) = closes.get(i) {
                 best = Some((*rate, date_str));
             }
-        }
     }
     best.ok_or_else(|| format!("No FX rate found on or before {}", target_str))
 }
@@ -918,20 +997,18 @@ async fn update_holdings_symbol_fields(
         Err(err) => return err_internal(err.to_string()),
     };
     // Save notes as a special field
-    if let Some(ref notes) = payload.notes {
-        if let Err(err) = conn.execute(
+    if let Some(ref notes) = payload.notes
+        && let Err(err) = conn.execute(
             "INSERT OR REPLACE INTO holdings_symbol_fields (symbol, field_key, value) VALUES (?1, '_notes', ?2)",
             params![symbol, notes],
         ) {
             let _ = insert_event_log(&db_path, "error", "holdings_symbol_fields_update", "api", Some(&symbol), &format!("Failed to save notes: {}", err));
             return err_internal(err.to_string());
         }
-    }
-    if let Some(ref fields) = payload.custom_fields {
-        if let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
+    if let Some(ref fields) = payload.custom_fields
+        && let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
             return err_internal(err);
         }
-    }
     HttpResponse::Ok().json("ok")
 }
 
@@ -1046,6 +1123,7 @@ struct YahooDivResponse {
 
 #[derive(Deserialize)]
 struct YahooDivResult {
+    meta: Option<YahooMeta>,
     events: Option<YahooDivEvents>,
 }
 
@@ -1089,8 +1167,8 @@ async fn fetch_dividend_events_for_symbol(client: &Client, symbol: &str) -> Resu
     let now = Utc::now().to_rfc3339();
     let mut events = Vec::new();
 
-    if let Some(ev) = result.events {
-        if let Some(dividends) = ev.dividends {
+    if let Some(ev) = result.events
+        && let Some(dividends) = ev.dividends {
             for entry in dividends.values() {
                 let amount = entry.amount.unwrap_or(0.0);
                 if amount <= 0.0 {
@@ -1099,19 +1177,11 @@ async fn fetch_dividend_events_for_symbol(client: &Client, symbol: &str) -> Resu
                 let ts = entry.ex_date.or(entry.date).ok_or_else(|| {
                     format!("Dividend entry missing date for {}", symbol)
                 })?;
-                let ex_date = Utc
-                    .timestamp_opt(ts, 0)
-                    .single()
-                    .ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?
-                    .date_naive();
-                let payment_date = entry
-                    .payment_date
-                    .and_then(|t| Utc.timestamp_opt(t, 0).single())
-                    .map(|dt| dt.date_naive());
-                let record_date = entry
-                    .record_date
-                    .and_then(|t| Utc.timestamp_opt(t, 0).single())
-                    .map(|dt| dt.date_naive());
+                let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
+                let ex_date = yahoo_local_date(ts, gmtoffset)
+                    .ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?;
+                let payment_date = entry.payment_date.and_then(|t| yahoo_local_date(t, gmtoffset));
+                let record_date = entry.record_date.and_then(|t| yahoo_local_date(t, gmtoffset));
                 events.push(DividendEvent {
                     symbol: symbol.to_string(),
                     ex_date,
@@ -1122,7 +1192,6 @@ async fn fetch_dividend_events_for_symbol(client: &Client, symbol: &str) -> Resu
                 });
             }
         }
-    }
 
     events.sort_by_key(|e| e.ex_date);
     Ok(events)
@@ -1218,6 +1287,7 @@ async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) 
         Err(err) => return DividendRefreshResult { updated: 0, errors: vec![err.to_string()] },
     };
 
+    let total = symbols.len();
     let mut updated = 0;
     let mut errors = Vec::new();
 
@@ -1234,20 +1304,15 @@ async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) 
         while let Some(joined) = set.join_next().await {
             let Ok((symbol, result)) = joined else { continue };
             match result {
-                Ok(events) => {
-                    let count = events.len();
-                    match store_dividend_events_for_symbol(db_path, &symbol, &events) {
-                        Ok(()) => {
-                            let details = format!("Stored {} dividend events", count);
-                            let _ = insert_event_log(db_path, "info", "dividend_fetch", "api", Some(&symbol), &details);
-                            updated += 1;
-                        }
-                        Err(err) => {
-                            let _ = insert_event_log(db_path, "error", "dividend_fetch", "api", Some(&symbol), &err);
-                            errors.push(format!("{}: {}", symbol, err));
-                        }
+                Ok(events) => match store_dividend_events_for_symbol(db_path, &symbol, &events) {
+                    Ok(()) => {
+                        updated += 1;
                     }
-                }
+                    Err(err) => {
+                        let _ = insert_event_log(db_path, "error", "dividend_fetch", "api", Some(&symbol), &err);
+                        errors.push(format!("{}: {}", symbol, err));
+                    }
+                },
                 Err(err) => {
                     let _ = insert_event_log(db_path, "error", "dividend_fetch", "api", Some(&symbol), &err);
                     errors.push(format!("{}: {}", symbol, err));
@@ -1255,6 +1320,18 @@ async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) 
             }
         }
     }
+
+    // One summary row instead of one info row per symbol — keeps event_log
+    // growth proportional to refreshes, not portfolio size. Errors still log
+    // per symbol above.
+    let _ = insert_event_log(
+        db_path,
+        "info",
+        "dividend_fetch",
+        "api",
+        None,
+        &format!("Dividend refresh complete: {}/{} symbols updated, {} error(s)", updated, total, errors.len()),
+    );
 
     DividendRefreshResult { updated, errors }
 }
@@ -1400,14 +1477,12 @@ async fn update_watchlist_symbol_lists(
 
     // Merge custom fields after the membership transaction (same semantics as
     // the single-row update endpoint)
-    if let Some(fields) = payload.custom_fields.as_ref() {
-        if let Ok(conn) = open_db(db_path.as_ref()) {
-            if let Err(err) = save_custom_fields(&conn, &symbol, fields) {
+    if let Some(fields) = payload.custom_fields.as_ref()
+        && let Ok(conn) = open_db(db_path.as_ref())
+            && let Err(err) = save_custom_fields(&conn, &symbol, fields) {
                 let _ = insert_event_log(&db_path, "error", "watchlist_update", "api", Some(&symbol), &err);
                 return err_internal(err);
             }
-        }
-    }
 
     match load_watchlist_symbols(&db_path, None) {
         Ok(rows) => {
@@ -1471,39 +1546,51 @@ async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl Responder 
         }))
         .collect();
 
-    if let Ok(conn) = open_db(db_path.as_ref()) {
-        if let Ok(mut stmt) = conn.prepare("SELECT symbol, ex_date, payment_date, amount FROM dividend_events ORDER BY ex_date DESC") {
-            if let Ok(event_rows) = stmt.query_map([], |row| {
+    let events_result = (|| -> Result<Vec<DividendEventRow>, String> {
+        let conn = open_db(db_path.as_ref()).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT symbol, ex_date, payment_date, amount FROM dividend_events ORDER BY ex_date DESC")
+            .map_err(|e| e.to_string())?;
+        let event_rows = stmt
+            .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, f64>(3)?))
-            }) {
-                for (symbol, ex_date, payment_date, amount) in event_rows.flatten() {
-                    let Some(first) = first_purchase.get(&symbol) else { continue };
-                    if ex_date < *first {
-                        continue;
-                    }
-                    if manual_dividend_keys.contains(&format!("{}|{}", symbol, ex_date)) {
-                        continue;
-                    }
-                    rows.push(serde_json::json!({
-                        "key": format!("div-{}-{}", symbol, ex_date),
-                        "id": serde_json::Value::Null,
-                        "symbol": symbol,
-                        "transaction_type": "dividend",
-                        "date": ex_date,
-                        "quantity": serde_json::Value::Null,
-                        "price": serde_json::Value::Null,
-                        "currency": "AUD",
-                        "original_price": serde_json::Value::Null,
-                        "fx_rate": serde_json::Value::Null,
-                        "amount": amount,
-                        "brokerage": serde_json::Value::Null,
-                        "notes": serde_json::Value::Null,
-                        "per_share": true,
-                        "payment_date": payment_date,
-                        "custom_fields": serde_json::json!({}),
-                    }));
+            })
+            .map_err(|e| e.to_string())?;
+        event_rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    })();
+    match events_result {
+        Ok(events) => {
+            for (symbol, ex_date, payment_date, amount) in events {
+                let Some(first) = first_purchase.get(&symbol) else { continue };
+                if ex_date < *first {
+                    continue;
                 }
+                if manual_dividend_keys.contains(&format!("{}|{}", symbol, ex_date)) {
+                    continue;
+                }
+                rows.push(serde_json::json!({
+                    "key": format!("div-{}-{}", symbol, ex_date),
+                    "id": serde_json::Value::Null,
+                    "symbol": symbol,
+                    "transaction_type": "dividend",
+                    "date": ex_date,
+                    "quantity": serde_json::Value::Null,
+                    "price": serde_json::Value::Null,
+                    "currency": "AUD",
+                    "original_price": serde_json::Value::Null,
+                    "fx_rate": serde_json::Value::Null,
+                    "amount": amount,
+                    "brokerage": serde_json::Value::Null,
+                    "notes": serde_json::Value::Null,
+                    "per_share": true,
+                    "payment_date": payment_date,
+                    "custom_fields": serde_json::json!({}),
+                }));
             }
+        }
+        Err(err) => {
+            // The ledger degrades to transactions-only — record why
+            let _ = insert_event_log(&db_path, "warn", "ledger_fetch", "api", None, &format!("Dividend events unavailable for ledger: {}", err));
         }
     }
 
@@ -1516,32 +1603,49 @@ struct RefreshQuery {
     force: Option<bool>,
 }
 
+/// Only one refresh may run at a time — a second caller gets a skip
+/// response instead of doubling the Yahoo traffic.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a completed refresh should stamp `last_full_refresh_at`.
+/// Stamp when the refresh achieved something, or when there was nothing to
+/// do — but a total failure (e.g. Yahoo down) must leave the stamp unset so
+/// the next attempt isn't debounced into a stale-data window.
+fn refresh_should_stamp(attempted_any: bool, did_any_work: bool) -> bool {
+    did_any_work || !attempted_any
+}
+
 /// One-call startup refresh: watchlist prices, holdings prices and dividends,
 /// debounced server-side so a client opening repeatedly doesn't hammer Yahoo.
 #[utoipa::path(post, path = "/api/v1/refresh", tag = "system", responses((status = 200, description = "Refresh all")))]
 #[post("/api/refresh")]
 async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<RefreshQuery>) -> impl Responder {
     const DEBOUNCE_SECS: i64 = 600;
+
     if query.force != Some(true) {
         let last = load_config(&db_path)
             .ok()
             .and_then(|c| c.into_iter().find(|i| i.key == "last_full_refresh_at").map(|i| i.value));
-        if let Some(last) = last {
-            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&last) {
-                if (Utc::now() - t.with_timezone(&Utc)).num_seconds() < DEBOUNCE_SECS {
+        if let Some(last) = last
+            && let Ok(t) = chrono::DateTime::parse_from_rfc3339(&last)
+                && (Utc::now() - t.with_timezone(&Utc)).num_seconds() < DEBOUNCE_SECS {
                     return HttpResponse::Ok().json(serde_json::json!({ "skipped": true, "last_refreshed_at": last }));
                 }
-            }
-        }
     }
-    if let Err(err) = upsert_config(&db_path, "last_full_refresh_at", &Utc::now().to_rfc3339()) {
-        let _ = insert_event_log(&db_path, "error", "refresh_all", "api", None, &err);
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .is_err()
+    {
+        return HttpResponse::Ok().json(serde_json::json!({ "skipped": true, "reason": "refresh_in_progress" }));
     }
 
     let mut errors: Vec<String> = Vec::new();
+    let mut watchlist_ok = 0;
+    let mut holdings_ok = 0;
 
     let watchlist_count = match fetch_watchlist_current_prices(&db_path, None).await {
         Ok(prices) => {
+            watchlist_ok = prices.iter().filter(|p| p.error.is_none()).count();
             errors.extend(prices.iter().filter_map(|p| p.error.clone()));
             prices.len()
         }
@@ -1557,6 +1661,7 @@ async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<RefreshQuery
     } else {
         match fetch_and_cache_current_prices(&db_path, &holding_symbols, "holdings_prices_updated_at").await {
             Ok(prices) => {
+                holdings_ok = prices.iter().filter(|p| p.error.is_none()).count();
                 errors.extend(prices.iter().filter_map(|p| p.error.clone()));
                 prices.len()
             }
@@ -1570,7 +1675,15 @@ async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<RefreshQuery
     let dividends = refresh_dividends_for_symbols(&db_path, holding_symbols).await;
     errors.extend(dividends.errors.clone());
 
-    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, dividends for {} symbols ({} error(s))", watchlist_count, holdings_count, dividends.updated, errors.len()));
+    let attempted_any = watchlist_count > 0 || holdings_count > 0;
+    let did_any_work = watchlist_ok > 0 || holdings_ok > 0 || dividends.updated > 0;
+    if refresh_should_stamp(attempted_any, did_any_work)
+        && let Err(err) = upsert_config(&db_path, "last_full_refresh_at", &Utc::now().to_rfc3339()) {
+            let _ = insert_event_log(&db_path, "error", "refresh_all", "api", None, &err);
+        }
+    REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, dividends for {} symbols ({} error(s))", watchlist_ok, holdings_ok, dividends.updated, errors.len()));
 
     HttpResponse::Ok().json(serde_json::json!({
         "skipped": false,
@@ -1694,8 +1807,8 @@ async fn post_stock_analysis(
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<String>>(4)?,
             )),
-        ) {
-            if let Some(price) = row.0 {
+        )
+            && let Some(price) = row.0 {
                 let mut line = format!("Current price: ${:.2}", price);
                 if let Some(chg) = row.1 { line.push_str(&format!(", change: {:.2}", chg)); }
                 if let Some(pct) = row.2 { line.push_str(&format!(" ({:.2}%)", pct)); }
@@ -1703,7 +1816,6 @@ async fn post_stock_analysis(
                 if let Some(ref date) = row.4 { line.push_str(&format!(", as of {}", date)); }
                 context_parts.push(line);
             }
-        }
         // Symbol info
         if let Ok(info) = conn.query_row(
             "SELECT instrument_type, long_name, currency FROM symbol_info WHERE symbol = ?1",
@@ -1733,19 +1845,17 @@ async fn post_stock_analysis(
         }
         // Custom fields (watchlist + holdings)
         let mut fields_stmt = conn.prepare("SELECT field_key, value FROM watchlist_symbol_fields WHERE symbol = ?1").ok();
-        if let Some(ref mut stmt) = fields_stmt {
-            if let Ok(rows) = stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+        if let Some(ref mut stmt) = fields_stmt
+            && let Ok(rows) = stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 let fields: Vec<String> = rows.filter_map(|r| r.ok()).map(|(k, v)| format!("{}: {}", k, v)).collect();
                 if !fields.is_empty() { context_parts.push(format!("Watchlist fields: {}", fields.join(", "))); }
             }
-        }
         let mut hf_stmt = conn.prepare("SELECT field_key, value FROM holdings_symbol_fields WHERE symbol = ?1").ok();
-        if let Some(ref mut stmt) = hf_stmt {
-            if let Ok(rows) = stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+        if let Some(ref mut stmt) = hf_stmt
+            && let Ok(rows) = stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 let fields: Vec<String> = rows.filter_map(|r| r.ok()).map(|(k, v)| format!("{}: {}", k, v)).collect();
                 if !fields.is_empty() { context_parts.push(format!("Holdings fields: {}", fields.join(", "))); }
             }
-        }
     }
 
     let system_prompt = format!(
@@ -1763,14 +1873,13 @@ async fn post_stock_analysis(
 
     // Save user message to history
     let now = Utc::now().to_rfc3339();
-    if let Some(last_msg) = payload.messages.last() {
-        if let Ok(conn) = open_db(db_path.as_ref()) {
+    if let Some(last_msg) = payload.messages.last()
+        && let Ok(conn) = open_db(db_path.as_ref()) {
             let _ = conn.execute(
                 "INSERT INTO stock_analysis_messages (symbol, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
                 params![symbol, last_msg.role, last_msg.content, now],
             );
         }
-    }
 
     let result = if provider == "openai" {
         call_openai_api(&client, &api_key, &model, &system_prompt, &payload.messages).await
@@ -1840,11 +1949,10 @@ async fn call_anthropic_api(
     let mut result_text = String::new();
     if let Some(content) = data["content"].as_array() {
         for block in content {
-            if block["type"] == "text" {
-                if let Some(text) = block["text"].as_str() {
+            if block["type"] == "text"
+                && let Some(text) = block["text"].as_str() {
                     result_text.push_str(text);
                 }
-            }
         }
     }
 
@@ -1970,7 +2078,7 @@ async fn main() -> std::io::Result<()> {
     let db_path = PathBuf::from(database_path);
     init_db(&db_path).map_err(|err| {
         eprintln!("Failed to initialize database: {err}");
-        std::io::Error::new(std::io::ErrorKind::Other, err)
+        std::io::Error::other(err)
     })?;
 
     let host = env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -2004,21 +2112,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             // Auth runs inside CORS so 401 responses still carry CORS headers.
             .wrap_fn(move |req, srv| {
-                let authorized = match token.as_deref() {
-                    None => true,
-                    Some(expected) => {
-                        req.method() == actix_web::http::Method::OPTIONS
-                            || req.path() == "/api/health"
-                            || req.path() == "/api/openapi.json"
-                            || req
-                                .headers()
-                                .get("authorization")
-                                .and_then(|h| h.to_str().ok())
-                                .and_then(|h| h.strip_prefix("Bearer "))
-                                .map(|t| t == expected)
-                                .unwrap_or(false)
-                    }
-                };
+                let authorized = is_request_authorized(&req, token.as_deref());
                 let fut = if authorized { Some(srv.call(req)) } else { None };
                 async move {
                     match fut {
@@ -2035,19 +2129,7 @@ async fn main() -> std::io::Result<()> {
             // clients pin the stable v1 prefix; breaking changes get a new
             // version. Runs before auth so exemptions see normalized paths.
             .wrap_fn(|mut req, srv| {
-                if let Some(rest) = req.path().strip_prefix("/api/v1/").map(str::to_owned) {
-                    let path_and_query = if req.query_string().is_empty() {
-                        format!("/api/{}", rest)
-                    } else {
-                        format!("/api/{}?{}", rest, req.query_string())
-                    };
-                    if let Ok(uri) = path_and_query.parse::<actix_web::http::Uri>() {
-                        req.head_mut().uri = uri.clone();
-                        // The router matches against the cached path object,
-                        // not head.uri — update both (as NormalizePath does).
-                        req.match_info_mut().get_mut().update(&uri);
-                    }
-                }
+                rewrite_v1_alias(&mut req);
                 srv.call(req)
             })
             .wrap(cors)
@@ -2118,19 +2200,6 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             UNIQUE(symbol, date)
         );
         CREATE INDEX IF NOT EXISTS idx_prices_symbol_date ON prices(symbol, date);
-        CREATE TABLE IF NOT EXISTS watchlist_prices (
-            id INTEGER PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            date TEXT NOT NULL,
-            fetched_at TEXT NOT NULL,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume INTEGER,
-            UNIQUE(symbol, date)
-        );
-        CREATE INDEX IF NOT EXISTS idx_watchlist_prices_symbol_date ON watchlist_prices(symbol, date);
         CREATE TABLE IF NOT EXISTS watchlist_symbols (
             symbol TEXT PRIMARY KEY,
             updated_at TEXT NOT NULL
@@ -2169,6 +2238,17 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         ",
     )
     .map_err(|err| err.to_string())?;
+
+    // Retention: the operational log grows on every refresh and would
+    // otherwise dominate the database over time. Pruned at API startup.
+    // (Timestamps compare lexicographically; format differences beyond the
+    // date portion don't matter at a 90-day horizon.)
+    let pruned_events = conn
+        .execute(
+            "DELETE FROM event_log WHERE timestamp < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')",
+            [],
+        )
+        .map_err(|err| err.to_string())?;
 
     // dividend_events table
     conn.execute_batch(
@@ -2378,6 +2458,23 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_audit_log_table ON audit_log(table_name, timestamp);",
     )
     .map_err(|err| err.to_string())?;
+
+    // Retention: audit rows carry full old/new JSON per change and every
+    // refresh stamps app_config (three trigger rows each). One year of
+    // history is plenty for a personal audit trail.
+    let pruned_audit = conn
+        .execute(
+            "DELETE FROM audit_log WHERE timestamp < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-365 days')",
+            [],
+        )
+        .map_err(|err| err.to_string())?;
+    if pruned_events > 0 || pruned_audit > 0 {
+        let now = Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, 'info', 'api', 'log_retention', NULL, ?2)",
+            params![now, format!("Pruned {} event_log row(s) older than 90 days and {} audit_log row(s) older than 365 days", pruned_events, pruned_audit)],
+        );
+    }
 
     // Create triggers for all tracked tables.
     // Each trigger captures old/new values as JSON.
@@ -2607,7 +2704,7 @@ fn add_column_if_missing(
         .map_err(|err| err.to_string())?;
 
     let has_column = stmt
-        .query_map([], |row| Ok(row.get::<_, String>(1)?))
+        .query_map([], |row| row.get::<_, String>(1))
         .map_err(|err| err.to_string())?
         .any(|result| result.ok().as_deref() == Some(column));
 
@@ -2628,11 +2725,10 @@ fn normalize_symbol(symbol: &str) -> String {
 
 fn load_custom_fields(conn: &Connection, symbol: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT field_key, value FROM watchlist_symbol_fields WHERE symbol = ?1") {
-        if let Ok(rows) = stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+    if let Ok(mut stmt) = conn.prepare("SELECT field_key, value FROM watchlist_symbol_fields WHERE symbol = ?1")
+        && let Ok(rows) = stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
             for row in rows.flatten() { map.insert(row.0, row.1); }
         }
-    }
     map
 }
 
@@ -2690,8 +2786,25 @@ fn load_watchlist_symbols(db_path: &PathBuf, list: Option<&str>) -> Result<Vec<W
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?
     };
+    // One grouped query for all custom fields instead of one query per row
+    // (same pattern as load_holdings_symbol_fields).
+    let mut fields_stmt = conn
+        .prepare("SELECT symbol, field_key, value FROM watchlist_symbol_fields")
+        .map_err(|err| err.to_string())?;
+    let field_rows = fields_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|err| err.to_string())?;
+    let mut fields_by_symbol: std::collections::HashMap<String, std::collections::HashMap<String, String>> = std::collections::HashMap::new();
+    for row in field_rows {
+        let (symbol, key, val) = row.map_err(|err| err.to_string())?;
+        fields_by_symbol.entry(symbol).or_default().insert(key, val);
+    }
     for row in &mut rows {
-        row.custom_fields = load_custom_fields(&conn, &row.symbol);
+        if let Some(fields) = fields_by_symbol.get(&row.symbol) {
+            row.custom_fields = fields.clone();
+        }
     }
     Ok(rows)
 }
@@ -2922,11 +3035,9 @@ fn load_dividend_events(db_path: &PathBuf, symbols: &std::collections::HashSet<S
                 ex_date: NaiveDate::parse_from_str(&ex_date_str, "%Y-%m-%d")
                     .map_err(|err| rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(err)))?,
                 payment_date: payment_date_str
-                    .map(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok())
-                    .flatten(),
+                    .and_then(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()),
                 record_date: record_date_str
-                    .map(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok())
-                    .flatten(),
+                    .and_then(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()),
                 amount: row.get(4)?,
                 fetched_at: row.get(5)?,
             })
@@ -2943,49 +3054,35 @@ fn load_dividend_events(db_path: &PathBuf, symbols: &std::collections::HashSet<S
     Ok(events)
 }
 
+// The shares-held ledger walk lives in stocks::portfolio (shared with the
+// dividends daemon); these wrappers only adapt the API's row types.
 fn calculate_dividend_payments(
     transactions: &[HoldingTransaction],
     events: &[DividendEvent],
 ) -> Vec<DividendPayment> {
-    let mut payments = Vec::new();
-
-    for event in events {
-        let shares_held = calculate_shares_on_date(transactions, event.ex_date);
-        let total_payment = shares_held * event.amount;
-        if shares_held > 0.0 {
-            payments.push(DividendPayment {
+    let txs = to_portfolio_txs(transactions);
+    events
+        .iter()
+        .filter_map(|event| {
+            let shares_held = portfolio::shares_on_date(&txs, &event.ex_date.format("%Y-%m-%d").to_string());
+            (shares_held > 0.0).then(|| DividendPayment {
                 symbol: event.symbol.clone(),
                 ex_date: event.ex_date,
                 payment_date: event.payment_date,
                 amount_per_share: event.amount,
                 shares_held,
-                total_payment,
-            });
-        }
-    }
-
-    payments
+                total_payment: shares_held * event.amount,
+            })
+        })
+        .collect()
 }
 
+/// Test-only adapter: production callers go through
+/// calculate_dividend_payments; the shares-on-date tests exercise the
+/// engine through the same row conversion.
+#[cfg(test)]
 fn calculate_shares_on_date(transactions: &[HoldingTransaction], date: NaiveDate) -> f64 {
-    let mut shares = 0.0;
-    let mut sorted_transactions = transactions.to_vec();
-    sorted_transactions.sort_by(|a, b| a.date.cmp(&b.date).then(a.id.cmp(&b.id)));
-
-    for tx in sorted_transactions {
-        if let Ok(tx_date) = NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d") {
-            if tx_date > date {
-                break;
-            }
-            match tx.transaction_type.as_str() {
-                "purchase" => shares += tx.quantity.unwrap_or(0.0),
-                "sale" => shares -= tx.quantity.unwrap_or(0.0),
-                _ => {}
-            }
-        }
-    }
-
-    shares.max(0.0)
+    portfolio::shares_on_date(&to_portfolio_txs(transactions), &date.format("%Y-%m-%d").to_string())
 }
 
 fn insert_holding_transaction(
@@ -3333,33 +3430,40 @@ fn upsert_config(db_path: &PathBuf, key: &str, value: &str) -> Result<(), String
     Ok(())
 }
 
+/// Record a warn/error against the event_log using an already-open connection.
+fn log_event_on_conn(conn: &Connection, level: &str, event_type: &str, symbol: Option<&str>, details: &str) {
+    let now = Utc::now().to_rfc3339();
+    let _ = conn.execute(
+        "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, ?2, 'api', ?3, ?4, ?5)",
+        params![now, level, event_type, symbol, details],
+    );
+}
+
 fn persist_price_history(conn: &Connection, symbol: &str, records: &[PriceHistoryPoint]) {
     let now = Utc::now().to_rfc3339();
     for r in records {
-        if let Some(close) = r.close {
-            if let Err(err) = conn.execute(
+        if let Some(close) = r.close
+            && let Err(err) = conn.execute(
                 "INSERT INTO prices (symbol, date, close, volume, fetched_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
                 params![symbol, r.date, close, r.volume, now],
             ) {
-                eprintln!("Failed to persist price history for {}: {}", symbol, err);
+                log_event_on_conn(conn, "warn", "price_persist", Some(symbol), &format!("Failed to persist price history: {}", err));
             }
-        }
     }
 }
 
 fn persist_price_to_history(conn: &Connection, symbol: &str, price: &CurrentPrice, fetched_at: &str) {
-    if let (Some(close), Some(date)) = (price.price, &price.price_date) {
-        if let Err(err) = conn.execute(
+    if let (Some(close), Some(date)) = (price.price, &price.price_date)
+        && let Err(err) = conn.execute(
             "INSERT INTO prices (symbol, date, close, volume, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
             params![symbol, date, close, price.volume, fetched_at],
         ) {
-            eprintln!("Failed to persist price for {}: {}", symbol, err);
+            log_event_on_conn(conn, "warn", "price_persist", Some(symbol), &format!("Failed to persist current price: {}", err));
         }
-    }
 }
 
 async fn fetch_watchlist_current_prices(db_path: &PathBuf, list: Option<&str>) -> Result<Vec<CurrentPrice>, String> {
@@ -3431,7 +3535,7 @@ async fn fetch_and_cache_current_prices(
                     })
                 });
                 let price_date = meta.regular_market_time.and_then(|ts| {
-                    Utc.timestamp_opt(ts, 0).single().map(|dt| dt.format("%Y-%m-%d").to_string())
+                    yahoo_local_date(ts, meta.gmtoffset).map(|d| d.format("%Y-%m-%d").to_string())
                 });
                 prices.push(CurrentPrice {
                     symbol: symbol.clone(),
@@ -3524,34 +3628,33 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
     };
     history.reverse();
 
-    // Determine the last weekday (most recent expected trading day) in UTC
-    let now = Utc::now();
-    let days_back = match now.weekday() {
-        chrono::Weekday::Sat => 1,
-        chrono::Weekday::Sun => 2,
-        chrono::Weekday::Mon => {
-            // Before ~10am UTC Monday, Friday is still the last trading day for US stocks
-            if now.hour() < 10 { 3 } else { 0 }
-        }
-        _ => 0,
-    };
-    let last_trading_day = (now - chrono::Duration::days(days_back)).format("%Y-%m-%d").to_string();
+    let last_trading_day = last_expected_trading_day(Utc::now(), symbol);
 
     let last_stored = history.last().map(|h| h.date.as_str()).unwrap_or("").to_string();
     let needs_supplement = last_stored < last_trading_day;
     let has_enough_data = history.len() as i64 >= days / 2;
+    // Only attempt Yahoo once per symbol per window — bursts of requests
+    // (dashboard + watchlist opening together) then serve stored data.
+    let wants_yahoo = history.is_empty() || !has_enough_data || needs_supplement;
+    let may_fetch = wants_yahoo && !history_recently_checked(symbol);
+    if may_fetch {
+        mark_history_checked(symbol);
+    }
 
     let client = Client::builder()
         .user_agent("stocks-api/1.0")
         .build()
         .map_err(|err| err.to_string())?;
 
-    if history.is_empty() || !has_enough_data {
+    if may_fetch && (history.is_empty() || !has_enough_data) {
         match fetch_price_history_from_yahoo(&client, symbol, days).await {
             Ok(records) => {
                 if records.len() > history.len() {
-                    if let Ok(conn) = open_db(db_path) {
-                        persist_price_history(&conn, symbol, &records);
+                    match open_db(db_path) {
+                        Ok(conn) => persist_price_history(&conn, symbol, &records),
+                        Err(err) => {
+                            let _ = insert_event_log(db_path, "warn", "price_history_fetch", "api", Some(symbol), &format!("Fetched history could not be persisted: {}", err));
+                        }
                     }
                     return Ok(records);
                 }
@@ -3560,13 +3663,16 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
                 let _ = insert_event_log(db_path, "warn", "price_history_fetch", "api", Some(symbol), &format!("Yahoo history fetch failed, serving stored data: {}", err));
             }
         }
-    } else if needs_supplement {
+    } else if may_fetch && needs_supplement {
         // Stored data is behind the last trading day — fetch from Yahoo and append missing records
         match fetch_price_history_from_yahoo(&client, symbol, days).await {
             Ok(yahoo) => {
                 let new_records: Vec<_> = yahoo.into_iter().filter(|r| r.date > last_stored).collect();
-                if let Ok(conn) = open_db(db_path) {
-                    persist_price_history(&conn, symbol, &new_records);
+                match open_db(db_path) {
+                    Ok(conn) => persist_price_history(&conn, symbol, &new_records),
+                    Err(err) => {
+                        let _ = insert_event_log(db_path, "warn", "price_history_fetch", "api", Some(symbol), &format!("Fetched supplement could not be persisted: {}", err));
+                    }
                 }
                 history.extend(new_records);
             }
@@ -3608,6 +3714,27 @@ async fn fetch_histories(db_path: &PathBuf, symbols: &[String], days: i64) -> Ha
     out
 }
 
+/// Most recent date (YYYY-MM-DD, UTC) for which a daily close bar is
+/// expected to exist for `symbol`. Weekends map back to Friday. The Monday
+/// cutoff is market-aware: ASX (.AX) closes ~05:00–06:00 UTC (16:00
+/// Sydney), so Monday's close is expected from 07:00 UTC — hours before US
+/// markets even open; US symbols keep a ~10:00 UTC cutoff, with Friday the
+/// last expected bar before it. Without the split, Monday-afternoon Sydney
+/// sessions would be treated as up to date on Friday's data.
+fn last_expected_trading_day(now: chrono::DateTime<Utc>, symbol: &str) -> String {
+    let monday_cutoff_hour = if symbol.to_uppercase().ends_with(".AX") { 7 } else { 10 };
+    let days_back = match now.weekday() {
+        chrono::Weekday::Sat => 1,
+        chrono::Weekday::Sun => 2,
+        chrono::Weekday::Mon => {
+            // Before the cutoff, Friday is still the last expected bar
+            if now.hour() < monday_cutoff_hour { 3 } else { 0 }
+        }
+        _ => 0,
+    };
+    (now - chrono::Duration::days(days_back)).format("%Y-%m-%d").to_string()
+}
+
 fn indicator_points(history: &[PriceHistoryPoint]) -> Vec<stocks::indicators::PricePoint> {
     history
         .iter()
@@ -3627,22 +3754,20 @@ fn compute_symbol_indicators(history: &[PriceHistoryPoint], price: Option<f64>, 
 
     let mut days_50 = None;
     let mut vol_50 = None;
-    if let (Some(p), Some(s)) = (price, sma50) {
-        if p > s {
+    if let (Some(p), Some(s)) = (price, sma50)
+        && p > s {
             let stats = ind::crossover_stats(&points, &sma50_arr, volume);
             days_50 = Some(stats.days);
             vol_50 = stats.volume_pct;
         }
-    }
     let mut days_150 = None;
     let mut vol_150 = None;
-    if let (Some(p), Some(s)) = (price, sma150) {
-        if p > s {
+    if let (Some(p), Some(s)) = (price, sma150)
+        && p > s {
             let stats = ind::crossover_stats(&points, &sma150_arr, volume);
             days_150 = Some(stats.days);
             vol_150 = stats.volume_pct;
         }
-    }
 
     serde_json::json!({
         "sma50": sma50,
@@ -3685,16 +3810,28 @@ async fn get_watchlist_enriched(db_path: web::Data<PathBuf>, query: web::Query<W
     };
     let price_map: HashMap<String, CurrentPrice> = prices.into_iter().map(|p| (p.symbol.clone(), p)).collect();
 
-    let mut info: HashMap<String, (Option<String>, Option<String>, Option<String>)> = HashMap::new();
-    if let Ok(conn) = open_db(db_path.as_ref()) {
-        if let Ok(mut stmt) = conn.prepare("SELECT symbol, instrument_type, long_name, currency FROM symbol_info") {
-            if let Ok(info_rows) = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))
-            }) {
-                for r in info_rows.flatten() {
-                    info.insert(r.0, (r.1, r.2, r.3));
-                }
+    let mut info: HashMap<String, SymbolInfo> = HashMap::new();
+    let info_result = (|| -> Result<Vec<(String, SymbolInfo)>, String> {
+        let conn = open_db(db_path.as_ref()).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT symbol, instrument_type, long_name, currency FROM symbol_info")
+            .map_err(|e| e.to_string())?;
+        let info_rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, (row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)))
+            })
+            .map_err(|e| e.to_string())?;
+        info_rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    })();
+    match info_result {
+        Ok(info_rows) => {
+            for (symbol, symbol_info) in info_rows {
+                info.insert(symbol, symbol_info);
             }
+        }
+        Err(err) => {
+            // Rows degrade to symbol-only badges — record why
+            let _ = insert_event_log(&db_path, "warn", "watchlist_fetch", "api", None, &format!("symbol_info unavailable for enriched watchlist: {}", err));
         }
     }
 
@@ -3799,6 +3936,19 @@ struct YahooMeta {
     currency: Option<String>,
     #[serde(rename = "regularMarketTime")]
     regular_market_time: Option<i64>,
+    /// Exchange UTC offset in seconds — needed to date bars correctly
+    gmtoffset: Option<i64>,
+}
+
+/// Convert a Yahoo bar/event timestamp to the exchange-local trading date.
+/// Yahoo stamps daily bars at the market open; for exchanges ahead of UTC
+/// (ASX opens 10:00 Sydney = 23:00 UTC the *previous* day during daylight
+/// saving) the UTC date is one day early, so the date must be taken in
+/// exchange time: UTC + meta.gmtoffset.
+fn yahoo_local_date(ts: i64, gmtoffset: Option<i64>) -> Option<NaiveDate> {
+    Utc.timestamp_opt(ts + gmtoffset.unwrap_or(0), 0)
+        .single()
+        .map(|dt| dt.date_naive())
 }
 
 #[derive(Deserialize)]
@@ -3814,6 +3964,7 @@ struct YahooHistoryChart {
 
 #[derive(Deserialize)]
 struct YahooHistoryResult {
+    meta: Option<YahooMeta>,
     timestamp: Option<Vec<i64>>,
     indicators: YahooHistoryIndicators,
 }
@@ -3867,11 +4018,10 @@ async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str, days: i64
         .first()
         .ok_or_else(|| format!("No quote data in Yahoo response for {}", symbol))?;
 
+    let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
     let mut records = Vec::with_capacity(timestamps.len());
     for (index, ts) in timestamps.iter().enumerate() {
-        let date = Utc
-            .timestamp_opt(*ts, 0)
-            .single()
+        let date = yahoo_local_date(*ts, gmtoffset)
             .ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?
             .format("%Y-%m-%d")
             .to_string();
@@ -3923,7 +4073,7 @@ async fn fetch_current_price(client: &Client, symbol: &str) -> Result<YahooMeta,
             .as_ref()
             .and_then(|ind| ind.quote.first())
             .and_then(|q| q.volume.as_ref())
-            .and_then(|vols| vols.iter().filter_map(|v| *v).last());
+            .and_then(|vols| vols.iter().filter_map(|v| *v).next_back());
     }
     Ok(meta)
 }
@@ -4101,8 +4251,8 @@ async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -> HashMap<S
             match fetch_current_price(client, &pair).await {
                 Ok(meta) => {
                     live = meta.regular_market_price;
-                    if live.is_some() {
-                        if let Ok(conn) = open_db(db_path) {
+                    if live.is_some()
+                        && let Ok(conn) = open_db(db_path) {
                             let _ = cache_current_price(&conn, &CurrentPrice {
                                 symbol: pair.clone(),
                                 price: live,
@@ -4114,7 +4264,6 @@ async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -> HashMap<S
                                 error: None,
                             });
                         }
-                    }
                 }
                 Err(err) => {
                     let _ = insert_event_log(db_path, "warn", "fx_fetch", "api", None, &format!("FX rate fetch failed for {}, using cached value if available: {}", currency, err));
@@ -4155,8 +4304,7 @@ struct EffectivePrice {
 struct PortfolioContext {
     groups: Vec<(String, Vec<PortfolioTx>)>,
     prices: HashMap<String, EffectivePrice>,
-    /// symbol -> (instrument_type, long_name, currency)
-    info: HashMap<String, (Option<String>, Option<String>, Option<String>)>,
+    info: HashMap<String, SymbolInfo>,
     fields: HashMap<String, HashMap<String, String>>,
     intl: HashMap<String, bool>,
     etf: HashMap<String, bool>,
@@ -4204,7 +4352,7 @@ async fn build_portfolio_context(db_path: &PathBuf) -> Result<PortfolioContext, 
     let fields = load_holdings_symbol_fields(db_path)?;
 
     let conn = open_db(db_path).map_err(|e| e.to_string())?;
-    let mut info: HashMap<String, (Option<String>, Option<String>, Option<String>)> = HashMap::new();
+    let mut info: HashMap<String, SymbolInfo> = HashMap::new();
     {
         let mut stmt = conn
             .prepare("SELECT symbol, instrument_type, long_name, currency FROM symbol_info")
@@ -4265,14 +4413,12 @@ async fn build_portfolio_context(db_path: &PathBuf) -> Result<PortfolioContext, 
         let c = cached_map.get(symbol);
         let mut native = c.and_then(|p| p.price);
         let mut source = if native.is_some() { "cache" } else { "none" };
-        if native.is_none() || native == Some(0.0) {
-            if let Some(manual) = config.get(&format!("manual_price_{}", symbol)) {
-                if let Ok(v) = manual.parse::<f64>() {
+        if (native.is_none() || native == Some(0.0))
+            && let Some(manual) = config.get(&format!("manual_price_{}", symbol))
+                && let Ok(v) = manual.parse::<f64>() {
                     native = Some(v);
                     source = "manual";
                 }
-            }
-        }
         let currency = info.get(symbol).and_then(|i| i.2.clone()).map(|c| c.to_uppercase());
         let aud = match (&native, &currency) {
             (Some(n), Some(cur)) if cur != "AUD" => match fx_rates.get(cur).copied().flatten() {
@@ -4329,6 +4475,13 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             .unwrap_or_default();
         let sma150 = stored_sma(&conn, symbol, 150).map(|v| ctx.to_aud(symbol, v));
         let itype = ctx.info.get(symbol).and_then(|i| i.0.clone());
+        // Effective stop loss (manual field, or the trailing-sell trigger) in
+        // the symbol's native currency, matching native_current_price.
+        let (stop_loss, is_trailing_sell) =
+            match effective_stop_loss(&conn, symbol, sym_fields, ep.and_then(|p| p.native), |p| p) {
+                Some((sl, trailing)) => (Some(sl), trailing),
+                None => (None, false),
+            };
         holdings.push(serde_json::json!({
             "symbol": symbol,
             "long_name": ctx.info.get(symbol).and_then(|i| i.1.clone()),
@@ -4355,10 +4508,57 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             "pl": pl,
             "pl_pct": if invested > 0.0 { Some(pl / invested * 100.0) } else { None },
             "sma150": sma150,
+            "stop_loss": stop_loss,
+            "is_trailing_sell": is_trailing_sell,
         }));
     }
 
     HttpResponse::Ok().json(serde_json::json!({ "holdings": holdings, "fx_rates": ctx.fx_rates }))
+}
+
+/// Effective stop-loss for a holding: the manual `stop_loss` symbol field if
+/// set, otherwise the trailing-sell trigger — the highest close since
+/// `trailing_sell_date` (plus the current price) minus `trailing_sell_pct`.
+/// Returns `(price, is_trailing)`. `convert` maps stored native closes into
+/// the caller's currency and must match the currency of `current_price`.
+fn effective_stop_loss(
+    conn: &Connection,
+    symbol: &str,
+    sym_fields: Option<&std::collections::HashMap<String, String>>,
+    current_price: Option<f64>,
+    convert: impl Fn(f64) -> f64,
+) -> Option<(f64, bool)> {
+    let manual = sym_fields
+        .and_then(|f| f.get("stop_loss"))
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v != 0.0);
+    if let Some(sl) = manual {
+        return Some((sl, false));
+    }
+    let pct = sym_fields
+        .and_then(|f| f.get("trailing_sell_pct"))
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)?;
+    let mut reference = current_price;
+    if let Some(since) = sym_fields.and_then(|f| f.get("trailing_sell_date")).filter(|d| !d.is_empty()) {
+        let mut closes: Vec<f64> = conn
+            .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL AND date >= ?2")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map(params![symbol, since], |row| row.get::<_, f64>(0))
+                    .ok()
+                    .map(|r| r.flatten().map(&convert).collect())
+            })
+            .unwrap_or_default();
+        if let Some(c) = current_price {
+            closes.push(c);
+        }
+        if !closes.is_empty() {
+            reference = closes.into_iter().reduce(f64::max);
+        }
+    }
+    let r = reference.filter(|r| *r != 0.0)?;
+    Some((r * (1.0 - pct / 100.0), true))
 }
 
 #[utoipa::path(get, path = "/api/v1/portfolio/overview", tag = "portfolio", responses((status = 200, description = "Get portfolio overview")))]
@@ -4460,12 +4660,11 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
             }
             let price = ctx.prices.get(symbol).and_then(|p| p.aud).filter(|p| *p != 0.0);
             let sma150 = stored_sma(&conn, symbol, 150).map(|v| ctx.to_aud(symbol, v));
-            if let (Some(p), Some(s)) = (price, sma150) {
-                if s != 0.0 {
+            if let (Some(p), Some(s)) = (price, sma150)
+                && s != 0.0 {
                     let pct = (p - s) / s * 100.0;
                     scored.push((pct, serde_json::json!({ "symbol": symbol, "price": p, "sma150": s, "pct_diff": pct })));
                 }
-            }
         }
         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         worst_holdings = scored.into_iter().take(15).map(|(_, v)| v).collect();
@@ -4545,6 +4744,15 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
+    // Needed to derive trailing stop-loss triggers for the stop_loss lists;
+    // on failure those lists degrade to manual stop losses only.
+    let list_conn = match open_db(db_path.as_ref()) {
+        Ok(c) => Some(c),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "warn", "portfolio_fetch", "api", None, &format!("Custom lists: DB unavailable for trailing stop losses: {}", err));
+            None
+        }
+    };
     let custom_lists: Vec<serde_json::Value> = list_defs
         .iter()
         .map(|def| {
@@ -4556,6 +4764,7 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                 diff: f64,
                 pct_diff: f64,
                 currency: Option<String>,
+                is_trailing: bool,
             }
             let matches_op = |diff: f64| match def.operator.as_str() {
                 "above" | "pct_below" => diff > 0.0,
@@ -4571,7 +4780,19 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                         continue;
                     }
                     let Some(price) = ctx.prices.get(symbol).and_then(|p| p.native) else { continue };
-                    let Some(fv) = ctx.fields.get(symbol).and_then(|f| f.get(field_key)).and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) else { continue };
+                    // The built-in stop_loss field falls back to the
+                    // trailing-sell trigger, so holdings protected by a
+                    // trailing stop appear in stop-loss lists too. Prices
+                    // here are native, so closes need no conversion.
+                    let (fv, is_trailing) = if field_key == "stop_loss" && let Some(conn) = list_conn.as_ref() {
+                        match effective_stop_loss(conn, symbol, ctx.fields.get(symbol), Some(price), |p| p) {
+                            Some((sl, trailing)) if sl > 0.0 => (sl, trailing),
+                            _ => continue,
+                        }
+                    } else {
+                        let Some(fv) = ctx.fields.get(symbol).and_then(|f| f.get(field_key)).and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) else { continue };
+                        (fv, false)
+                    };
                     let diff = price - fv;
                     if matches_op(diff) {
                         entries.push(Entry {
@@ -4581,6 +4802,7 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                             diff,
                             pct_diff: diff / fv * 100.0,
                             currency: ctx.info.get(symbol).and_then(|i| i.2.clone()),
+                            is_trailing,
                         });
                     }
                 }
@@ -4607,6 +4829,7 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                             diff,
                             pct_diff: diff / fv * 100.0,
                             currency: None,
+                            is_trailing: false,
                         });
                     }
                 }
@@ -4654,6 +4877,7 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                     "diff": e.diff,
                     "pct_diff": e.pct_diff,
                     "currency": e.currency,
+                    "is_trailing": e.is_trailing,
                 })).collect::<Vec<_>>(),
             })
         })
@@ -4822,45 +5046,10 @@ async fn get_portfolio_risk(db_path: web::Data<PathBuf>) -> impl Responder {
         };
 
         let sym_fields = ctx.fields.get(symbol);
-        let stop_loss_manual = sym_fields
-            .and_then(|f| f.get("stop_loss"))
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| *v != 0.0);
-        let trailing_pct = sym_fields
-            .and_then(|f| f.get("trailing_sell_pct"))
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| *v > 0.0);
-
-        let mut stop_loss: Option<f64> = stop_loss_manual;
-        let mut is_trailing = false;
-        if stop_loss.is_none() {
-            if let Some(pct) = trailing_pct {
-                // Trailing trigger: highest close since placement date (plus
-                // the live price) minus the trailing percentage.
-                let mut reference = current_price;
-                if let Some(since) = sym_fields.and_then(|f| f.get("trailing_sell_date")).filter(|d| !d.is_empty()) {
-                    let mut closes: Vec<f64> = conn
-                        .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL AND date >= ?2")
-                        .ok()
-                        .and_then(|mut stmt| {
-                            stmt.query_map(params![symbol, since], |row| row.get::<_, f64>(0))
-                                .ok()
-                                .map(|r| r.flatten().map(&to_display).collect())
-                        })
-                        .unwrap_or_default();
-                    if let Some(c) = current_price {
-                        closes.push(c);
-                    }
-                    if !closes.is_empty() {
-                        reference = closes.into_iter().reduce(f64::max);
-                    }
-                }
-                if let Some(r) = reference.filter(|r| *r != 0.0) {
-                    stop_loss = Some(r * (1.0 - pct / 100.0));
-                    is_trailing = true;
-                }
-            }
-        }
+        let (stop_loss, is_trailing) = match effective_stop_loss(&conn, symbol, sym_fields, current_price, to_display) {
+            Some((sl, trailing)) => (Some(sl), trailing),
+            None => (None, false),
+        };
 
         let stop_loss_pct = stop_loss
             .filter(|_| purchase_price != 0.0)
@@ -4923,22 +5112,30 @@ async fn get_portfolio_risk(db_path: web::Data<PathBuf>) -> impl Responder {
 #[utoipa::path(get, path = "/api/v1/sync-state", tag = "system", responses((status = 200, description = "Get sync state")))]
 #[get("/api/sync-state")]
 async fn get_sync_state(db_path: web::Data<PathBuf>) -> impl Responder {
-    let conn = match open_db(db_path.as_ref()) {
-        Ok(c) => c,
-        Err(err) => return err_internal(err.to_string()),
-    };
-    let mut latest: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT table_name, MAX(timestamp) FROM audit_log GROUP BY table_name") {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        }) {
-            for (table, ts) in rows.flatten() {
-                if let Some(ts) = ts {
-                    latest.insert(table, ts);
-                }
+    let latest_result = (|| -> Result<HashMap<String, String>, String> {
+        let conn = open_db(db_path.as_ref()).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT table_name, MAX(timestamp) FROM audit_log GROUP BY table_name")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+            .map_err(|e| e.to_string())?;
+        let mut latest = HashMap::new();
+        for row in rows {
+            let (table, ts) = row.map_err(|e| e.to_string())?;
+            if let Some(ts) = ts {
+                latest.insert(table, ts);
             }
         }
-    }
+        Ok(latest)
+    })();
+    let latest = match latest_result {
+        Ok(latest) => latest,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "sync_state_fetch", "api", None, &err);
+            return err_internal(err);
+        }
+    };
     let max_of = |tables: &[&str]| -> Option<String> {
         tables.iter().filter_map(|t| latest.get(*t)).max().cloned()
     };
@@ -4954,6 +5151,7 @@ async fn get_sync_state(db_path: web::Data<PathBuf>) -> impl Responder {
         "config": max_of(&["app_config"]),
         "watchlist_prices_updated_at": config.get("watchlist_prices_updated_at"),
         "holdings_prices_updated_at": config.get("holdings_prices_updated_at"),
+        "daily_prices_updated_at": config.get("daily_prices_updated_at"),
         "last_full_refresh_at": config.get("last_full_refresh_at"),
         "server_time": Utc::now().to_rfc3339(),
     }))
@@ -5281,5 +5479,1197 @@ mod tests {
 
         let result = insert_holding_transaction(&db_path, "TST.AX", payload);
         assert!(result.is_err(), "should reject zero quantity");
+    }
+
+    // -------------------------------------------------------------------------
+    // Yahoo timestamp → trading-date conversion (gmtoffset)
+    //
+    // Yahoo stamps daily bars at the market open. ASX opens 10:00 Sydney,
+    // which during daylight saving (AEDT, Oct–Apr) is 23:00 UTC the previous
+    // day — dating bars in UTC filed every AEDT trading day one day early
+    // (Monday closes stored under Sunday). These tests pin the fix.
+    // -------------------------------------------------------------------------
+
+    const AEDT: i64 = 11 * 3600;
+    const AEST: i64 = 10 * 3600;
+    const EST: i64 = -5 * 3600;
+
+    fn utc_ts(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+        Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap().timestamp()
+    }
+
+    #[test]
+    fn yahoo_local_date_aedt_open_dates_as_local_trading_day() {
+        // Mon 2026-01-05 10:00 AEDT = Sun 2026-01-04 23:00 UTC
+        let ts = utc_ts(2026, 1, 4, 23, 0);
+        assert_eq!(yahoo_local_date(ts, Some(AEDT)), NaiveDate::from_ymd_opt(2026, 1, 5));
+    }
+
+    #[test]
+    fn yahoo_local_date_aest_open_is_unchanged() {
+        // Mon 2026-06-01 10:00 AEST = Mon 2026-06-01 00:00 UTC
+        let ts = utc_ts(2026, 6, 1, 0, 0);
+        assert_eq!(yahoo_local_date(ts, Some(AEST)), NaiveDate::from_ymd_opt(2026, 6, 1));
+    }
+
+    #[test]
+    fn yahoo_local_date_us_open_is_unchanged() {
+        // Mon 2026-01-05 09:30 EST = Mon 2026-01-05 14:30 UTC — proves the
+        // fix does not shift US-listed symbols
+        let ts = utc_ts(2026, 1, 5, 14, 30);
+        assert_eq!(yahoo_local_date(ts, Some(EST)), NaiveDate::from_ymd_opt(2026, 1, 5));
+    }
+
+    #[test]
+    fn yahoo_local_date_missing_offset_falls_back_to_utc() {
+        let ts = utc_ts(2026, 1, 4, 23, 0);
+        assert_eq!(yahoo_local_date(ts, None), NaiveDate::from_ymd_opt(2026, 1, 4));
+    }
+
+    /// gmtoffset must survive deserialisation of the history payload — if
+    /// the field is dropped, every AEDT bar silently shifts a day early.
+    #[test]
+    fn history_response_parses_gmtoffset() {
+        let json = r#"{
+            "chart": {
+                "result": [{
+                    "meta": { "currency": "AUD", "gmtoffset": 39600 },
+                    "timestamp": [1767564000],
+                    "indicators": { "quote": [{ "close": [37.39], "volume": [100000] }] }
+                }],
+                "error": null
+            }
+        }"#;
+        let payload: YahooHistoryResponse = serde_json::from_str(json).unwrap();
+        let result = &payload.chart.result.unwrap()[0];
+        let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
+        assert_eq!(gmtoffset, Some(AEDT));
+        // 1767564000 = 2026-01-04 22:00 UTC = 2026-01-05 09:00 AEDT
+        assert_eq!(
+            yahoo_local_date(result.timestamp.as_ref().unwrap()[0], gmtoffset),
+            NaiveDate::from_ymd_opt(2026, 1, 5)
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // effective_stop_loss — the one function that decides the stop-loss
+    // number shown on the Analysis screen, the Dashboard Stop Losses list
+    // and the Holdings SMA chart. Manual field wins; otherwise the
+    // trailing-sell trigger is the highest close since the placement date
+    // (plus the live price) minus the trailing percentage.
+    // -------------------------------------------------------------------------
+
+    fn sym_fields(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn insert_price(db_path: &PathBuf, symbol: &str, date: &str, close: f64) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, ?4)",
+            params![symbol, date, close, "2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stop_loss_manual_field_wins_over_trailing() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[
+            ("stop_loss", "4.50"),
+            ("trailing_sell_pct", "10"),
+            ("trailing_sell_date", "2026-05-01"),
+        ]);
+        let result = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(5.0), |p| p);
+        assert_eq!(result, Some((4.50, false)));
+    }
+
+    #[test]
+    fn stop_loss_zero_manual_falls_back_to_trailing() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("stop_loss", "0"), ("trailing_sell_pct", "10")]);
+        let result = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(10.0), |p| p);
+        assert_eq!(result, Some((9.0, true)));
+    }
+
+    #[test]
+    fn trailing_uses_highest_close_since_placement_date() {
+        let (_file, db_path) = setup_test_db();
+        insert_price(&db_path, "TST.AX", "2026-05-01", 20.0); // before placement — excluded
+        insert_price(&db_path, "TST.AX", "2026-05-12", 12.0);
+        insert_price(&db_path, "TST.AX", "2026-06-01", 11.0);
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "2026-05-10")]);
+        let result = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(11.5), |p| p);
+        // Reference = max(12.0, 11.0, live 11.5) = 12.0; trigger = 12.0 × 0.90
+        let (sl, trailing) = result.unwrap();
+        assert!((sl - 10.8).abs() < 1e-9, "expected 10.8, got {sl}");
+        assert!(trailing);
+    }
+
+    #[test]
+    fn trailing_live_price_can_be_the_reference() {
+        let (_file, db_path) = setup_test_db();
+        insert_price(&db_path, "TST.AX", "2026-05-12", 12.0);
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "2026-05-10")]);
+        // Live price above every stored close — the trigger trails the live high
+        let result = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(13.0), |p| p);
+        let (sl, trailing) = result.unwrap();
+        assert!((sl - 11.7).abs() < 1e-9, "expected 11.7, got {sl}");
+        assert!(trailing);
+    }
+
+    #[test]
+    fn trailing_without_placement_date_uses_current_price_only() {
+        let (_file, db_path) = setup_test_db();
+        insert_price(&db_path, "TST.AX", "2026-05-12", 15.0); // ignored without a date
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10")]);
+        let result = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(10.0), |p| p);
+        assert_eq!(result, Some((9.0, true)));
+    }
+
+    #[test]
+    fn trailing_empty_placement_date_is_treated_as_absent() {
+        let (_file, db_path) = setup_test_db();
+        insert_price(&db_path, "TST.AX", "2026-05-12", 15.0);
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "")]);
+        let result = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(10.0), |p| p);
+        assert_eq!(result, Some((9.0, true)));
+    }
+
+    #[test]
+    fn stop_loss_none_when_no_fields() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        assert_eq!(effective_stop_loss(&conn, "TST.AX", None, Some(10.0), |p| p), None);
+        let empty = sym_fields(&[]);
+        assert_eq!(effective_stop_loss(&conn, "TST.AX", Some(&empty), Some(10.0), |p| p), None);
+    }
+
+    #[test]
+    fn stop_loss_zero_or_negative_trailing_pct_ignored() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let zero = sym_fields(&[("trailing_sell_pct", "0")]);
+        assert_eq!(effective_stop_loss(&conn, "TST.AX", Some(&zero), Some(10.0), |p| p), None);
+        let negative = sym_fields(&[("trailing_sell_pct", "-5")]);
+        assert_eq!(effective_stop_loss(&conn, "TST.AX", Some(&negative), Some(10.0), |p| p), None);
+    }
+
+    #[test]
+    fn trailing_none_when_no_price_and_no_closes() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "2026-05-10")]);
+        assert_eq!(effective_stop_loss(&conn, "TST.AX", Some(&fields), None, |p| p), None);
+    }
+
+    #[test]
+    fn trailing_conversion_applies_to_stored_closes() {
+        let (_file, db_path) = setup_test_db();
+        insert_price(&db_path, "TST", "2026-05-12", 10.0); // native close
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "2026-05-10")]);
+        // Display currency is 2× native (e.g. USD→AUD); current price is
+        // already converted. Reference = max(10.0 × 2, 18.0) = 20.0.
+        let result = effective_stop_loss(&conn, "TST", Some(&fields), Some(18.0), |p| p * 2.0);
+        let (sl, trailing) = result.unwrap();
+        assert!((sl - 18.0).abs() < 1e-9, "expected 18.0, got {sl}");
+        assert!(trailing);
+    }
+
+    /// Same guarantee for the dividends payload: ASX ex-dividend dates are
+    /// stamped at the market open and shift a day early without the offset.
+    #[test]
+    fn dividend_response_parses_gmtoffset() {
+        let json = r#"{
+            "chart": {
+                "result": [{
+                    "meta": { "currency": "AUD", "gmtoffset": 39600 },
+                    "events": {
+                        "dividends": {
+                            "1767564000": { "amount": 0.44, "date": 1767564000 }
+                        }
+                    }
+                }],
+                "error": null
+            }
+        }"#;
+        let payload: YahooDivResponse = serde_json::from_str(json).unwrap();
+        let result = payload.chart.result.unwrap().into_iter().next().unwrap();
+        let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
+        assert_eq!(gmtoffset, Some(AEDT));
+        let entry_ts = result
+            .events
+            .unwrap()
+            .dividends
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .date
+            .unwrap();
+        assert_eq!(yahoo_local_date(entry_ts, gmtoffset), NaiveDate::from_ymd_opt(2026, 1, 5));
+    }
+
+    // -------------------------------------------------------------------------
+    // Portfolio endpoint handler tests (P1.3)
+    //
+    // Full actix App against a seeded temp DB. All symbols are AUD so no
+    // handler touches the network (FX resolution short-circuits on an empty
+    // currency list; the watchlist is empty so no history fetches run).
+    //
+    // Fixture:
+    //   MAN.AX  — 100 @ $10, manual stop loss $9,   cached $12, 150-SMA $10
+    //   TRL.AX  —  50 @ $20, 10% trail since 1 May (peak close $30 → $27), cached $28
+    //   PART.AX — 100 @ $1, 40 sold @ $2 → 60 remaining, cached $1.50, 150-SMA $3
+    //   SOLD.AX —  10 @ $5, all sold @ $6 → excluded everywhere
+    // -------------------------------------------------------------------------
+
+    fn seed_portfolio_fixture() -> (NamedTempFile, PathBuf) {
+        let (file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+
+        let mut tx_id = 1000;
+        let mut add_tx = |symbol: &str, tx_type: &str, date: &str, qty: f64, price: f64| {
+            tx_id += 1;
+            conn.execute(
+                "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0.0, '2026-01-01T00:00:00Z')",
+                params![tx_id, symbol, tx_type, date, qty, price],
+            )
+            .unwrap();
+        };
+        add_tx("MAN.AX", "purchase", "2026-01-05", 100.0, 10.0);
+        add_tx("TRL.AX", "purchase", "2026-02-02", 50.0, 20.0);
+        add_tx("PART.AX", "purchase", "2026-01-05", 100.0, 1.0);
+        add_tx("PART.AX", "sale", "2026-03-02", 40.0, 2.0);
+        add_tx("SOLD.AX", "purchase", "2026-01-05", 10.0, 5.0);
+        add_tx("SOLD.AX", "sale", "2026-04-01", 10.0, 6.0);
+
+        for (sym, price) in [("MAN.AX", 12.0), ("TRL.AX", 28.0), ("PART.AX", 1.5), ("SOLD.AX", 7.0)] {
+            conn.execute(
+                "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
+                 VALUES (?1, ?2, '2026-07-11T00:00:00Z', '2026-07-10')",
+                params![sym, price],
+            )
+            .unwrap();
+        }
+
+        for (sym, key, value) in [
+            ("MAN.AX", "stop_loss", "9.0"),
+            ("TRL.AX", "trailing_sell_pct", "10"),
+            ("TRL.AX", "trailing_sell_date", "2026-05-01"),
+        ] {
+            conn.execute(
+                "INSERT INTO holdings_symbol_fields (symbol, field_key, value) VALUES (?1, ?2, ?3)",
+                params![sym, key, value],
+            )
+            .unwrap();
+        }
+
+        // Trailing reference closes for TRL.AX (peak 30.0 since 1 May)
+        for (date, close) in [("2026-05-15", 30.0), ("2026-06-01", 25.0)] {
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TRL.AX', ?1, ?2, '2026-07-01T00:00:00Z')",
+                params![date, close],
+            )
+            .unwrap();
+        }
+
+        // Flat 150-day history so the 150-SMA equals the close: MAN.AX at
+        // 10.0 (price 12 → +20%), PART.AX at 3.0 (price 1.50 → −50%).
+        // TRL.AX has only 2 closes → no SMA → excluded from worst holdings.
+        let start = NaiveDate::from_ymd_opt(2025, 8, 1).unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, '2026-07-01T00:00:00Z')")
+            .unwrap();
+        for i in 0..150 {
+            let date = (start + chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
+            stmt.execute(params!["MAN.AX", date, 10.0]).unwrap();
+            stmt.execute(params!["PART.AX", date, 3.0]).unwrap();
+        }
+        drop(stmt);
+
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('dashboard_custom_lists',
+             '[{\"key\":\"stop_losses\",\"label\":\"Stop Losses\",\"source\":\"holdings\",\"field_key\":\"holdings:stop_loss\",\"operator\":\"pct_below\",\"limit\":20}]')",
+            [],
+        )
+        .unwrap();
+
+        (file, db_path)
+    }
+
+    async fn get_json(db_path: &std::path::Path, uri: &str) -> serde_json::Value {
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.to_path_buf()))
+                .service(get_portfolio_holdings)
+                .service(get_portfolio_overview)
+                .service(get_portfolio_risk),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get().uri(uri).to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert!(resp.status().is_success(), "{} returned {}", uri, resp.status());
+        actix_web::test::read_body_json(resp).await
+    }
+
+    fn find<'a>(rows: &'a serde_json::Value, symbol: &str) -> &'a serde_json::Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["symbol"] == symbol)
+            .unwrap_or_else(|| panic!("{symbol} missing from response"))
+    }
+
+    fn close_to(v: &serde_json::Value, expected: f64) -> bool {
+        v.as_f64().map(|f| (f - expected).abs() < 1e-6).unwrap_or(false)
+    }
+
+    #[actix_web::test]
+    async fn holdings_endpoint_reports_positions_and_stop_losses() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let body = get_json(&db_path, "/api/portfolio/holdings").await;
+        let holdings = &body["holdings"];
+        assert_eq!(holdings.as_array().unwrap().len(), 3, "fully sold symbol must be excluded");
+
+        let man = find(holdings, "MAN.AX");
+        assert!(close_to(&man["shares"], 100.0));
+        assert!(close_to(&man["invested"], 1000.0));
+        assert!(close_to(&man["avg_cost"], 10.0));
+        assert!(close_to(&man["current_price"], 12.0));
+        assert!(close_to(&man["pl"], 200.0));
+        assert!(close_to(&man["pl_pct"], 20.0));
+        assert!(close_to(&man["stop_loss"], 9.0), "manual stop loss passes through");
+        assert_eq!(man["is_trailing_sell"], false);
+
+        let trl = find(holdings, "TRL.AX");
+        assert!(close_to(&trl["stop_loss"], 27.0), "trailing trigger = peak 30.0 × 0.90");
+        assert_eq!(trl["is_trailing_sell"], true);
+
+        let part = find(holdings, "PART.AX");
+        assert!(close_to(&part["shares"], 60.0), "partial sale leaves remaining shares only");
+        assert!(close_to(&part["invested"], 60.0));
+        assert!(part["stop_loss"].is_null());
+    }
+
+    #[actix_web::test]
+    async fn overview_endpoint_totals_reconcile_with_seeded_data() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+
+        let totals = &body["totals"];
+        assert_eq!(totals["stock_count"], 3);
+        // 100×12 + 50×28 + 60×1.5
+        assert!(close_to(&totals["total_value"], 2690.0));
+        // Holdings P/L 630 (200 + 400 + 30) + sold P/L 50 (PART 40 + SOLD 10)
+        assert!(close_to(&totals["holdings_pl"], 630.0));
+        assert!(close_to(&totals["sold_pl"], 50.0));
+        assert!(close_to(&totals["total_pl"], 680.0));
+    }
+
+    #[actix_web::test]
+    async fn overview_worst_holdings_sorted_by_sma_gap() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+
+        let worst = body["worst_holdings"].as_array().unwrap();
+        // TRL.AX has no 150-SMA (2 closes) and must be absent
+        assert_eq!(worst.len(), 2);
+        // PART.AX (−50%) is worse than MAN.AX (+20%) and must sort first
+        assert_eq!(worst[0]["symbol"], "PART.AX");
+        assert!(close_to(&worst[0]["pct_diff"], -50.0));
+        assert_eq!(worst[1]["symbol"], "MAN.AX");
+        assert!(close_to(&worst[1]["pct_diff"], 20.0));
+    }
+
+    #[actix_web::test]
+    async fn overview_stop_loss_list_includes_trailing_holdings() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+
+        let lists = body["custom_lists"].as_array().unwrap();
+        let stop_losses = lists.iter().find(|l| l["key"] == "stop_losses").expect("configured list missing");
+        let entries = &stop_losses["entries"];
+
+        let man = find(entries, "MAN.AX");
+        assert!(close_to(&man["field_value"], 9.0));
+        assert_eq!(man["is_trailing"], false);
+        // (12 − 9) / 9
+        assert!(close_to(&man["pct_diff"], 33.333333333333336));
+
+        let trl = find(entries, "TRL.AX");
+        assert!(close_to(&trl["field_value"], 27.0), "trailing trigger appears as the list value");
+        assert_eq!(trl["is_trailing"], true);
+
+        // PART.AX has no stop loss of either kind
+        assert!(entries.as_array().unwrap().iter().all(|e| e["symbol"] != "PART.AX"));
+    }
+
+    #[actix_web::test]
+    async fn risk_endpoint_reports_margins_and_dollar_impact() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let body = get_json(&db_path, "/api/portfolio/risk").await;
+        let rows = &body["rows"];
+        assert_eq!(rows.as_array().unwrap().len(), 3);
+
+        let man = find(rows, "MAN.AX");
+        assert!(close_to(&man["purchase_price"], 10.0));
+        assert!(close_to(&man["current_price"], 12.0));
+        assert!(close_to(&man["pl_pct"], 20.0));
+        assert!(close_to(&man["stop_loss"], 9.0));
+        assert!(close_to(&man["stop_loss_pct"], -10.0), "stop 9 vs purchase 10");
+        assert!(close_to(&man["stop_loss_dollar"], -100.0), "(9 − 10) × 100 shares");
+        assert_eq!(man["is_trailing_sell"], false);
+
+        let trl = find(rows, "TRL.AX");
+        assert!(close_to(&trl["stop_loss"], 27.0));
+        assert!(close_to(&trl["stop_loss_pct"], 35.0), "stop 27 vs purchase 20");
+        assert!(close_to(&trl["stop_loss_dollar"], 350.0), "(27 − 20) × 50 shares");
+        assert_eq!(trl["is_trailing_sell"], true);
+
+        let totals = &body["totals"];
+        assert!(close_to(&totals["total_invested"], 2060.0));
+        assert!(close_to(&totals["total_sl_dollar"], 250.0), "−100 + 350 + 0");
+        assert!(close_to(&totals["total_sl_pct"], 250.0 / 2060.0 * 100.0));
+    }
+
+    // -------------------------------------------------------------------------
+    // Holding-transaction write handlers (P2.1)
+    //
+    // These guard the source-of-truth ledger: over-sell confirmation,
+    // foreign-currency rules, validation-rejects-without-writing, delete
+    // recalculation, and the atomic move-from-watchlist.
+    // -------------------------------------------------------------------------
+
+    /// Send a write request to the holdings handlers and return (status, body).
+    async fn call_write(
+        db_path: &std::path::Path,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (actix_web::http::StatusCode, serde_json::Value) {
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.to_path_buf()))
+                .service(add_holding_transaction)
+                .service(update_holding_transaction)
+                .service(delete_holding_transaction)
+                .service(add_holding_from_watchlist)
+                .service(get_portfolio_holdings),
+        )
+        .await;
+        let mut req = match method {
+            "POST" => actix_web::test::TestRequest::post(),
+            "PUT" => actix_web::test::TestRequest::put(),
+            "DELETE" => actix_web::test::TestRequest::delete(),
+            _ => actix_web::test::TestRequest::get(),
+        }
+        .uri(uri);
+        if let Some(b) = body {
+            req = req.set_json(b);
+        }
+        let resp = actix_web::test::call_service(&app, req.to_request()).await;
+        let status = resp.status();
+        let bytes = actix_web::test::read_body(resp).await;
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    fn purchase_json(symbol: &str, qty: f64, price: f64) -> serde_json::Value {
+        serde_json::json!({
+            "symbol": symbol, "transaction_type": "purchase",
+            "date": "2026-01-05", "quantity": qty, "price": price
+        })
+    }
+
+    fn tx_count(db_path: &PathBuf, symbol: &str) -> i64 {
+        let conn = open_db(db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM holdings_transactions WHERE symbol = ?1",
+            params![symbol],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[actix_web::test]
+    async fn oversell_without_confirm_is_409_and_writes_nothing() {
+        let (_file, db_path) = setup_test_db();
+        let (status, _) = call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("TST.AX", 10.0, 5.0))).await;
+        assert_eq!(status, 200);
+
+        let sale = serde_json::json!({
+            "symbol": "TST.AX", "transaction_type": "sale",
+            "date": "2026-06-01", "quantity": 15.0, "price": 6.0
+        });
+        let (status, body) = call_write(&db_path, "POST", "/api/holdings", Some(sale)).await;
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["code"], "oversell_confirmation_required");
+        assert!(close_to(&body["error"]["held"], 10.0));
+        assert_eq!(tx_count(&db_path, "TST.AX"), 1, "the rejected sale must not be written");
+    }
+
+    #[actix_web::test]
+    async fn oversell_with_confirm_is_recorded() {
+        let (_file, db_path) = setup_test_db();
+        call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("TST.AX", 10.0, 5.0))).await;
+
+        let sale = serde_json::json!({
+            "symbol": "TST.AX", "transaction_type": "sale",
+            "date": "2026-06-01", "quantity": 15.0, "price": 6.0, "confirm": true
+        });
+        let (status, body) = call_write(&db_path, "POST", "/api/holdings", Some(sale)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["transaction_type"], "sale");
+        assert_eq!(tx_count(&db_path, "TST.AX"), 2);
+    }
+
+    #[actix_web::test]
+    async fn sale_within_holding_needs_no_confirm() {
+        let (_file, db_path) = setup_test_db();
+        call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("TST.AX", 10.0, 5.0))).await;
+
+        let sale = serde_json::json!({
+            "symbol": "TST.AX", "transaction_type": "sale",
+            "date": "2026-06-01", "quantity": 5.0, "price": 6.0
+        });
+        let (status, _) = call_write(&db_path, "POST", "/api/holdings", Some(sale)).await;
+        assert_eq!(status, 200);
+    }
+
+    #[actix_web::test]
+    async fn invalid_transactions_rejected_with_envelope_and_nothing_written() {
+        let (_file, db_path) = setup_test_db();
+
+        for body in [
+            purchase_json("TST.AX", 0.0, 5.0),   // zero quantity
+            purchase_json("TST.AX", -3.0, 5.0),  // negative quantity
+            purchase_json("TST.AX", 10.0, 0.0),  // zero price
+            purchase_json("TST.AX", 10.0, -1.0), // negative price
+            serde_json::json!({ "symbol": "TST.AX", "transaction_type": "dividend", "date": "2026-01-05", "amount": 0.0 }),
+            serde_json::json!({ "symbol": "TST.AX", "transaction_type": "gift", "date": "2026-01-05", "quantity": 1.0, "price": 1.0 }),
+            serde_json::json!({ "symbol": "TST.AX", "transaction_type": "purchase", "date": "05/01/2026", "quantity": 1.0, "price": 1.0 }),
+        ] {
+            let (status, resp) = call_write(&db_path, "POST", "/api/holdings", Some(body.clone())).await;
+            assert_eq!(status, 400, "expected 400 for {body}");
+            assert_eq!(resp["error"]["code"], "bad_request", "error envelope for {body}");
+        }
+        assert_eq!(tx_count(&db_path, "TST.AX"), 0, "no rejected payload may be written");
+    }
+
+    #[actix_web::test]
+    async fn foreign_purchase_without_price_or_original_is_rejected() {
+        let (_file, db_path) = setup_test_db();
+        let body = serde_json::json!({
+            "symbol": "TSM", "transaction_type": "purchase",
+            "date": "2026-01-05", "quantity": 10.0, "currency": "USD"
+        });
+        let (status, resp) = call_write(&db_path, "POST", "/api/holdings", Some(body)).await;
+        assert_eq!(status, 400);
+        assert!(
+            resp["error"]["message"].as_str().unwrap().contains("original_price"),
+            "message should say what is missing: {resp}"
+        );
+        assert_eq!(tx_count(&db_path, "TSM"), 0);
+    }
+
+    #[actix_web::test]
+    async fn foreign_purchase_with_supplied_fx_persists_native_and_aud() {
+        let (_file, db_path) = setup_test_db();
+        // The client converts: price (AUD) = original_price (USD) × fx_rate
+        let body = serde_json::json!({
+            "symbol": "TSM", "transaction_type": "purchase",
+            "date": "2026-01-05", "quantity": 10.0,
+            "currency": "USD", "original_price": 100.0, "fx_rate": 1.5, "price": 150.0
+        });
+        let (status, record) = call_write(&db_path, "POST", "/api/holdings", Some(body)).await;
+        assert_eq!(status, 200);
+        assert_eq!(record["currency"], "USD");
+        assert!(close_to(&record["original_price"], 100.0));
+        assert!(close_to(&record["fx_rate"], 1.5));
+        assert!(close_to(&record["price"], 150.0), "AUD price = native × rate");
+    }
+
+    #[actix_web::test]
+    async fn delete_recalculates_holdings_and_404s_on_missing_id() {
+        let (_file, db_path) = setup_test_db();
+        let (_, first) = call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("TST.AX", 10.0, 5.0))).await;
+        let (_, second) = call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("TST.AX", 4.0, 6.0))).await;
+        // A cached price so the holding shows up in the portfolio
+        open_db(&db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO cached_current_prices (symbol, price, last_updated) VALUES ('TST.AX', 7.0, '2026-07-11T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let (status, _) = call_write(&db_path, "DELETE", &format!("/api/holdings/{}", first["id"]), None).await;
+        assert_eq!(status, 204);
+        let body = call_write(&db_path, "GET", "/api/portfolio/holdings", None).await.1;
+        assert!(close_to(&find(&body["holdings"], "TST.AX")["shares"], 4.0), "holdings recalculate after delete");
+
+        let (status, _) = call_write(&db_path, "DELETE", &format!("/api/holdings/{}", second["id"]), None).await;
+        assert_eq!(status, 204);
+        let body = call_write(&db_path, "GET", "/api/portfolio/holdings", None).await.1;
+        assert!(body["holdings"].as_array().unwrap().is_empty(), "symbol disappears with its last transaction");
+
+        let (status, resp) = call_write(&db_path, "DELETE", "/api/holdings/99999", None).await;
+        assert_eq!(status, 404);
+        assert_eq!(resp["error"]["code"], "not_found");
+    }
+
+    fn seed_watchlist_entry(db_path: &PathBuf, symbol: &str, lists: &[&str]) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO watchlist_symbols (symbol, updated_at) VALUES (?1, '2026-01-01T00:00:00Z')",
+            params![symbol],
+        )
+        .unwrap();
+        for list in lists {
+            conn.execute(
+                "INSERT INTO watchlist_memberships (symbol, list_name, added_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
+                params![symbol, list],
+            )
+            .unwrap();
+        }
+    }
+
+    fn watchlist_rows(db_path: &PathBuf, symbol: &str) -> (i64, i64) {
+        let conn = open_db(db_path).unwrap();
+        let memberships: i64 = conn
+            .query_row("SELECT COUNT(*) FROM watchlist_memberships WHERE symbol = ?1", params![symbol], |r| r.get(0))
+            .unwrap();
+        let symbols: i64 = conn
+            .query_row("SELECT COUNT(*) FROM watchlist_symbols WHERE symbol = ?1", params![symbol], |r| r.get(0))
+            .unwrap();
+        (memberships, symbols)
+    }
+
+    #[actix_web::test]
+    async fn from_watchlist_records_transaction_and_removes_memberships() {
+        let (_file, db_path) = setup_test_db();
+        seed_watchlist_entry(&db_path, "TST.AX", &["Default", "Growth"]);
+
+        let (status, body) =
+            call_write(&db_path, "POST", "/api/holdings/from-watchlist", Some(purchase_json("TST.AX", 10.0, 5.0))).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["removed_memberships"], 2);
+        assert_eq!(body["transaction"]["symbol"], "TST.AX");
+        assert_eq!(tx_count(&db_path, "TST.AX"), 1);
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (0, 0), "both watchlist tables cleaned up");
+    }
+
+    #[actix_web::test]
+    async fn from_watchlist_rejection_leaves_watchlist_untouched() {
+        let (_file, db_path) = setup_test_db();
+        seed_watchlist_entry(&db_path, "TST.AX", &["Default", "Growth"]);
+
+        let (status, _) =
+            call_write(&db_path, "POST", "/api/holdings/from-watchlist", Some(purchase_json("TST.AX", 0.0, 5.0))).await;
+        assert_eq!(status, 400);
+        assert_eq!(tx_count(&db_path, "TST.AX"), 0, "no transaction on validation failure");
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (2, 1), "watchlist must survive a failed move");
+    }
+
+    // -------------------------------------------------------------------------
+    // Watchlist CRUD + two-table invariants (P2.2)
+    //
+    // The watchlist is a two-table design (watchlist_symbols holds per-symbol
+    // data once; watchlist_memberships one row per list). The invariants
+    // below are documented in CLAUDE.md and enforced only by this code.
+    // The add handler spawns a background Yahoo fetch, so tests exercise
+    // insert_watchlist_symbol (the function it wraps) plus the network-free
+    // handlers.
+    // -------------------------------------------------------------------------
+
+    async fn call_watchlist(
+        db_path: &std::path::Path,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (actix_web::http::StatusCode, serde_json::Value) {
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.to_path_buf()))
+                .service(delete_watchlist_symbol)
+                .service(update_watchlist_symbol_lists),
+        )
+        .await;
+        let mut req = match method {
+            "PUT" => actix_web::test::TestRequest::put(),
+            "DELETE" => actix_web::test::TestRequest::delete(),
+            _ => actix_web::test::TestRequest::get(),
+        }
+        .uri(uri);
+        if let Some(b) = body {
+            req = req.set_json(b);
+        }
+        let resp = actix_web::test::call_service(&app, req.to_request()).await;
+        let status = resp.status();
+        let bytes = actix_web::test::read_body(resp).await;
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    fn membership_ids(db_path: &PathBuf, symbol: &str) -> Vec<i64> {
+        let conn = open_db(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM watchlist_memberships WHERE symbol = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![symbol], |r| r.get(0)).unwrap().flatten().collect()
+    }
+
+    fn membership_lists(db_path: &PathBuf, symbol: &str) -> Vec<String> {
+        let conn = open_db(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT list_name FROM watchlist_memberships WHERE symbol = ?1 ORDER BY list_name")
+            .unwrap();
+        stmt.query_map(params![symbol], |r| r.get(0)).unwrap().flatten().collect()
+    }
+
+    #[actix_web::test]
+    async fn deleting_last_membership_removes_symbol_row() {
+        let (_file, db_path) = setup_test_db();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Default", Some("keep"), None, None, None).unwrap();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Growth", None, None, None, None).unwrap();
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (2, 1));
+
+        let ids = membership_ids(&db_path, "TST.AX");
+        let (status, _) = call_watchlist(&db_path, "DELETE", &format!("/api/watchlist/{}", ids[0]), None).await;
+        assert_eq!(status, 204);
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (1, 1), "symbol row survives while a membership remains");
+
+        let (status, _) = call_watchlist(&db_path, "DELETE", &format!("/api/watchlist/{}", ids[1]), None).await;
+        assert_eq!(status, 204);
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (0, 0), "last membership must cascade the symbol row");
+
+        let (status, resp) = call_watchlist(&db_path, "DELETE", "/api/watchlist/99999", None).await;
+        assert_eq!(status, 404);
+        assert_eq!(resp["error"]["code"], "not_found");
+    }
+
+    #[test]
+    fn adding_to_second_list_preserves_symbol_data() {
+        let (_file, db_path) = setup_test_db();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Default", Some("watch me"), Some(5.0), Some(4.0), None).unwrap();
+        // Second list, no symbol data supplied — COALESCE must keep the originals
+        let row = insert_watchlist_symbol(&db_path, "TST.AX", "Growth", None, None, None, None).unwrap();
+        assert_eq!(row.notes.as_deref(), Some("watch me"));
+        assert_eq!(row.breakthrough_price, Some(5.0));
+        assert_eq!(row.stop_loss_price, Some(4.0));
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (2, 1), "one symbol row, two memberships");
+    }
+
+    #[test]
+    fn duplicate_membership_is_idempotent() {
+        let (_file, db_path) = setup_test_db();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Default", None, None, None, None).unwrap();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Default", None, None, None, None).unwrap();
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (1, 1), "same symbol+list twice must not duplicate");
+    }
+
+    #[test]
+    fn custom_field_merge_deletes_empty_keeps_absent_upserts_rest() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        save_custom_fields(&conn, "TST.AX", &sym_fields(&[("target", "10"), ("conviction", "high")])).unwrap();
+
+        // Partial map: empty deletes, absent untouched, non-empty upserts
+        save_custom_fields(&conn, "TST.AX", &sym_fields(&[("target", ""), ("thesis", " breakout ")])).unwrap();
+
+        let fields = load_custom_fields(&conn, "TST.AX");
+        assert!(!fields.contains_key("target"), "empty value must delete the key");
+        assert_eq!(fields.get("conviction").map(String::as_str), Some("high"), "absent key must be untouched");
+        assert_eq!(fields.get("thesis").map(String::as_str), Some("breakout"), "values are trimmed on upsert");
+    }
+
+    #[test]
+    fn update_by_membership_id_has_partial_semantics() {
+        let (_file, db_path) = setup_test_db();
+        let row = insert_watchlist_symbol(&db_path, "TST.AX", "Default", Some("original"), Some(5.0), Some(4.0), None).unwrap();
+
+        // Absent fields (None) keep current values; explicit Some(None) clears
+        let updated = update_watchlist_symbol_notes(&db_path, row.id, Some(Some("edited".into())), None, Some(None), None).unwrap();
+        assert_eq!(updated.notes.as_deref(), Some("edited"));
+        assert_eq!(updated.breakthrough_price, Some(5.0), "absent field keeps its value");
+        assert_eq!(updated.stop_loss_price, None, "explicit null clears the value");
+
+        let err = match update_watchlist_symbol_notes(&db_path, 99999, None, None, None, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for an unknown membership id"),
+        };
+        assert!(err.contains("not found"), "unknown membership id: {err}");
+    }
+
+    #[actix_web::test]
+    async fn symbol_lists_update_replaces_memberships_transactionally() {
+        let (_file, db_path) = setup_test_db();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Default", Some("notes"), None, None, None).unwrap();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Growth", None, None, None, None).unwrap();
+        let conn = open_db(&db_path).unwrap();
+        save_custom_fields(&conn, "TST.AX", &sym_fields(&[("target", "10")])).unwrap();
+        drop(conn);
+
+        // Lowercase path exercises symbol normalisation; the field map deletes
+        // `target`; Default is dropped, Value added, Growth kept.
+        let body = serde_json::json!({
+            "lists": ["Growth", "Value"],
+            "notes": "rewritten",
+            "breakthrough_price": 6.5,
+            "stop_loss_price": null,
+            "custom_fields": { "target": "" }
+        });
+        let (status, resp) = call_watchlist(&db_path, "PUT", "/api/watchlist/symbol/tst.ax", Some(body)).await;
+        assert_eq!(status, 200);
+
+        assert_eq!(membership_lists(&db_path, "TST.AX"), vec!["Growth", "Value"]);
+        let returned: Vec<&str> = resp.as_array().unwrap().iter().filter_map(|r| r["list_name"].as_str()).collect();
+        assert!(returned.contains(&"Value"), "response reflects the new memberships: {resp}");
+
+        let conn = open_db(&db_path).unwrap();
+        let (notes, bp): (Option<String>, Option<f64>) = conn
+            .query_row(
+                "SELECT notes, breakthrough_price FROM watchlist_symbols WHERE symbol = 'TST.AX'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(notes.as_deref(), Some("rewritten"));
+        assert_eq!(bp, Some(6.5));
+        assert!(load_custom_fields(&conn, "TST.AX").is_empty(), "empty field value deletes the key");
+    }
+
+    #[actix_web::test]
+    async fn symbol_lists_update_requires_at_least_one_list() {
+        let (_file, db_path) = setup_test_db();
+        insert_watchlist_symbol(&db_path, "TST.AX", "Default", None, None, None, None).unwrap();
+
+        let body = serde_json::json!({ "lists": ["  "], "notes": null, "breakthrough_price": null, "stop_loss_price": null });
+        let (status, resp) = call_watchlist(&db_path, "PUT", "/api/watchlist/symbol/TST.AX", Some(body)).await;
+        assert_eq!(status, 400);
+        assert_eq!(resp["error"]["code"], "bad_request");
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (1, 1), "rejected update must change nothing");
+    }
+
+    // -------------------------------------------------------------------------
+    // Auth middleware + /api/v1 alias (P2.3)
+    //
+    // The test app uses the same two wrap_fn layers as main(), in the same
+    // registration order (auth first, v1 rewrite second — actix runs the
+    // later-registered wrap first, so the alias normalises the path before
+    // the auth exemption check sees it).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn constant_time_eq_cases() {
+        assert!(constant_time_eq("secret-token", "secret-token"));
+        assert!(constant_time_eq("", ""));
+        assert!(!constant_time_eq("secret-token", "secret-tokeX"), "same length, different bytes");
+        assert!(!constant_time_eq("secret", "secret-token"), "different lengths");
+        assert!(!constant_time_eq("secret-token", ""), "empty guess");
+    }
+
+    /// Build the middleware stack from main() around real handlers and
+    /// return (status, body) for one request.
+    async fn call_with_auth(
+        db_path: &std::path::Path,
+        token: Option<&str>,
+        method: &str,
+        uri: &str,
+        auth_header: Option<&str>,
+    ) -> (actix_web::http::StatusCode, serde_json::Value) {
+        use actix_web::dev::Service as _;
+        let token: Option<String> = token.map(str::to_string);
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.to_path_buf()))
+                .wrap_fn(move |req, srv| {
+                    let authorized = is_request_authorized(&req, token.as_deref());
+                    let fut = if authorized { Some(srv.call(req)) } else { None };
+                    async move {
+                        match fut {
+                            Some(f) => f.await,
+                            None => Err(actix_web::error::InternalError::from_response(
+                                "unauthorized",
+                                api_error(
+                                    actix_web::http::StatusCode::UNAUTHORIZED,
+                                    "unauthorized",
+                                    "Missing or invalid API token",
+                                ),
+                            )
+                            .into()),
+                        }
+                    }
+                })
+                .wrap_fn(|mut req, srv| {
+                    rewrite_v1_alias(&mut req);
+                    srv.call(req)
+                })
+                .service(health)
+                .service(get_events)
+                .service(get_watchlist_lists),
+        )
+        .await;
+        let mut req = match method {
+            "OPTIONS" => actix_web::test::TestRequest::with_uri(uri).method(actix_web::http::Method::OPTIONS),
+            _ => actix_web::test::TestRequest::get().uri(uri),
+        };
+        if let Some(h) = auth_header {
+            req = req.insert_header(("authorization", h));
+        }
+        // A denied request surfaces as a service Err (the HttpServer boundary
+        // renders it in production) — try_call_service lets the test read it.
+        let (status, bytes) = match actix_web::test::try_call_service(&app, req.to_request()).await {
+            Ok(resp) => {
+                let status = resp.status();
+                (status, actix_web::test::read_body(resp).await)
+            }
+            Err(err) => {
+                let resp = err.error_response();
+                let status = resp.status();
+                let bytes = actix_web::body::to_bytes(resp.into_body())
+                    .await
+                    .unwrap_or_else(|_| actix_web::web::Bytes::new());
+                (status, bytes)
+            }
+        };
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    #[actix_web::test]
+    async fn auth_gate_rejects_missing_wrong_and_malformed_tokens() {
+        let (_file, db_path) = setup_test_db();
+        const TOKEN: Option<&str> = Some("secret-token");
+
+        let (status, body) = call_with_auth(&db_path, TOKEN, "GET", "/api/watchlist/lists", None).await;
+        assert_eq!(status, 401, "no header");
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, _) = call_with_auth(&db_path, TOKEN, "GET", "/api/watchlist/lists", Some("Bearer wrong-token")).await;
+        assert_eq!(status, 401, "wrong token");
+
+        let (status, _) = call_with_auth(&db_path, TOKEN, "GET", "/api/watchlist/lists", Some("secret-token")).await;
+        assert_eq!(status, 401, "missing Bearer prefix");
+
+        let (status, _) = call_with_auth(&db_path, TOKEN, "GET", "/api/watchlist/lists", Some("Bearer secret-token")).await;
+        assert_eq!(status, 200, "correct token");
+    }
+
+    #[actix_web::test]
+    async fn auth_gate_exemptions_and_disabled_mode() {
+        let (_file, db_path) = setup_test_db();
+        const TOKEN: Option<&str> = Some("secret-token");
+
+        let (status, body) = call_with_auth(&db_path, TOKEN, "GET", "/api/health", None).await;
+        assert_eq!(status, 200, "health is reachable without a token");
+        assert_eq!(body["status"], "ok");
+
+        let (status, _) = call_with_auth(&db_path, TOKEN, "GET", "/api/v1/health", None).await;
+        assert_eq!(status, 200, "the v1 alias is rewritten before the exemption check");
+
+        let (status, _) = call_with_auth(&db_path, TOKEN, "OPTIONS", "/api/watchlist/lists", None).await;
+        assert_ne!(status, 401, "CORS preflights must pass the gate");
+
+        let (status, _) = call_with_auth(&db_path, None, "GET", "/api/watchlist/lists", None).await;
+        assert_eq!(status, 200, "no configured token disables auth");
+    }
+
+    #[actix_web::test]
+    async fn v1_alias_rewrites_path_and_preserves_query() {
+        let (_file, db_path) = setup_test_db();
+        let _ = insert_event_log(&db_path, "info", "test", "test", None, "first");
+        let _ = insert_event_log(&db_path, "info", "test", "test", None, "second");
+
+        let (status, body) = call_with_auth(&db_path, None, "GET", "/api/v1/events?size=1", None).await;
+        assert_eq!(status, 200, "v1 path reaches the /api handler");
+        assert_eq!(body["items"].as_array().unwrap().len(), 1, "query string survives the rewrite");
+        assert!(body["total"].as_i64().unwrap() >= 2);
+
+        let (status, _) = call_with_auth(&db_path, None, "GET", "/api/v1/no-such-endpoint", None).await;
+        assert_eq!(status, 404, "unknown v1 path rewrites and then 404s normally");
+    }
+
+    // -------------------------------------------------------------------------
+    // Price-history supplement heuristics (P3.1)
+    // -------------------------------------------------------------------------
+
+    /// 2026-01-05 is a Monday; 2026-01-02 the preceding Friday.
+    #[test]
+    fn last_expected_trading_day_table() {
+        let cases: &[(u32, u32, &str, &str)] = &[
+            // Plain weekdays expect the same day's bar regardless of hour
+            (6, 0, "TST.AX", "2026-01-06"), // Tuesday 00:00
+            (9, 23, "MSFT", "2026-01-09"),  // Friday 23:00
+            // Weekends map back to Friday
+            (3, 12, "TST.AX", "2026-01-02"), // Saturday
+            (4, 12, "MSFT", "2026-01-02"),   // Sunday
+            // Monday around the ASX cutoff (07:00 UTC)
+            (5, 6, "TST.AX", "2026-01-02"),
+            (5, 7, "TST.AX", "2026-01-05"),
+            // Monday around the US cutoff (10:00 UTC)
+            (5, 9, "MSFT", "2026-01-02"),
+            (5, 10, "MSFT", "2026-01-05"),
+            // 08:00 UTC Monday: the two markets diverge — this window was
+            // the ASX Monday-staleness bug. Suffix match is case-insensitive.
+            (5, 8, "tst.ax", "2026-01-05"),
+            (5, 8, "MSFT", "2026-01-02"),
+        ];
+        for (day, hour, symbol, expected) in cases {
+            let now = Utc.with_ymd_and_hms(2026, 1, *day, *hour, 0, 0).unwrap();
+            assert_eq!(
+                last_expected_trading_day(now, symbol),
+                *expected,
+                "2026-01-{day:02} {hour:02}:00 UTC for {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_check_debounces_within_ttl() {
+        assert!(!history_recently_checked("DEB1.TEST"), "unknown symbol is not debounced");
+        mark_history_checked("DEB1.TEST");
+        assert!(history_recently_checked("DEB1.TEST"), "a fresh mark suppresses refetching");
+    }
+
+    #[test]
+    fn history_check_expires_after_ttl() {
+        // Inject a stale timestamp directly — waiting out the real TTL is not viable
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(HISTORY_CHECK_TTL_SECS + 1);
+        HISTORY_CHECKED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert("DEB2.TEST".to_string(), stale);
+        assert!(!history_recently_checked("DEB2.TEST"), "an expired mark allows refetching");
+    }
+
+    #[test]
+    fn history_check_map_prunes_stale_entries_past_capacity() {
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(HISTORY_CHECK_TTL_SECS + 1);
+        {
+            let mut map = HISTORY_CHECKED.get_or_init(Default::default).lock().unwrap();
+            for i in 0..2100 {
+                map.insert(format!("PRUNE{i}.TEST"), stale);
+            }
+        }
+        mark_history_checked("PRUNE-TRIGGER.TEST");
+        let map = HISTORY_CHECKED.get_or_init(Default::default).lock().unwrap();
+        assert!(map.get("PRUNE0.TEST").is_none(), "stale entries are pruned once the map exceeds capacity");
+        assert!(map.get("PRUNE-TRIGGER.TEST").is_some(), "the fresh entry survives the prune");
+    }
+
+    // -------------------------------------------------------------------------
+    // refresh_all debounce semantics (P3.2)
+    // -------------------------------------------------------------------------
+
+    /// The stamp decision: a total failure must NOT stamp (so the next call
+    /// retries), success or an empty portfolio must (so clients debounce).
+    #[test]
+    fn refresh_stamp_decision_table() {
+        assert!(!refresh_should_stamp(true, false), "attempted but everything failed → no stamp, retry allowed");
+        assert!(refresh_should_stamp(true, true), "attempted and something succeeded → stamp");
+        assert!(refresh_should_stamp(false, false), "nothing to do → stamp (an empty portfolio is 'done')");
+        assert!(refresh_should_stamp(false, true), "dividends-only work still counts");
+    }
+
+    fn last_refresh_stamp(db_path: &PathBuf) -> Option<String> {
+        let conn = open_db(db_path).unwrap();
+        conn.query_row(
+            "SELECT value FROM app_config WHERE key = 'last_full_refresh_at'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    async fn post_refresh(db_path: &std::path::Path, uri: &str) -> serde_json::Value {
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.to_path_buf())).service(refresh_all),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post().uri(uri).to_request();
+        actix_web::test::call_and_read_body_json(&app, req).await
+    }
+
+    /// One sequential scenario: REFRESH_IN_FLIGHT is process-global, so the
+    /// debounce cases must not run as parallel tests. The DB is empty (no
+    /// watchlist, no holdings), so no request touches the network.
+    #[actix_web::test]
+    async fn refresh_debounce_scenario() {
+        let (_file, db_path) = setup_test_db();
+
+        // Fresh DB: runs, and an empty portfolio still stamps the debounce
+        let body = post_refresh(&db_path, "/api/refresh").await;
+        assert_eq!(body["skipped"], false, "first call runs: {body}");
+        let first_stamp = last_refresh_stamp(&db_path).expect("empty-portfolio run must stamp");
+        assert!(
+            !REFRESH_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+            "the in-flight flag must clear after a run"
+        );
+
+        // Second call inside the window is debounced and reports the stamp
+        let body = post_refresh(&db_path, "/api/refresh").await;
+        assert_eq!(body["skipped"], true);
+        assert_eq!(body["last_refreshed_at"], first_stamp.as_str());
+
+        // force=true bypasses the debounce
+        let body = post_refresh(&db_path, "/api/refresh?force=true").await;
+        assert_eq!(body["skipped"], false, "force bypasses the window: {body}");
+
+        // A stale stamp (older than the 600s window) no longer debounces
+        upsert_config(&db_path, "last_full_refresh_at", &(Utc::now() - chrono::Duration::seconds(601)).to_rfc3339()).unwrap();
+        let body = post_refresh(&db_path, "/api/refresh").await;
+        assert_eq!(body["skipped"], false, "expired window runs again: {body}");
+        let new_stamp = last_refresh_stamp(&db_path).unwrap();
+        assert!(new_stamp > first_stamp, "a completed run re-stamps");
+
+        // While a refresh is in flight, even force is skipped — and the
+        // caller is told why
+        REFRESH_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let body = post_refresh(&db_path, "/api/refresh?force=true").await;
+        assert_eq!(body["skipped"], true);
+        assert_eq!(body["reason"], "refresh_in_progress");
+        REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[actix_web::test]
+    async fn update_transaction_rewrites_fields() {
+        let (_file, db_path) = setup_test_db();
+        let (_, created) = call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("TST.AX", 10.0, 5.0))).await;
+
+        let updated = serde_json::json!({
+            "symbol": "TST.AX", "transaction_type": "purchase",
+            "date": "2026-02-01", "quantity": 12.0, "price": 5.5
+        });
+        let (status, record) =
+            call_write(&db_path, "PUT", &format!("/api/holdings/{}", created["id"]), Some(updated)).await;
+        assert_eq!(status, 200);
+        assert_eq!(record["date"], "2026-02-01");
+        assert!(close_to(&record["quantity"], 12.0));
+        assert!(close_to(&record["price"], 5.5));
+        assert_eq!(tx_count(&db_path, "TST.AX"), 1, "update must not duplicate the row");
     }
 }

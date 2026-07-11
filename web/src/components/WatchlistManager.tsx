@@ -172,16 +172,16 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     try {
       setLoading(true)
       setError(null)
-      apiClient.getMeta().then((m) => { if (m.sectors?.length) setSectorOptions(m.sectors) }).catch(() => {})
+      apiClient.getMeta().then((m) => {
+        if (m.sectors?.length) setSectorOptions(m.sectors)
+        // Field definitions come pre-parsed from /api/meta
+        setCustomFieldDefs((m.watchlist_custom_fields ?? []) as CustomFieldDef[])
+      }).catch(() => {})
       const [listsData, enriched, configData] = await Promise.all([
         apiClient.getWatchlistLists(),
         apiClient.getWatchlistEnriched(),
         apiClient.getConfig(),
       ])
-      try {
-        const defs = JSON.parse(configData['watchlist_custom_fields'] ?? '[]') as CustomFieldDef[]
-        setCustomFieldDefs(defs)
-      } catch { setCustomFieldDefs([]) }
       setPricesUpdatedAt(configData['watchlist_prices_updated_at'] ?? null)
       const savedDefault = configData['default_watchlist'] ?? ''
       const effectiveLists = listsData.length > 0 ? listsData : ['Default']
@@ -255,6 +255,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       }
       const bp = parsePrice(newSymbolFields['breakthrough_price'])
       const sl = parsePrice(newSymbolFields['stop_loss_price'])
+      // Strip the two built-in keys; only true custom fields go in custom_fields
       const { breakthrough_price: _bp, stop_loss_price: _sl, ...cfFields } = newSymbolFields
       const result = await apiClient.addWatchlistSymbol(newSymbol.trim(), selectedList, newSymbolNotes.trim() || undefined, { breakthroughPrice: bp, stopLossPrice: sl, customFields: cfFields })
       setNewSymbol('')

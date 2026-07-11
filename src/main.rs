@@ -43,6 +43,8 @@ struct YahooMeta {
     #[serde(rename = "longName")]
     long_name: Option<String>,
     currency: Option<String>,
+    /// Exchange UTC offset in seconds — needed to date bars correctly
+    gmtoffset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,23 +96,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let run_once = env::var("RUN_ONCE").is_ok() || env::args().any(|arg| arg == "--once");
-    let watchlist_only = env::var("WATCHLIST_ONLY").is_ok() || env::args().any(|arg| arg == "--watchlist-only");
     let historical_range = parse_historical_range()?;
-    let watchlist_symbols = env::var("WATCHLIST_SYMBOLS").unwrap_or_default();
-    let watchlist_interval_secs = env::var("WATCHLIST_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(900);
-    let watchlist_symbols: Vec<String> = watchlist_symbols
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(normalize_symbol)
-        .collect();
-    let watchlist_enabled = !watchlist_symbols.is_empty();
 
-    if watchlist_only && !watchlist_enabled {
-        anyhow::bail!("WATCHLIST_ONLY requires WATCHLIST_SYMBOLS to be set.");
+    // The intraday watchlist pipeline was removed: watchlist prices are served
+    // from the API's price cache (populated by /api/v1/refresh and on-demand
+    // fetches). The daemon's job is daily closes into the `prices` table.
+    if env::var("WATCHLIST_SYMBOLS").is_ok()
+        || env::var("WATCHLIST_ONLY").is_ok()
+        || env::var("WATCHLIST_INTERVAL_SECS").is_ok()
+        || env::args().any(|arg| arg == "--watchlist-only")
+    {
+        log::warn!(
+            "WATCHLIST_SYMBOLS/WATCHLIST_ONLY/WATCHLIST_INTERVAL_SECS are no longer used; \
+             intraday watchlist prices come from the API's price cache (POST /api/v1/refresh)."
+        );
     }
 
     let db_path = PathBuf::from(database_path);
@@ -122,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let today = Utc::now().date_naive();
-    if !watchlist_only && historical_range.is_none() && is_asx_market_closed(today, &manual_holidays) {
+    if historical_range.is_none() && is_asx_market_closed(today, &manual_holidays) {
         log::info!("ASX is closed today ({}) - skipping update.", today);
         return Ok(());
     }
@@ -130,38 +129,7 @@ async fn main() -> anyhow::Result<()> {
     if run_once {
         log::info!("Running one-shot ASX update for symbols: {:?}", symbols);
         run_one_shot(&client, &db_path, &symbols, historical_range.as_ref()).await?;
-        if watchlist_enabled {
-            log::info!("Running one-shot watchlist update for symbols: {:?}", watchlist_symbols);
-            run_watchlist_once(&client, &db_path, &watchlist_symbols, historical_range.as_ref()).await?;
-        }
         return Ok(());
-    }
-
-    if watchlist_only {
-        log::info!("Starting watchlist-only mode for symbols: {:?}", watchlist_symbols);
-        watchlist_loop(
-            &client,
-            &db_path,
-            watchlist_interval_secs,
-            historical_range.clone(),
-        )
-        .await;
-        return Ok(());
-    }
-
-    if watchlist_enabled {
-        let client_clone = client.clone();
-        let db_path_clone = db_path.clone();
-        let historical_range_clone = historical_range.clone();
-        tokio::spawn(async move {
-            watchlist_loop(
-                &client_clone,
-                &db_path_clone,
-                watchlist_interval_secs,
-                historical_range_clone,
-            )
-            .await;
-        });
     }
 
     log::info!(
@@ -194,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        next_run = next_run + ChronoDuration::days(1);
+        next_run += ChronoDuration::days(1);
     }
 }
 
@@ -213,103 +181,25 @@ async fn run_one_shot(
     Ok(())
 }
 
-async fn run_watchlist_once(
-    client: &Client,
-    db_path: &PathBuf,
-    symbols: &[String],
-    historical_range: Option<&DateRange>,
-) -> anyhow::Result<()> {
-    for symbol in symbols.iter() {
-        match fetch_and_store_watchlist(client, db_path, symbol, historical_range).await {
-            Ok(count) => log::info!("Watchlist stored {} rows for {}", count, symbol),
-            Err(err) => log::error!("Watchlist failed for {}: {}", symbol, err),
-        }
-    }
-    Ok(())
-}
 
 fn next_daily_run(hour: u32, minute: u32) -> chrono::DateTime<Local> {
-    let now = Local::now();
+    next_daily_run_from(Local::now(), hour, minute)
+}
+
+/// Next occurrence of hh:mm strictly after `now` — today if the time is
+/// still ahead, otherwise tomorrow. An invalid hour/minute falls back to
+/// the default 16:15 schedule.
+fn next_daily_run_from(now: chrono::DateTime<Local>, hour: u32, minute: u32) -> chrono::DateTime<Local> {
     let today_target = now
         .date_naive()
         .and_hms_opt(hour, minute, 0)
         .unwrap_or_else(|| now.date_naive().and_hms_opt(16, 15, 0).unwrap());
 
-    let next = if now.time() < today_target.time() {
+    if now.time() < today_target.time() {
         Local.from_local_datetime(&today_target).unwrap()
     } else {
         Local.from_local_datetime(&(today_target + ChronoDuration::days(1))).unwrap()
-    };
-
-    next
-}
-
-/// Read a u64 value from app_config. The Configuration screen writes
-/// WATCHLIST_INTERVAL_SECS there, so edits take effect on the next cycle
-/// without restarting the daemon.
-fn load_config_u64(db_path: &PathBuf, key: &str) -> Option<u64> {
-    let conn = open_db(db_path).ok()?;
-    conn.query_row(
-        "SELECT value FROM app_config WHERE key = ?1",
-        params![key],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()?
-    .trim()
-    .parse()
-    .ok()
-}
-
-async fn watchlist_loop(
-    client: &Client,
-    db_path: &PathBuf,
-    default_interval_secs: u64,
-    historical_range: Option<DateRange>,
-) {
-    loop {
-        let today = Utc::now().date_naive();
-        if let Err(err) = purge_old_watchlist_entries(db_path, today) {
-            log::error!("Watchlist cleanup failed: {}", err);
-        }
-
-        match load_watchlist_symbols(db_path) {
-            Ok(symbols) if !symbols.is_empty() => {
-                for symbol in symbols.iter() {
-                    match fetch_and_store_watchlist(client, db_path, symbol, historical_range.as_ref()).await {
-                        Ok(count) => log::info!("Watchlist stored {} rows for {}", count, symbol),
-                        Err(err) => log::error!("Watchlist failed for {}: {}", symbol, err),
-                    }
-                }
-            }
-            Ok(_) => log::info!("No watchlist symbols configured; skipping watchlist tick."),
-            Err(err) => log::error!("Unable to load watchlist symbols: {}", err),
-        }
-
-        let interval_secs = load_config_u64(db_path, "WATCHLIST_INTERVAL_SECS")
-            .filter(|&secs| secs >= 30)
-            .unwrap_or(default_interval_secs);
-        time::sleep(Duration::from_secs(interval_secs)).await;
     }
-}
-
-async fn fetch_and_store_watchlist(
-    client: &Client,
-    db_path: &PathBuf,
-    symbol: &str,
-    historical_range: Option<&DateRange>,
-) -> anyhow::Result<usize> {
-    let (prices, instrument_type, long_name, currency) = fetch_closing_prices(client, symbol, historical_range).await?;
-    store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref(), currency.as_deref())?;
-    store_watchlist_prices(db_path, symbol, prices)
-}
-
-fn purge_old_watchlist_entries(db_path: &PathBuf, today: NaiveDate) -> anyhow::Result<()> {
-    let conn = open_db(db_path)?;
-    conn.execute(
-        "DELETE FROM watchlist_prices WHERE date <> ?1",
-        params![today.format("%Y-%m-%d").to_string()],
-    )?;
-    Ok(())
 }
 
 fn normalize_symbol(symbol: &str) -> String {
@@ -383,12 +273,17 @@ fn is_asx_market_closed(date: NaiveDate, manual_holidays: &[NaiveDate]) -> bool 
 }
 
 fn parse_asx_manual_holidays() -> Vec<NaiveDate> {
-    let env_value = env::var("ASX_HOLIDAY_OVERRIDES").unwrap_or_default();
-    if env_value.trim().is_empty() {
+    parse_holiday_list(&env::var("ASX_HOLIDAY_OVERRIDES").unwrap_or_default())
+}
+
+/// Parse a comma-separated list of YYYY-MM-DD dates; invalid entries are
+/// logged and skipped rather than failing the whole list.
+fn parse_holiday_list(value: &str) -> Vec<NaiveDate> {
+    if value.trim().is_empty() {
         return Vec::new();
     }
 
-    env_value
+    value
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -403,16 +298,16 @@ fn parse_asx_manual_holidays() -> Vec<NaiveDate> {
 }
 
 fn asx_holidays(year: i32) -> Vec<NaiveDate> {
-    let mut list = Vec::new();
-    list.push(observed_new_years_day(year));
-    list.push(observed_australia_day(year));
-    list.push(good_friday(year));
-    list.push(easter_monday(year));
-    list.push(observed_anzac_day(year));
-    list.push(queens_birthday(year));
-    list.push(observed_christmas_day(year));
-    list.push(observed_boxing_day(year));
-    list
+    vec![
+        observed_new_years_day(year),
+        observed_australia_day(year),
+        good_friday(year),
+        easter_monday(year),
+        observed_anzac_day(year),
+        queens_birthday(year),
+        observed_christmas_day(year),
+        observed_boxing_day(year),
+    ]
 }
 
 fn observed_new_years_day(year: i32) -> NaiveDate {
@@ -511,23 +406,6 @@ fn init_db(path: &PathBuf) -> anyhow::Result<()> {
             UNIQUE(symbol, date)
         );
         CREATE INDEX IF NOT EXISTS idx_prices_symbol_date ON prices(symbol, date);
-        CREATE TABLE IF NOT EXISTS watchlist_prices (
-            id INTEGER PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            date TEXT NOT NULL,
-            fetched_at TEXT NOT NULL,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume INTEGER,
-            UNIQUE(symbol, date)
-        );
-        CREATE INDEX IF NOT EXISTS idx_watchlist_prices_symbol_date ON watchlist_prices(symbol, date);
-        CREATE TABLE IF NOT EXISTS watchlist_symbols (
-            symbol TEXT PRIMARY KEY,
-            updated_at TEXT NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS app_config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -563,6 +441,19 @@ async fn fetch_and_store(
     let (prices, instrument_type, long_name, currency) = fetch_closing_prices(client, symbol, historical_range).await?;
     store_symbol_info(db_path, symbol, instrument_type.as_deref(), long_name.as_deref(), currency.as_deref())?;
     store_prices(db_path, symbol, prices)
+}
+
+/// Date a Yahoo daily bar by its exchange-local trading day. Yahoo stamps
+/// bars at the market open; for exchanges ahead of UTC (ASX opens 10:00
+/// Sydney = 23:00 UTC the *previous* day during daylight saving) the UTC
+/// date is one day early, so the date is taken in exchange time:
+/// UTC + meta.gmtoffset.
+fn bar_date(ts: i64, gmtoffset: Option<i64>) -> String {
+    Utc.timestamp_opt(ts + gmtoffset.unwrap_or(0), 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap())
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 async fn fetch_closing_prices(
@@ -618,14 +509,10 @@ async fn fetch_closing_prices(
         .first()
         .ok_or_else(|| anyhow::anyhow!("No quote data in Yahoo response for {}", symbol))?;
 
+    let gmtoffset = result.meta.gmtoffset;
     let mut records = Vec::with_capacity(timestamp.len());
     for (index, ts) in timestamp.iter().enumerate() {
-        let date = Utc
-            .timestamp_opt(*ts, 0)
-            .single()
-            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap())
-            .format("%Y-%m-%d")
-            .to_string();
+        let date = bar_date(*ts, gmtoffset);
 
         let record = PriceRecord {
             date,
@@ -689,50 +576,16 @@ fn store_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> a
 
     drop(insert);
     tx.commit()?;
+    // Stamp the refresh so /api/v1/sync-state can tell polling clients that
+    // daily closes changed (the prices table itself has no audit trigger).
+    conn.execute(
+        "INSERT INTO app_config (key, value) VALUES ('daily_prices_updated_at', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![Utc::now().to_rfc3339()],
+    )?;
     // Log event
     let details = format!("Inserted {} price records", count);
     let _ = insert_event_log(db_path, "info", "price_update", "daemon", Some(symbol), &details);
-    Ok(count)
-}
-
-fn load_watchlist_symbols(db_path: &PathBuf) -> anyhow::Result<Vec<String>> {
-    let conn = open_db(db_path)?;
-    let mut stmt = conn.prepare("SELECT symbol FROM watchlist_symbols ORDER BY symbol")?;
-    let rows = stmt
-        .query_map([], |row| row.get::<usize, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-fn store_watchlist_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> anyhow::Result<usize> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction()?;
-    let mut insert = tx.prepare(
-        "INSERT OR REPLACE INTO watchlist_prices (symbol, date, fetched_at, open, high, low, close, volume)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
-
-    let fetched_at = Utc::now().to_rfc3339();
-    let mut count = 0;
-
-    for record in records.into_iter().filter(|r| r.close.is_some()) {
-        insert.execute(params![
-            symbol,
-            record.date,
-            fetched_at,
-            record.open,
-            record.high,
-            record.low,
-            record.close,
-            record.volume,
-        ])?;
-        count += 1;
-    }
-
-    drop(insert);
-    tx.commit()?;
-    let details = format!("Inserted {} watchlist price records", count);
-    let _ = insert_event_log(db_path, "info", "price_update", "watchlist", Some(symbol), &details);
     Ok(count)
 }
 
@@ -751,4 +604,173 @@ fn insert_event_log(
         params![now, level, source, event_type, symbol, details],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AEDT: i64 = 11 * 3600; // Sydney daylight saving, Oct–Apr
+    const AEST: i64 = 10 * 3600; // Sydney standard time
+    const EST: i64 = -5 * 3600; // New York standard time
+
+    fn utc_ts(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+        Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap().timestamp()
+    }
+
+    /// The bug this guards against: an ASX bar for Monday opens 10:00 AEDT,
+    /// which is 23:00 UTC *Sunday*. Dating it in UTC filed Monday's close
+    /// under Sunday for every daylight-saving trading day.
+    #[test]
+    fn bar_date_aedt_open_dates_as_local_trading_day() {
+        let ts = utc_ts(2026, 1, 4, 23, 0); // Mon 2026-01-05 10:00 AEDT
+        assert_eq!(bar_date(ts, Some(AEDT)), "2026-01-05");
+    }
+
+    #[test]
+    fn bar_date_aest_open_is_unchanged() {
+        let ts = utc_ts(2026, 6, 1, 0, 0); // Mon 2026-06-01 10:00 AEST
+        assert_eq!(bar_date(ts, Some(AEST)), "2026-06-01");
+    }
+
+    #[test]
+    fn bar_date_us_open_is_unchanged() {
+        let ts = utc_ts(2026, 1, 5, 14, 30); // Mon 2026-01-05 09:30 EST
+        assert_eq!(bar_date(ts, Some(EST)), "2026-01-05");
+    }
+
+    #[test]
+    fn bar_date_missing_offset_falls_back_to_utc() {
+        let ts = utc_ts(2026, 1, 4, 23, 0);
+        assert_eq!(bar_date(ts, None), "2026-01-04");
+    }
+
+    /// gmtoffset must survive deserialisation of the daemon's chart payload —
+    /// if the field is dropped, every AEDT bar silently shifts a day early.
+    #[test]
+    fn chart_response_parses_gmtoffset() {
+        let json = r#"{
+            "chart": {
+                "result": [{
+                    "meta": {
+                        "instrumentType": "EQUITY",
+                        "longName": "Washington H. Soul Pattinson",
+                        "currency": "AUD",
+                        "gmtoffset": 39600
+                    },
+                    "timestamp": [1767564000],
+                    "indicators": { "quote": [{
+                        "open": [37.0], "high": [37.5], "low": [36.9],
+                        "close": [37.39], "volume": [100000]
+                    }] }
+                }],
+                "error": null
+            }
+        }"#;
+        let payload: YahooChartResponse = serde_json::from_str(json).unwrap();
+        let result = &payload.chart.result.unwrap()[0];
+        assert_eq!(result.meta.gmtoffset, Some(AEDT));
+        // 1767564000 = 2026-01-04 22:00 UTC = 2026-01-05 09:00 AEDT
+        assert_eq!(bar_date(result.timestamp.as_ref().unwrap()[0], result.meta.gmtoffset), "2026-01-05");
+    }
+
+    // -------------------------------------------------------------------------
+    // ASX calendar and schedule functions (P3.3). A wrong holiday means a
+    // silently skipped daily close (or a junk fetch on a closed day).
+    // -------------------------------------------------------------------------
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn easter_dates_for_known_years() {
+        // Computus verification against published calendars
+        assert_eq!(easter_sunday(2024), d(2024, 3, 31));
+        assert_eq!(easter_sunday(2025), d(2025, 4, 20));
+        assert_eq!(easter_sunday(2026), d(2026, 4, 5));
+        assert_eq!(good_friday(2026), d(2026, 4, 3));
+        assert_eq!(easter_monday(2026), d(2026, 4, 6));
+    }
+
+    #[test]
+    fn holidays_observed_on_weekdays_are_unshifted() {
+        assert_eq!(observed_new_years_day(2026), d(2026, 1, 1)); // Thursday
+        assert_eq!(observed_australia_day(2026), d(2026, 1, 26)); // Monday
+        assert_eq!(observed_anzac_day(2025), d(2025, 4, 25)); // Friday
+        assert_eq!(observed_christmas_day(2026), d(2026, 12, 25)); // Friday
+    }
+
+    #[test]
+    fn weekend_holidays_shift_to_the_observed_weekday() {
+        assert_eq!(observed_new_years_day(2022), d(2022, 1, 3), "Sat 1 Jan → Mon 3 Jan");
+        assert_eq!(observed_new_years_day(2023), d(2023, 1, 2), "Sun 1 Jan → Mon 2 Jan");
+        assert_eq!(observed_australia_day(2025), d(2025, 1, 27), "Sun 26 Jan → Mon 27 Jan");
+        assert_eq!(observed_anzac_day(2026), d(2026, 4, 27), "Sat 25 Apr → Mon 27 Apr");
+        // Christmas Sat/Sun both observe Mon 27th; Boxing Day then takes the 28th
+        assert_eq!(observed_christmas_day(2027), d(2027, 12, 27), "Sat 25 Dec → Mon 27 Dec");
+        assert_eq!(observed_boxing_day(2027), d(2027, 12, 28), "Sun 26 Dec → Tue 28 Dec");
+        assert_eq!(observed_boxing_day(2026), d(2026, 12, 28), "Sat 26 Dec → Mon 28 Dec");
+        // Boxing Day on a Monday stays put (Christmas Sunday observes Tue 27th)
+        assert_eq!(observed_boxing_day(2022), d(2022, 12, 26));
+        assert_eq!(observed_christmas_day(2022), d(2022, 12, 27));
+    }
+
+    #[test]
+    fn kings_birthday_is_second_monday_of_june() {
+        assert_eq!(queens_birthday(2025), d(2025, 6, 9));
+        assert_eq!(queens_birthday(2026), d(2026, 6, 8)); // 1 June is itself a Monday
+    }
+
+    #[test]
+    fn market_closed_on_weekends_holidays_and_overrides() {
+        assert!(is_asx_market_closed(d(2026, 7, 11), &[]), "Saturday");
+        assert!(is_asx_market_closed(d(2026, 7, 12), &[]), "Sunday");
+        assert!(is_asx_market_closed(d(2026, 4, 3), &[]), "Good Friday");
+        assert!(is_asx_market_closed(d(2026, 12, 28), &[]), "observed Boxing Day");
+        assert!(!is_asx_market_closed(d(2026, 7, 8), &[]), "ordinary Wednesday");
+        // A manual override closes an otherwise-open day
+        assert!(is_asx_market_closed(d(2026, 7, 8), &[d(2026, 7, 8)]));
+    }
+
+    #[test]
+    fn business_back_date_skips_weekends_and_manual_holidays() {
+        // Wed 8 Jul back 3 business days: Tue 7, Mon 6, (skip weekend) Fri 3
+        assert_eq!(calculate_business_back_date(d(2026, 7, 8), 3, &[]), d(2026, 7, 3));
+        // With Mon 6 Jul closed by override, the third day lands on Thu 2 Jul
+        assert_eq!(calculate_business_back_date(d(2026, 7, 8), 3, &[d(2026, 7, 6)]), d(2026, 7, 2));
+    }
+
+    #[test]
+    fn holiday_list_parsing_skips_invalid_entries() {
+        assert_eq!(parse_holiday_list(""), Vec::<NaiveDate>::new());
+        assert_eq!(parse_holiday_list("  "), Vec::<NaiveDate>::new());
+        assert_eq!(
+            parse_holiday_list("2026-07-08, 2026-12-31"),
+            vec![d(2026, 7, 8), d(2026, 12, 31)]
+        );
+        // Invalid entries are dropped, valid ones kept
+        assert_eq!(parse_holiday_list("garbage, 2026-07-08, 31/12/2026"), vec![d(2026, 7, 8)]);
+    }
+
+    #[test]
+    fn next_daily_run_today_or_tomorrow() {
+        let at = |h: u32, min: u32| Local.with_ymd_and_hms(2026, 7, 8, h, min, 0).unwrap();
+
+        // Before the target time → today at hh:mm
+        let run = next_daily_run_from(at(10, 0), 16, 15);
+        assert_eq!(run, at(16, 15));
+
+        // After the target time → tomorrow at hh:mm
+        let run = next_daily_run_from(at(17, 0), 16, 15);
+        assert_eq!(run, Local.with_ymd_and_hms(2026, 7, 9, 16, 15, 0).unwrap());
+
+        // Exactly at the target time counts as passed → tomorrow
+        let run = next_daily_run_from(at(16, 15), 16, 15);
+        assert_eq!(run, Local.with_ymd_and_hms(2026, 7, 9, 16, 15, 0).unwrap());
+
+        // An invalid schedule falls back to the default 16:15
+        let run = next_daily_run_from(at(10, 0), 99, 0);
+        assert_eq!(run, at(16, 15));
+    }
 }

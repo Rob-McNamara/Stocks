@@ -6,30 +6,9 @@ interface ConfigPanelProps {
   onConfigChanged?: () => void
 }
 
-interface ConfigItem {
-  key: string
-  value: string
-  description: string
-  type: 'string' | 'number'
-}
-
-// Only settings the daemon actually reads from the database belong here.
-// Fetch schedule (FETCH_SCHEDULE_HOUR/MINUTE) and DATABASE_PATH are
-// environment variables read at daemon startup and can't be changed from
-// this screen.
-const CONFIG_SCHEMA: ConfigItem[] = [
-  {
-    key: 'WATCHLIST_INTERVAL_SECS',
-    value: '900',
-    description: 'Interval between watchlist price updates (seconds, min 30) — applies from the next daemon cycle',
-    type: 'number'
-  }
-]
 
 export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelProps) {
   const [config, setConfig] = useState<Record<string, string>>({})
-  const [editingKey, setEditingKey] = useState<string | null>(null)
-  const [editingValue, setEditingValue] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -83,40 +62,6 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       setLoading(false)
       onLoading(false)
     }
-  }
-
-  const handleEdit = (key: string) => {
-    setEditingKey(key)
-    setEditingValue(config[key] || '')
-    setError(null)
-    setSuccess(null)
-  }
-
-  const handleSave = async (key: string) => {
-    try {
-      setLoading(true)
-      setError(null)
-      setSuccess(null)
-
-      await apiClient.updateConfig(key, editingValue)
-      setConfig({ ...config, [key]: editingValue })
-      setEditingKey(null)
-      setSuccess(`Updated ${key}`)
-      onConfigChanged?.()
-
-      // Clear success message after 3 seconds
-      setTimeout(() => setSuccess(null), 3000)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update configuration')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
-  }
-
-  const handleCancel = () => {
-    setEditingKey(null)
-    setEditingValue('')
   }
 
   const manualPrices = Object.entries(config)
@@ -244,56 +189,6 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
         <p className="loading-text">Loading configuration...</p>
       ) : (
         <>
-          <div className="config-list">
-            {CONFIG_SCHEMA.map(({ key, description, type }) => (
-              <div key={key} className="config-item">
-                <div className="config-info">
-                  <label className="config-key">{key}</label>
-                  <p className="config-description">{description}</p>
-                </div>
-                <div className="config-value-container">
-                  {editingKey === key ? (
-                    <div className="config-edit">
-                      <input
-                        type={type === 'number' ? 'number' : 'text'}
-                        value={editingValue}
-                        onChange={(e) => setEditingValue(e.target.value)}
-                        className="config-input"
-                        disabled={loading}
-                        min={type === 'number' ? '1' : undefined}
-                      />
-                      <button
-                        onClick={() => handleSave(key)}
-                        className="btn btn-primary btn-small"
-                        disabled={loading}
-                      >
-                        Save
-                      </button>
-                      <button
-                        onClick={handleCancel}
-                        className="btn btn-secondary btn-small"
-                        disabled={loading}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="config-display">
-                      <span className="config-value">{config[key] || '—'}</span>
-                      <button
-                        onClick={() => handleEdit(key)}
-                        className="btn btn-outline btn-small"
-                        disabled={loading}
-                      >
-                        Edit
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-
           <div className="manager-card" style={{ marginTop: 24 }}>
             <h2>Manual Prices</h2>
             <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
@@ -954,10 +849,10 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
             <h3>⚙️ Configuration Notes</h3>
             <ul>
               <li>
-                <strong>WATCHLIST_INTERVAL_SECS:</strong> How often intraday watchlist prices are updated (default 900 = 15 minutes). The daemon re-reads this each cycle, so no restart is needed.
+                Intraday prices are managed by the API server: refreshed on app startup (<code>POST /api/v1/refresh</code>, debounced) and via the Update Prices buttons.
               </li>
               <li>
-                The daily fetch schedule (<code>FETCH_SCHEDULE_HOUR</code>/<code>FETCH_SCHEDULE_MINUTE</code>) and <code>DATABASE_PATH</code> are environment variables read when the daemon starts — change them in the daemon's launch configuration, not here.
+                The price daemon only stores daily ASX closes and is configured entirely by environment variables (<code>STOCK_SYMBOLS</code>, <code>FETCH_SCHEDULE_HOUR</code>/<code>FETCH_SCHEDULE_MINUTE</code>, <code>DATABASE_PATH</code>) — change them in its launch configuration.
               </li>
             </ul>
           </div>

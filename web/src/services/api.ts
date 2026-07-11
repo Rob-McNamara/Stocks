@@ -117,6 +117,8 @@ export interface CustomListEntry {
   diff: number
   pct_diff: number
   currency: string | null
+  /** True when field_value is a trailing-sell trigger rather than a manual stop loss */
+  is_trailing: boolean
 }
 
 export interface CustomListResult {
@@ -209,6 +211,9 @@ export interface PortfolioHolding {
   pl: number
   pl_pct: number | null
   sma150: number | null
+  /** Effective stop loss in native currency: manual field, or the trailing-sell trigger */
+  stop_loss: number | null
+  is_trailing_sell: boolean
 }
 
 export interface RiskRow {
@@ -282,6 +287,8 @@ export interface SyncState {
   config: string | null
   watchlist_prices_updated_at: string | null
   holdings_prices_updated_at: string | null
+  /** Stamped by the price daemon's daily close run */
+  daily_prices_updated_at: string | null
   last_full_refresh_at: string | null
   server_time: string
 }
@@ -329,7 +336,11 @@ export const apiClient = {
     return response.json()
   },
 
-  /** Per-domain last-modified stamps — poll this instead of refetching payloads. */
+  /**
+   * Per-domain last-modified stamps — poll this instead of refetching payloads.
+   * Currently unused by the web app (it refetches on navigation); kept for
+   * parity with the mobile client, which polls it to decide when to sync.
+   */
   async getSyncState(): Promise<SyncState> {
     const response = await apiFetch(`${API_BASE_URL}/sync-state`)
     if (!response.ok) throw new Error('Failed to fetch sync state')
@@ -466,16 +477,6 @@ export const apiClient = {
     return response.json()
   },
 
-  async updateWatchlistSymbol(id: number, notes: string | null, opts?: { breakthroughPrice?: number | null; stopLossPrice?: number | null; customFields?: Record<string, string> }): Promise<WatchlistSymbol> {
-    const response = await apiFetch(`${API_BASE_URL}/watchlist/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notes, breakthrough_price: opts?.breakthroughPrice ?? null, stop_loss_price: opts?.stopLossPrice ?? null, custom_fields: opts?.customFields ?? {} })
-    })
-    if (!response.ok) throw new Error('Failed to update symbol')
-    return response.json()
-  },
-
   async removeWatchlistSymbol(id: number): Promise<void> {
     const response = await apiFetch(`${API_BASE_URL}/watchlist/${id}`, {
       method: 'DELETE'
@@ -496,13 +497,6 @@ export const apiClient = {
     const url = list ? `${API_BASE_URL}/watchlist/prices?list=${encodeURIComponent(list)}` : `${API_BASE_URL}/watchlist/prices`
     const response = await apiFetch(url)
     if (!response.ok) throw new Error('Failed to fetch current prices')
-    return response.json()
-  },
-
-  async getWatchlistCachedPrices(list?: string): Promise<CurrentPrice[]> {
-    const url = list ? `${API_BASE_URL}/watchlist/cached-prices?list=${encodeURIComponent(list)}` : `${API_BASE_URL}/watchlist/cached-prices`
-    const response = await apiFetch(url)
-    if (!response.ok) throw new Error('Failed to fetch cached prices')
     return response.json()
   },
 
@@ -657,12 +651,6 @@ export const apiClient = {
   async getFxRateForDate(currency: string, date: string): Promise<{ rate: number; date: string } | null> {
     const response = await apiFetch(`${API_BASE_URL}/fx-rate?currency=${encodeURIComponent(currency)}&date=${encodeURIComponent(date)}`)
     if (!response.ok) return null
-    return response.json()
-  },
-
-  async getDividends(): Promise<{ symbol: string; ex_date: string; payment_date: string | null; amount: number }[]> {
-    const response = await apiFetch(`${API_BASE_URL}/dividends`)
-    if (!response.ok) throw new Error('Failed to fetch dividends')
     return response.json()
   },
 
