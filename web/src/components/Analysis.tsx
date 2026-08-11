@@ -306,12 +306,15 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
       </div>
 
       {editingStopLossSymbol && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+        <div className="modal-overlay"
           onClick={() => setEditingStopLossSymbol(null)}>
-          <div style={{ background: '#fff', borderRadius: 8, padding: 24, minWidth: 320, boxShadow: '0 4px 24px rgba(0,0,0,0.18)' }}
+          <div className="modal-card" style={{ minWidth: 320 }}
             onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 16px' }}>Edit Stop Loss — {editingStopLossSymbol}</h3>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 20 }}>
+            <div className="modal-header">
+              <h3 style={{ margin: 0 }}>Edit Stop Loss — {editingStopLossSymbol}</h3>
+            </div>
+            <div className="modal-body">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <label style={{ fontSize: 13, color: '#666' }}>Stop Loss Price</label>
                 <input
@@ -350,7 +353,8 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
                 />
               </div>
             </div>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            </div>
+            <div className="modal-footer">
               <button className="btn btn-outline" onClick={() => setEditingStopLossSymbol(null)}>Cancel</button>
               <button
                 className="btn btn-primary"

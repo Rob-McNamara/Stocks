@@ -1070,11 +1070,14 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       </div>
 
       {editingSymbolCard && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+        <div className="modal-overlay"
           onClick={() => setEditingSymbolCard(null)}>
-          <div style={{ background: '#fff', borderRadius: 8, padding: 24, minWidth: 320, boxShadow: '0 4px 24px rgba(0,0,0,0.18)' }}
+          <div className="modal-card" style={{ minWidth: 320 }}
             onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 16px' }}>Edit {editingSymbolCard}</h3>
+            <div className="modal-header">
+              <h3 style={{ margin: 0 }}>Edit {editingSymbolCard}</h3>
+            </div>
+            <div className="modal-body">
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 16 }}>
               <label style={{ fontSize: 13, color: '#666' }}>Stock Symbol</label>
               <input
@@ -1166,7 +1169,8 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 </div>
               ))}
             </div>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            </div>
+            <div className="modal-footer">
               <button className="btn btn-outline" onClick={() => setEditingSymbolCard(null)}>Cancel</button>
               <button
                 className="btn btn-primary"

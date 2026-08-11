@@ -350,9 +350,12 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       </div>
 
       {editing && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div style={{ background: '#fff', borderRadius: 12, padding: 28, minWidth: 380, maxWidth: 480, width: '100%', boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}>
-            <h3 style={{ marginBottom: 18 }}>Edit {typeLabel(editing.type)} — {editing.symbol}</h3>
+        <div className="modal-overlay">
+          <div className="modal-card" style={{ borderRadius: 12, minWidth: 380, maxWidth: 480, width: '100%' }}>
+            <div className="modal-header">
+              <h3 style={{ margin: 0 }}>Edit {typeLabel(editing.type)} — {editing.symbol}</h3>
+            </div>
+            <div className="modal-body">
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <label style={{ fontSize: 13, color: '#666' }}>Date</label>
@@ -427,7 +430,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                 </div>
               ))}
             </div>
-            <div style={{ display: 'flex', gap: 10, marginTop: 22, justifyContent: 'flex-end' }}>
+            </div>
+            <div className="modal-footer" style={{ gap: 10 }}>
               <button className="btn btn-secondary" onClick={() => setEditing(null)} disabled={saving}>Cancel</button>
               <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
                 {saving ? 'Saving…' : 'Save'}

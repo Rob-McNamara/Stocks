@@ -797,88 +797,92 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       </div>
 
       {editingSymbol && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+        <div className="modal-overlay"
           onClick={() => setEditingSymbol(null)}>
-          <div style={{ background: '#fff', borderRadius: 8, padding: 24, minWidth: 280, boxShadow: '0 4px 24px rgba(0,0,0,0.18)' }}
+          <div className="modal-card" style={{ minWidth: 280 }}
             onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 4px' }}>Edit {editingSymbol}</h3>
-            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#666' }}>Select which watchlists this stock appears in:</p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
-              {lists.map((l) => (
-                <label key={l} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 14 }}>
-                  <input
-                    type="checkbox"
-                    checked={!!editListChecks[l]}
-                    onChange={(e) => setEditListChecks((prev) => ({ ...prev, [l]: e.target.checked }))}
-                    style={{ width: 16, height: 16, cursor: 'pointer' }}
-                  />
-                  {l}
-                </label>
-              ))}
+            <div className="modal-header">
+              <h3 style={{ margin: '0 0 4px' }}>Edit {editingSymbol}</h3>
+              <p style={{ margin: 0, fontSize: 13, color: '#666' }}>Select which watchlists this stock appears in:</p>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
-              <label style={{ fontSize: 13, color: '#666' }}>Notes (optional)</label>
-              <input
-                type="text"
-                value={editNotes}
-                onChange={(e) => setEditNotes(e.target.value)}
-                placeholder="Add a note about this stock…"
-                className="symbol-input"
-                style={{ width: '100%' }}
-              />
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <label style={{ fontSize: 13, color: '#666' }}>Breakthrough Price</label>
+            <div className="modal-body">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+                {lists.map((l) => (
+                  <label key={l} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 14 }}>
+                    <input
+                      type="checkbox"
+                      checked={!!editListChecks[l]}
+                      onChange={(e) => setEditListChecks((prev) => ({ ...prev, [l]: e.target.checked }))}
+                      style={{ width: 16, height: 16, cursor: 'pointer' }}
+                    />
+                    {l}
+                  </label>
+                ))}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Notes (optional)</label>
                 <input
-                  type="number"
-                  value={editCustomFields['breakthrough_price'] ?? ''}
-                  onChange={(e) => setEditCustomFields((prev) => ({ ...prev, breakthrough_price: e.target.value }))}
+                  type="text"
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                  placeholder="Add a note about this stock…"
                   className="symbol-input"
                   style={{ width: '100%' }}
                 />
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <label style={{ fontSize: 13, color: '#666' }}>Stop Loss Price</label>
-                <input
-                  type="number"
-                  value={editCustomFields['stop_loss_price'] ?? ''}
-                  onChange={(e) => setEditCustomFields((prev) => ({ ...prev, stop_loss_price: e.target.value }))}
-                  className="symbol-input"
-                  style={{ width: '100%' }}
-                />
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <label style={{ fontSize: 13, color: '#666' }}>Sector</label>
-                <select
-                  value={editCustomFields['sector'] ?? ''}
-                  onChange={(e) => setEditCustomFields((prev) => ({ ...prev, sector: e.target.value }))}
-                  className="symbol-input"
-                  style={{ width: '100%' }}
-                >
-                  <option value="">— None —</option>
-                  {(editCustomFields['sector'] ?? '') !== '' && !sectorOptions.includes(editCustomFields['sector']) && (
-                    <option value={editCustomFields['sector']}>{editCustomFields['sector']}</option>
-                  )}
-                  {sectorOptions.map((s) => (
-                    <option key={s} value={s}>{s}</option>
-                  ))}
-                </select>
-              </div>
-              {extraCustomFieldDefs.map((def) => (
-                <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 13, color: '#666' }}>Breakthrough Price</label>
                   <input
-                    type={def.type}
-                    value={editCustomFields[def.key] ?? ''}
-                    onChange={(e) => setEditCustomFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                    type="number"
+                    value={editCustomFields['breakthrough_price'] ?? ''}
+                    onChange={(e) => setEditCustomFields((prev) => ({ ...prev, breakthrough_price: e.target.value }))}
                     className="symbol-input"
                     style={{ width: '100%' }}
                   />
                 </div>
-              ))}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 13, color: '#666' }}>Stop Loss Price</label>
+                  <input
+                    type="number"
+                    value={editCustomFields['stop_loss_price'] ?? ''}
+                    onChange={(e) => setEditCustomFields((prev) => ({ ...prev, stop_loss_price: e.target.value }))}
+                    className="symbol-input"
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 13, color: '#666' }}>Sector</label>
+                  <select
+                    value={editCustomFields['sector'] ?? ''}
+                    onChange={(e) => setEditCustomFields((prev) => ({ ...prev, sector: e.target.value }))}
+                    className="symbol-input"
+                    style={{ width: '100%' }}
+                  >
+                    <option value="">— None —</option>
+                    {(editCustomFields['sector'] ?? '') !== '' && !sectorOptions.includes(editCustomFields['sector']) && (
+                      <option value={editCustomFields['sector']}>{editCustomFields['sector']}</option>
+                    )}
+                    {sectorOptions.map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                </div>
+                {extraCustomFieldDefs.map((def) => (
+                  <div key={def.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: 13, color: '#666' }}>{def.label}</label>
+                    <input
+                      type={def.type}
+                      value={editCustomFields[def.key] ?? ''}
+                      onChange={(e) => setEditCustomFields((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                      className="symbol-input"
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <div className="modal-footer">
               <button className="btn btn-outline" onClick={() => setEditingSymbol(null)}>Cancel</button>
               <button className="btn btn-primary" onClick={handleSaveEdit} disabled={loading || !lists.some((l) => editListChecks[l])}>
                 {loading ? 'Saving...' : 'Save'}
