@@ -54,6 +54,10 @@ interface CurrentPrice {
 
 interface PriceHistoryPoint {
   date: string
+  /** Null on bars stored before OHLC ingest existed — clients must tolerate it. */
+  open: number | null
+  high: number | null
+  low: number | null
   close: number | null
   volume: number | null
 }
@@ -83,6 +87,8 @@ interface HoldingTransaction {
   currency: string
   original_price: number | null
   fx_rate: number | null
+  /** Cash account this trade settles against, when it has one. */
+  cash_account_id: number | null
   custom_fields: Record<string, string>
 }
 
@@ -129,6 +135,10 @@ export interface CustomListResult {
   field_source: string
   operator: string
   field_label: string
+  /** Direction the server actually ranked by (request override, else config). */
+  sort: 'asc' | 'desc'
+  /** True when more rows qualified than `limit` allowed through. */
+  truncated: boolean
   entries: CustomListEntry[]
 }
 
@@ -228,8 +238,75 @@ export interface RiskRow {
   stop_loss_dollar: number | null
   sma50: number | null
   sma150: number | null
+  /** 40-week exponential moving average, over weekly closes. */
+  ema40w: number | null
   high30d: number | null
   total_invested: number
+  /** Shares still held, for position-level dollar figures. */
+  shares: number
+}
+
+export interface CashAccount {
+  id: number
+  name: string
+  currency: string
+  /** Nominal annual rate, for display only — interest is recorded as credited. */
+  interest_rate: number | null
+  /** Whether this account counts toward portfolio value and growth. */
+  include_in_portfolio: boolean
+  notes: string | null
+  created_at: string
+  /** Balance in the account's own currency. */
+  balance: number
+  /** The same balance in AUD, or null when no rate is stored for that currency. */
+  balance_aud: number | null
+  transaction_count: number
+}
+
+export interface CashTransaction {
+  id: number
+  account_id: number
+  account_name: string
+  currency: string
+  date: string
+  /** Signed, in the account's currency: positive is money in. */
+  amount: number
+  kind: string
+  /** Set when this entry was written by the trade it settles. */
+  holding_tx_id: number | null
+  /** Pairs the two legs of a currency conversion. */
+  transfer_group_id: string | null
+  notes: string | null
+  created_at: string
+}
+
+export interface PortfolioHistoryPoint {
+  date: string
+  /** Market value of shares held, in AUD. */
+  stocks: number
+  /** Cash across accounts counted toward the portfolio, in AUD. */
+  cash: number
+  total: number
+  /** Money in (+) or out (−) that day. Contributions only, never earnings. */
+  flow: number
+}
+
+export interface PortfolioHistorySummary {
+  start_date: string | null
+  end_date: string | null
+  /** Value carried into the window, before any of its contributions. */
+  opening_value: number
+  end_value: number
+  net_contributions: number
+  /** end_value − opening_value − net_contributions. */
+  gain: number
+  /** Time-weighted return as a percentage; null until there is capital. */
+  twr_pct: number | null
+}
+
+export interface PortfolioHistory {
+  series: PortfolioHistoryPoint[]
+  summary: PortfolioHistorySummary
 }
 
 export interface RiskTotals {
@@ -273,6 +350,8 @@ export interface LedgerRow {
   amount: number | null
   brokerage: number | null
   notes: string | null
+  /** Settlement account the trade draws on; null for dividend events and unlinked trades */
+  cash_account_id: number | null
   /** true for fetched dividend events (per-share amounts); false for manual rows (totals) */
   per_share: boolean
   payment_date: string | null
@@ -316,8 +395,25 @@ export interface HoldingTransactionPayload {
   original_price?: number
   fx_rate?: number
   custom_fields?: Record<string, string>
+  /**
+   * Cash account this trade settles against. Omit to record the trade without
+   * touching the cash ledger — which is how every pre-ledger trade is stored.
+   * The account's currency must match the trade's.
+   */
+  cash_account_id?: number | null
   /** Acknowledge an over-sell warning (server responds 409 otherwise) */
   confirm?: boolean
+}
+
+/**
+ * URL of an account's ledger as CSV.
+ *
+ * A link rather than a fetch: the response carries Content-Disposition, so the
+ * browser saves it under the server's filename with no blob juggling, and the
+ * running balance stays in the order the server computed it.
+ */
+export function cashAccountCsvUrl(accountId: number): string {
+  return `${API_BASE_URL}/cash/accounts/${accountId}/transactions.csv`
 }
 
 export const apiClient = {
@@ -347,8 +443,16 @@ export const apiClient = {
     return response.json()
   },
 
-  async getPortfolioOverview(): Promise<PortfolioOverview> {
-    const response = await apiFetch(`${API_BASE_URL}/portfolio/overview`)
+  /**
+   * @param listSort Per-list sort direction keyed by list key. Sent to the
+   *   server rather than applied here because each list is ranked and then
+   *   truncated to its limit server-side — reordering in the browser would only
+   *   reverse the rows that survived the cut.
+   */
+  async getPortfolioOverview(listSort?: Record<string, 'asc' | 'desc'>): Promise<PortfolioOverview> {
+    const pairs = Object.entries(listSort ?? {}).map(([key, dir]) => `${key}:${dir}`)
+    const qs = pairs.length > 0 ? `?list_sort=${encodeURIComponent(pairs.join(','))}` : ''
+    const response = await apiFetch(`${API_BASE_URL}/portfolio/overview${qs}`)
     if (!response.ok) {
       const message = await apiErrorMessage(response)
       throw new Error(message || 'Failed to fetch portfolio overview')
@@ -370,6 +474,106 @@ export const apiClient = {
     if (!response.ok) {
       const message = await apiErrorMessage(response)
       throw new Error(message || 'Failed to fetch portfolio lots')
+    }
+    return response.json()
+  },
+
+  async getCashAccounts(): Promise<CashAccount[]> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/accounts`)
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to fetch cash accounts')
+    return response.json()
+  },
+
+  async addCashAccount(payload: {
+    name: string
+    currency: string
+    interest_rate?: number
+    include_in_portfolio?: boolean
+    notes?: string
+  }): Promise<{ id: number }> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/accounts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to add cash account')
+    return response.json()
+  },
+
+  async deleteCashAccount(id: number): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/accounts/${id}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to delete cash account')
+  },
+
+  async getCashTransactions(accountId?: number): Promise<CashTransaction[]> {
+    const qs = accountId ? `?account_id=${accountId}` : ''
+    const response = await apiFetch(`${API_BASE_URL}/cash/transactions${qs}`)
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to fetch cash transactions')
+    return response.json()
+  },
+
+  async addCashTransaction(payload: {
+    account_id: number
+    date: string
+    amount: number
+    kind: string
+    notes?: string
+  }): Promise<{ id: number }> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/transactions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to record cash transaction')
+    return response.json()
+  },
+
+  async updateCashTransaction(
+    id: number,
+    payload: { account_id: number; date: string; amount: number; kind: string; notes?: string },
+  ): Promise<{ id: number }> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/transactions/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to update cash transaction')
+    return response.json()
+  },
+
+  async deleteCashTransaction(id: number): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/transactions/${id}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to delete cash transaction')
+  },
+
+  /** Records both legs of a move between accounts, including across currencies. */
+  async addCashTransfer(payload: {
+    from_account_id: number
+    to_account_id: number
+    date: string
+    from_amount: number
+    to_amount: number
+    notes?: string
+  }): Promise<{ transfer_group_id: string; implied_rate: number }> {
+    const response = await apiFetch(`${API_BASE_URL}/cash/transfer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to record transfer')
+    return response.json()
+  },
+
+  /**
+   * Daily portfolio value and time-weighted return.
+   * @param from Optional YYYY-MM-DD start; omit for the full history.
+   */
+  async getPortfolioHistory(from?: string): Promise<PortfolioHistory> {
+    const qs = from ? `?from=${encodeURIComponent(from)}` : ''
+    const response = await apiFetch(`${API_BASE_URL}/portfolio/history${qs}`)
+    if (!response.ok) {
+      const message = await apiErrorMessage(response)
+      throw new Error(message || 'Failed to fetch portfolio history')
     }
     return response.json()
   },

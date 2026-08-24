@@ -8,9 +8,10 @@ import EventLogViewer from './components/EventLogViewer'
 import Dashboard from './components/Dashboard'
 import SoldStocks from './components/SoldStocks'
 import Transactions from './components/Transactions'
+import CashManager from './components/CashManager'
 import Analysis from './components/Analysis'
 
-type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'analysis' | 'sold' | 'transactions' | 'events' | 'config'
+type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'analysis' | 'sold' | 'cash' | 'transactions' | 'events' | 'config'
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
@@ -113,6 +114,13 @@ function App() {
           Sold Stocks
         </button>
         <button
+          className={`tab-button ${activeTab === 'cash' ? 'active' : ''}`}
+          onClick={() => setActiveTab('cash')}
+          disabled={loading}
+        >
+          Cash
+        </button>
+        <button
           className={`tab-button ${activeTab === 'transactions' ? 'active' : ''}`}
           onClick={() => setActiveTab('transactions')}
           disabled={loading}
@@ -150,6 +158,9 @@ function App() {
         </div>
         <div style={{ display: activeTab === 'sold' ? 'block' : 'none' }}>
           <SoldStocks onLoading={setLoading} holdingsVersion={holdingsVersion} />
+        </div>
+        <div style={{ display: activeTab === 'cash' ? 'block' : 'none' }}>
+          <CashManager onLoading={setLoading} onCashChanged={() => setHoldingsVersion((v) => v + 1)} />
         </div>
         <div style={{ display: activeTab === 'transactions' ? 'block' : 'none' }}>
           <Transactions onLoading={setLoading} holdingsVersion={holdingsVersion} />

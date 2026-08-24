@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { apiClient, type HoldingTransactionPayload, type PortfolioHolding, type PortfolioLot } from '../services/api'
-import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate } from '../utils/holdings'
+import { apiClient, type HoldingTransactionPayload, type PortfolioHolding, type PortfolioLot, type CashAccount } from '../services/api'
+import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from '../utils/holdings'
+import { settlementAccountsFor } from '../utils/cash'
 import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
 
@@ -67,6 +68,15 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [brokerage, setBrokerage] = useState('')
   const [notes, setNotes] = useState('')
   const [currency, setCurrency] = useState('AUD')
+  const [cashAccountId, setCashAccountId] = useState('')
+  const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
+  // An account in the transaction's currency, or an AUD account that converts.
+  // The API applies the same rule, so the picker never offers one it would
+  // refuse.
+  const settlementAccounts = useMemo(
+    () => settlementAccountsFor(cashAccounts, currency),
+    [cashAccounts, currency],
+  )
   const [fxRate, setFxRate] = useState<number | null>(null)
   const [fxRateDate, setFxRateDate] = useState<string | null>(null)
   const [fxLoading, setFxLoading] = useState(false)
@@ -95,6 +105,24 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+
+  // Shared by the trade and dividend rows: income arrives in a currency just as
+  // a purchase is paid in one, and a foreign dividend recorded as AUD would be
+  // silently wrong by the exchange rate.
+  const currencySelect = (
+    <select
+      value={currency}
+      onChange={(e) => setCurrency(e.target.value)}
+      className="config-input"
+      disabled={loading}
+      style={{ minWidth: 80 }}
+      title="Currency this amount is in"
+    >
+      {currencyOptions.map((c) => (
+        <option key={c} value={c}>{c}</option>
+      ))}
+    </select>
+  )
 
   useEffect(() => {
     loadHoldings()
@@ -213,6 +241,8 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         if (m.currencies?.length) setCurrencyOptions(m.currencies)
         setHoldingsFieldDefs(((m.holdings_custom_fields ?? []) as HoldingsFieldDef[]).filter((d) => !BUILT_IN_HOLDINGS_KEYS.includes(d.key)))
       }).catch(() => {})
+      // Settlement accounts for the picker; an empty list simply hides it.
+      apiClient.getCashAccounts().then(setCashAccounts).catch(() => setCashAccounts([]))
       const data = await apiClient.getHoldings()
       setTransactions(data)
       try {
@@ -253,6 +283,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       brokerage: brokerage ? parseFloat(brokerage) : undefined,
       notes: notes.trim() || undefined,
       custom_fields: Object.keys(customFieldValues).length > 0 ? customFieldValues : undefined,
+      cash_account_id: cashAccountId ? Number(cashAccountId) : null,
     }
 
     if (transactionType === 'purchase' || transactionType === 'sale') {
@@ -310,7 +341,22 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         setError('Dividend amount must be a positive number')
         return
       }
-      payload.amount = parsedAmount
+      if (currency !== 'AUD') {
+        // Never silently record a foreign dividend as AUD.
+        if (!fxRate) {
+          setError(`No ${currency}/AUD exchange rate available for ${date} — cannot save. Retry, or pick a different date.`)
+          return
+        }
+        // `amount` is stored in AUD, matching `price` on a trade; the rate is
+        // kept so the server can recover the native figure when the dividend
+        // settles into an account held in that currency.
+        payload.currency = currency
+        payload.fx_rate = fxRate
+        payload.amount = parsedAmount * fxRate
+      } else {
+        payload.currency = 'AUD'
+        payload.amount = parsedAmount
+      }
     }
 
     try {
@@ -366,6 +412,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       setCustomFieldValues({})
       setDate(new Date().toISOString().slice(0, 10))
       setCurrency('AUD')
+      setCashAccountId('')
       setFxRate(null)
       setFxRateDate(null)
       setTimeout(() => setSuccess(null), 3000)
@@ -594,17 +641,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                   className="symbol-input"
                   disabled={loading}
                 />
-                <select
-                  value={currency}
-                  onChange={(e) => setCurrency(e.target.value)}
-                  className="config-input"
-                  disabled={loading}
-                  style={{ minWidth: 80 }}
-                >
-                  {currencyOptions.map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
-                </select>
+                {currencySelect}
                 <input
                   type="number"
                   min="0"
@@ -639,17 +676,68 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
           )}
 
           {transactionType === 'dividend' && (
+            <>
+              <div className="form-group">
+                {currencySelect}
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  placeholder={currency !== 'AUD' ? `Dividend amount (${currency})` : 'Dividend amount (AUD)'}
+                  className="symbol-input"
+                  disabled={loading}
+                />
+              </div>
+              {currency !== 'AUD' && (
+                <div className="form-group" style={{ alignItems: 'center', fontSize: 13, color: '#666', gap: 8 }}>
+                  {fxLoading && <span>Fetching {currency}/AUD rate...</span>}
+                  {!fxLoading && fxRate && amount && !isNaN(parseFloat(amount)) && (
+                    <span>
+                      Rate: 1 {currency} = {fxRate.toFixed(4)} AUD{fxRateDate && ` (${fxRateDate})`}
+                      {' → '}AUD {(parseFloat(amount) * fxRate).toFixed(2)}
+                    </span>
+                  )}
+                  {!fxLoading && !fxRate && (
+                    <span style={{ color: '#c62828' }}>No {currency}/AUD rate for {date} — cannot save.</span>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Outside the trade branch: a dividend needs somewhere to land just
+              as much as a purchase needs somewhere to draw from. */}
+          {cashAccounts.length > 0 && (
             <div className="form-group">
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                placeholder="Dividend amount"
-                className="symbol-input"
-                disabled={loading}
-              />
+              <select
+                value={settlementAccounts.some((a) => String(a.id) === cashAccountId) ? cashAccountId : ''}
+                onChange={(e) => setCashAccountId(e.target.value)}
+                className="config-input"
+                disabled={loading || settlementAccounts.length === 0}
+                title={transactionType === 'purchase'
+                  ? 'Which cash account this purchase is paid from'
+                  : 'Which cash account this money is paid into'}
+              >
+                <option value="">
+                  {settlementAccounts.length === 0
+                    ? `No account can settle ${currency} — this will not touch the ledger`
+                    : transactionType === 'purchase'
+                      ? 'Pay from… (optional)'
+                      : 'Deposit into… (optional)'}
+                </option>
+                {settlementAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name} — {a.currency} {a.balance.toLocaleString('en-AU', { maximumFractionDigits: 2 })}
+                  </option>
+                ))}
+              </select>
+              <span style={{ fontSize: 12, color: '#666', alignSelf: 'center' }}>
+                {cashAccountId
+                  ? 'Cash will move automatically when this is saved.'
+                  : 'Leave blank to record it without touching cash.'}
+              </span>
             </div>
           )}
 
@@ -748,7 +836,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       {selectedChartSymbol && (
         <div className="manager-card chart-card">
           <div className="card-header">
-            <h2>Simple Moving Average Chart</h2>
+            <h2>Stock Chart</h2>
             <div className="chart-select">
               <label htmlFor="holdings-chart-symbol">Symbol</label>
               <select
@@ -774,6 +862,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 onLoading={onLoading}
                 purchasePrice={sel?.native_avg_cost ?? null}
                 purchaseDate={getEarliestRemainingPurchaseDate(transactions, selectedChartSymbol)}
+            purchases={getRemainingPurchaseLots(transactions, selectedChartSymbol)}
                 currentPrice={sel?.native_current_price ?? null}
                 currentVolume={sel?.volume ?? null}
                 currentPriceDate={sel?.price_date ?? null}

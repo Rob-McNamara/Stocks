@@ -1,12 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { apiClient } from '../services/api'
-import { calculateSMA } from '../utils/sma'
+import { calculateSMA, calculateEMA } from '../utils/sma'
+import { toWeeklyBars } from '../utils/bars'
 
 interface PriceHistoryPoint {
   date: string
+  // OHLC is null for bars ingested before OHLC support existed — run the
+  // backfill_ohlc binary to populate them. The chart falls back to a line.
+  open: number | null
+  high: number | null
+  low: number | null
   close: number | null
   volume: number | null
 }
+
+const CANDLE_UP = '#4caf50'
+const CANDLE_DOWN = '#f44336'
+
+// User-set price levels share one blue: deeper than the price line so the two
+// stay apart in line mode, and clear of the SMA palette (cyan at 100). The
+// purchase dot and the breakthrough marker never appear on the same chart —
+// Watchlist passes markers, Holdings passes purchasePrice.
+const PURCHASE_COLOR = '#1565c0'
+export const BREAKTHROUGH_COLOR = '#1565c0'
+export const STOP_LOSS_COLOR = '#e91e63'
+/** Purchase predates the chart range — pinned to the Y axis instead. */
+const PURCHASE_AXIS_COLOR = '#ff9800'
 
 interface PriceChartProps {
   symbol: string
@@ -17,6 +36,11 @@ interface PriceChartProps {
   currentPriceDate?: string | null  // actual trading date for the live price (may differ from today)
   purchasePrice?: number | null  // avg cost per share — shown in Holdings chart header
   purchaseDate?: string | null   // earliest purchase date (YYYY-MM-DD) for dot placement
+  /**
+   * Every purchase lot still held, so a position built in several parcels is
+   * marked at each one. Falls back to the single averaged dot when absent.
+   */
+  purchases?: Array<{ date: string; price: number }>
   markerPrice?: number | null    // price level to mark with a dot (e.g. breakthrough price, stop loss)
   markerLabel?: string           // label for the marker (e.g. "Breakthrough", "Stop Loss")
   markerMode?: 'breakthrough' | 'stoploss'
@@ -27,16 +51,29 @@ const CURRENCY_SYMBOL: Record<string, string> = {
   AUD: '$', USD: 'US$', GBP: '£', EUR: '€', JPY: '¥', CAD: 'CA$', HKD: 'HK$', SGD: 'S$', NZD: 'NZ$',
 }
 
-const SMA_PERIODS = [20, 50, 100, 150, 200] as const
-type SmaPeriod = typeof SMA_PERIODS[number]
-
-const SMA_COLORS: Record<SmaPeriod, string> = {
-  20:  '#9c27b0',
-  50:  '#ff9800',
-  100: '#00bcd4',
-  150: '#f44336',
-  200: '#4caf50',
+/**
+ * Moving-average overlays, ordered by period so the buttons read left to right.
+ * Identified by id rather than period because the period alone no longer says
+ * which kind of average it is — 40 is exponential, the rest are simple.
+ */
+interface OverlayDef {
+  id: string
+  label: string
+  period: number
+  kind: 'sma' | 'ema'
+  color: string
+  /** EMA gets its own dash so the two kinds are distinguishable at a glance. */
+  dash: string
 }
+
+const OVERLAYS: readonly OverlayDef[] = [
+  { id: 'sma20',  label: 'SMA 20',  period: 20,  kind: 'sma', color: '#9c27b0', dash: '8 6' },
+  { id: 'ema40',  label: 'EMA 40',  period: 40,  kind: 'ema', color: '#795548', dash: '3 4' },
+  { id: 'sma50',  label: 'SMA 50',  period: 50,  kind: 'sma', color: '#ff9800', dash: '8 6' },
+  { id: 'sma100', label: 'SMA 100', period: 100, kind: 'sma', color: '#00bcd4', dash: '8 6' },
+  { id: 'sma150', label: 'SMA 150', period: 150, kind: 'sma', color: '#f44336', dash: '8 6' },
+  { id: 'sma200', label: 'SMA 200', period: 200, kind: 'sma', color: '#4caf50', dash: '8 6' },
+]
 
 function buildPath(points: Array<{ x: number; y: number | null }>) {
   const filtered = points.filter((p) => p.y !== null) as Array<{ x: number; y: number }>
@@ -46,12 +83,14 @@ function buildPath(points: Array<{ x: number; y: number | null }>) {
   return filtered.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
 }
 
-export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading, currentPrice, currentVolume, currentPriceDate, purchasePrice, purchaseDate, markerPrice, markerLabel, markerMode = 'breakthrough', markers }: PriceChartProps) {
+export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading, currentPrice, currentVolume, currentPriceDate, purchasePrice, purchaseDate, purchases, markerPrice, markerLabel, markerMode = 'breakthrough', markers }: PriceChartProps) {
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [activePeriods, setActivePeriods] = useState<Set<SmaPeriod>>(new Set([50, 150]))
-  const [timeframe, setTimeframe] = useState<'12m' | '6m' | '3m' | '1m' | '1w'>('6m')
+  const [activeOverlays, setActiveOverlays] = useState<Set<string>>(new Set(['sma50', 'sma150']))
+  const [timeframe, setTimeframe] = useState<'2y' | '12m' | '6m' | '3m' | '1m' | '1w'>('6m')
+  const [chartType, setChartType] = useState<'line' | 'candle'>('line')
+  const [barInterval, setBarInterval] = useState<'day' | 'week'>('day')
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
   const [showInAud, setShowInAud] = useState(false)
   const [fxRate, setFxRate] = useState<number | null>(null)
@@ -114,13 +153,13 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     }).catch(() => applyCurrency('AUD'))
   }, [symbol, currencyProp])
 
-  const togglePeriod = (period: SmaPeriod) => {
-    setActivePeriods((prev) => {
+  const toggleOverlay = (id: string) => {
+    setActiveOverlays((prev) => {
       const next = new Set(prev)
-      if (next.has(period)) {
-        if (next.size > 1) next.delete(period) // keep at least one active
+      if (next.has(id)) {
+        if (next.size > 1) next.delete(id) // keep at least one active
       } else {
-        next.add(period)
+        next.add(id)
       }
       return next
     })
@@ -134,40 +173,74 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const priceDate = currentPriceDate ?? new Date().toISOString().slice(0, 10)
     const liveVol = currentVolume ?? null
     if (history.length === 0) {
-      return [{ date: priceDate, close: currentPrice, volume: liveVol }]
+      return [{ date: priceDate, open: null, high: null, low: null, close: currentPrice, volume: liveVol }]
     }
     const last = history[history.length - 1]
     if (priceDate === last.date) {
-      // Replace stored close with live price; prefer live volume over stored
-      return [...history.slice(0, -1), { date: priceDate, close: currentPrice, volume: liveVol ?? last.volume }]
+      // Replace stored close with live price; prefer live volume over stored.
+      // Keep the stored session OHLC, but stretch high/low to cover the live
+      // price — an intraday move past the last stored extreme would otherwise
+      // render a candle whose close sits outside its own wick.
+      return [...history.slice(0, -1), {
+        date: priceDate,
+        open: last.open,
+        high: last.high !== null ? Math.max(last.high, currentPrice) : null,
+        low: last.low !== null ? Math.min(last.low, currentPrice) : null,
+        close: currentPrice,
+        volume: liveVol ?? last.volume,
+      }]
     }
     if (priceDate > last.date) {
-      return [...history, { date: priceDate, close: currentPrice, volume: liveVol }]
+      // A brand-new day with no stored bar yet: only the close is known.
+      return [...history, { date: priceDate, open: null, high: null, low: null, close: currentPrice, volume: liveVol }]
     }
     return history
   }, [history, currentPrice, currentPriceDate, currentVolume])
 
+  /**
+   * The bars the chart actually draws. Weekly aggregation happens here, before
+   * the moving averages and the timeframe trim, so the averages are computed on
+   * the same bars that are plotted — a 50-period average over weekly bars spans
+   * 50 weeks, which is the conventional behaviour when changing interval.
+   */
+  const seriesHistory = useMemo(
+    () => (barInterval === 'week' ? toWeeklyBars(effectiveHistory) : effectiveHistory),
+    [effectiveHistory, barInterval],
+  )
+
   const trimmedHistory = useMemo(() => {
-    if (effectiveHistory.length === 0) return effectiveHistory
+    if (seriesHistory.length === 0) return seriesHistory
     const cutoff = new Date()
-    if (timeframe === '12m') cutoff.setFullYear(cutoff.getFullYear() - 1)
+    if (timeframe === '2y') cutoff.setFullYear(cutoff.getFullYear() - 2)
+    else if (timeframe === '12m') cutoff.setFullYear(cutoff.getFullYear() - 1)
     else if (timeframe === '6m') cutoff.setMonth(cutoff.getMonth() - 6)
     else if (timeframe === '3m') cutoff.setMonth(cutoff.getMonth() - 3)
     else if (timeframe === '1m') cutoff.setMonth(cutoff.getMonth() - 1)
     else cutoff.setDate(cutoff.getDate() - 7)
     const cutoffStr = cutoff.toISOString().slice(0, 10)
-    const filtered = effectiveHistory.filter((item) => item.date >= cutoffStr)
-    return filtered.length > 0 ? filtered : effectiveHistory.slice(-5)
-  }, [effectiveHistory, timeframe])
+    const filtered = seriesHistory.filter((item) => item.date >= cutoffStr)
+    return filtered.length > 0 ? filtered : seriesHistory.slice(-5)
+  }, [seriesHistory, timeframe])
 
-  // Compute all SMA series upfront (cheap — reused across renders)
-  const allSmas = useMemo(() => {
-    const result = {} as Record<SmaPeriod, (number | null)[]>
-    for (const p of SMA_PERIODS) {
-      result[p] = calculateSMA(effectiveHistory, p)
+  /**
+   * Averages are computed on the plotted bars, so a period counts whatever the
+   * interval is: SMA 150 spans 150 days in Day mode and 150 weeks in Week mode.
+   * The legend states the unit, since "150" alone would be ambiguous.
+   *
+   * A consequence worth knowing: the longer averages have no line in Week mode.
+   * 600 daily rows collapse to roughly 125 weekly bars, fewer than the 150 and
+   * 200 those averages need, and only about two years of history is stored so
+   * fetching more would not fill them either.
+   */
+  const allOverlays = useMemo(() => {
+    const result: Record<string, (number | null)[]> = {}
+    for (const o of OVERLAYS) {
+      result[o.id] = o.kind === 'ema'
+        ? calculateEMA(seriesHistory, o.period)
+        : calculateSMA(seriesHistory, o.period)
     }
     return result
-  }, [effectiveHistory])
+  }, [seriesHistory])
 
   // Multiplier converts native prices to AUD when toggled on
   const fxMultiplier = showInAud && fxRate ? fxRate : 1
@@ -176,6 +249,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
 
   const priceValues = trimmedHistory.map((item) => item.close).filter((v): v is number => v !== null)
   const latestPrice = priceValues.length > 0 ? priceValues[priceValues.length - 1] * fxMultiplier : null
+
+  // Candles need a complete bar. Older history is close-only until the backfill
+  // has run, so the toggle stays disabled rather than drawing an empty chart.
+  const hasOhlc = useMemo(
+    () => trimmedHistory.some((item) => item.open !== null && item.high !== null && item.low !== null),
+    [trimmedHistory]
+  )
+  const showCandles = chartType === 'candle' && hasOhlc
 
   const chartData = useMemo(() => {
     const width = 1040
@@ -189,6 +270,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
 
     const closeValues = trimmedHistory.map((item) => item.close)
     const validValues = closeValues.filter((val): val is number => val !== null).map((v) => v * fxMultiplier)
+    // In candle mode the extremes are the wicks, not the closes — without this
+    // the highs and lows clip outside the plot area.
+    if (showCandles) {
+      for (const item of trimmedHistory) {
+        if (item.high !== null) validValues.push(item.high * fxMultiplier)
+        if (item.low !== null) validValues.push(item.low * fxMultiplier)
+      }
+    }
     // Include marker and purchase prices in the range so dots are always visible
     const markerValues: number[] = []
     if (markerPrice != null) markerValues.push(markerPrice * fxMultiplier)
@@ -196,6 +285,9 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     if (purchasePrice != null) {
       markerValues.push(purchasePrice * fxMultiplier)
     }
+    // Every plotted lot has to fit, or a parcel bought well away from the
+    // average is drawn outside the plot and silently clipped.
+    if (purchases) purchases.forEach((p) => markerValues.push(p.price * fxMultiplier))
     const rawMin = Math.min(...validValues, ...markerValues)
     const rawMax = Math.max(...validValues, ...markerValues)
     const padding = (rawMax - rawMin) * 0.05 || 1
@@ -210,18 +302,44 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       y: item.close !== null ? toY(item.close * fxMultiplier) : null,
     }))
 
-    const smaLines = SMA_PERIODS.map((period) => ({
-      period,
-      color: SMA_COLORS[period],
+    const overlayLines = OVERLAYS.map((overlay) => ({
+      id: overlay.id,
+      color: overlay.color,
+      dash: overlay.dash,
       points: trimmedHistory.map((_, index) => {
-        const globalIndex = effectiveHistory.length - trimmedHistory.length + index
-        const value = allSmas[period][globalIndex]
+        const globalIndex = seriesHistory.length - trimmedHistory.length + index
+        const value = allOverlays[overlay.id][globalIndex]
         return {
           x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
           y: value !== null ? toY(value * fxMultiplier) : null,
         }
       }),
     }))
+
+    // Candle bodies span open→close, wicks span low→high. Colour is close vs
+    // the bar's *own* open (candlestick convention), which is not the same as
+    // the volume bars' close-vs-previous-close rule.
+    const candleWidth = Math.max(1, Math.min(14, plotWidth / Math.max(trimmedHistory.length, 1) - 1))
+    const candles = trimmedHistory.map((item, index) => {
+      const x = left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1)
+      const { open, high, low, close } = item
+      if (open === null || high === null || low === null || close === null) return null
+      const openY = toY(open * fxMultiplier)
+      const closeY = toY(close * fxMultiplier)
+      const rising = close >= open
+      // A doji (open === close) would otherwise be a zero-height invisible rect
+      const bodyHeight = Math.max(1, Math.abs(closeY - openY))
+      return {
+        x: x - candleWidth / 2,
+        centerX: x,
+        width: candleWidth,
+        bodyY: Math.min(openY, closeY),
+        bodyHeight,
+        highY: toY(high * fxMultiplier),
+        lowY: toY(low * fxMultiplier),
+        color: rising ? CANDLE_UP : CANDLE_DOWN,
+      }
+    }).filter((c): c is NonNullable<typeof c> => c !== null)
 
     const volumeValues = trimmedHistory.map((item) => item.volume ?? 0)
     const maxVolume = Math.max(...volumeValues, 1)
@@ -270,16 +388,16 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
 
     return {
       width: 1100, height: volumeTop + volumeHeight,
-      points, smaLines, volumeBars, yLabels, xLabels,
+      points, overlayLines, candles, volumeBars, yLabels, xLabels,
       left, right, top, bottom, plotWidth, plotHeight,
       pricePlotHeight: plotHeight, axisY, labelY, toY, minValue, maxValue,
     }
-  }, [trimmedHistory, effectiveHistory.length, allSmas, fxMultiplier, currSym, markerPrice, markers, purchasePrice, isInternational, showInAud, fxRate])
+  }, [trimmedHistory, seriesHistory.length, allOverlays, fxMultiplier, currSym, markerPrice, markers, purchasePrice, purchases, isInternational, showInAud, fxRate, showCandles])
 
   const allMarkers = useMemo(() => {
     const defs: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }> = []
     if (markers) defs.push(...markers)
-    if (markerPrice != null) defs.push({ price: markerPrice, label: markerLabel ?? 'Marker', mode: markerMode, color: markerMode === 'stoploss' ? '#e91e63' : '#4caf50' })
+    if (markerPrice != null) defs.push({ price: markerPrice, label: markerLabel ?? 'Marker', mode: markerMode, color: markerMode === 'stoploss' ? STOP_LOSS_COLOR : BREAKTHROUGH_COLOR })
     return defs
   }, [markers, markerPrice, markerLabel, markerMode])
 
@@ -318,24 +436,46 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     }).filter((d): d is NonNullable<typeof d> => d !== null)
   }, [allMarkers, trimmedHistory, chartData, fxMultiplier])
 
-  const purchaseDot = useMemo(() => {
-    if (purchasePrice == null || trimmedHistory.length === 0) return null
-    const displayPrice = purchasePrice * fxMultiplier
-    const y = chartData.toY(displayPrice)
-
-    if (purchaseDate) {
-      const firstDate = trimmedHistory[0].date
-      if (purchaseDate >= firstDate) {
-        // Purchase date is within chart range — find the x position
-        const idx = trimmedHistory.findIndex((h) => h.date >= purchaseDate)
+  /**
+   * One dot per purchase still held, or a single averaged dot when the caller
+   * has not supplied the individual lots.
+   *
+   * A buy predating the visible window has no x position on this chart, so it
+   * is pinned to the Y axis in a different colour rather than being drawn at
+   * the left edge as though it happened then. Several such buys would stack on
+   * the same spot, so they collapse to one axis marker at the average price.
+   */
+  const purchaseDots = useMemo(() => {
+    if (trimmedHistory.length === 0) return []
+    const firstDate = trimmedHistory[0].date
+    const place = (price: number, date: string | null) => {
+      const displayPrice = price * fxMultiplier
+      const y = chartData.toY(displayPrice)
+      if (date && date >= firstDate) {
+        const idx = trimmedHistory.findIndex((h) => h.date >= date)
         const i = idx >= 0 ? idx : trimmedHistory.length - 1
         const x = chartData.left + (chartData.plotWidth * i) / Math.max(trimmedHistory.length - 1, 1)
-        return { x, y, price: displayPrice, onAxis: false }
+        return { x, y, price: displayPrice, date, onAxis: false }
       }
+      return { x: chartData.left, y, price: displayPrice, date, onAxis: true }
     }
-    // Purchase date is before chart range or not provided — show on Y axis
-    return { x: chartData.left, y, price: displayPrice, onAxis: true }
-  }, [purchasePrice, purchaseDate, trimmedHistory, chartData, fxMultiplier, isInternational, showInAud, fxRate])
+
+    if (purchases && purchases.length > 0) {
+      const visible = purchases.filter((p) => p.date >= firstDate).map((p) => place(p.price, p.date))
+      const earlier = purchases.filter((p) => p.date < firstDate)
+      if (earlier.length > 0) {
+        const avg = earlier.reduce((sum, p) => sum + p.price, 0) / earlier.length
+        visible.push(place(avg, null))
+      }
+      return visible
+    }
+    if (purchasePrice == null) return []
+    return [place(purchasePrice, purchaseDate ?? null)]
+  }, [purchases, purchasePrice, purchaseDate, trimmedHistory, chartData, fxMultiplier, isInternational, showInAud, fxRate])
+
+  // The tooltip and the y-range logic below still reason about a single
+  // representative purchase.
+  const purchaseDot = purchaseDots[0] ?? null
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current
@@ -351,23 +491,27 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     if (hoverIndex === null) return null
     const item = trimmedHistory[hoverIndex]
     if (!item) return null
-    const globalIndex = effectiveHistory.length - trimmedHistory.length + hoverIndex
+    const globalIndex = seriesHistory.length - trimmedHistory.length + hoverIndex
     const x = chartData.points[hoverIndex]?.x ?? 0
     const priceY = chartData.points[hoverIndex]?.y ?? null
-    const smaValues = SMA_PERIODS.filter((p) => activePeriods.has(p)).map((p) => {
-      const raw = allSmas[p][globalIndex] ?? null
+    const overlayValues = OVERLAYS.filter((o) => activeOverlays.has(o.id)).map((o) => {
+      const raw = allOverlays[o.id][globalIndex] ?? null
       return {
-        period: p,
-        color: SMA_COLORS[p],
+        id: o.id,
+        label: o.label,
+        color: o.color,
         value: raw !== null ? raw * fxMultiplier : null,
-        y: chartData.smaLines.find((l) => l.period === p)?.points[hoverIndex]?.y ?? null,
+        y: chartData.overlayLines.find((l) => l.id === o.id)?.points[hoverIndex]?.y ?? null,
       }
     })
     const displayPrice = item.close !== null ? item.close * fxMultiplier : null
-    return { date: item.date, price: displayPrice, x, priceY, smaValues }
-  }, [hoverIndex, trimmedHistory, effectiveHistory.length, allSmas, chartData, activePeriods, fxMultiplier])
+    const ohlc = showCandles && item.open !== null && item.high !== null && item.low !== null
+      ? { open: item.open * fxMultiplier, high: item.high * fxMultiplier, low: item.low * fxMultiplier }
+      : null
+    return { date: item.date, price: displayPrice, x, priceY, overlayValues, ohlc }
+  }, [hoverIndex, trimmedHistory, seriesHistory.length, allOverlays, chartData, activeOverlays, fxMultiplier, showCandles])
 
-  if (!symbol) return <p className="chart-message">Select a watchlist symbol to display the Simple Moving Average chart.</p>
+  if (!symbol) return <p className="chart-message">Select a watchlist symbol to display the stock chart.</p>
   if (loading) return <p className="chart-message">Loading chart for {symbol}...</p>
   if (error) return <div className="alert alert-error">{error}</div>
   if (trimmedHistory.length === 0) return <p className="chart-message">No historical price data available for {symbol}.</p>
@@ -378,10 +522,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       ? hoverData.x - tooltipWidth - 10
       : hoverData.x + 10
     : 0
-  const activeSmaValues = hoverData?.smaValues ?? []
-  const tooltipHeight = 38 + (hoverData?.price !== null ? 18 : 0) + activeSmaValues.length * 18 + markerDots.length * 18 + (purchaseDot ? 18 : 0) + 4
+  const activeOverlayValues = hoverData?.overlayValues ?? []
+  // Candle mode adds Open/High/Low rows above the SMA block, pushing every
+  // following row down by the same amount.
+  const ohlcRows = hoverData?.ohlc ? 3 : 0
+  const tooltipHeight = 38 + (hoverData?.price !== null ? 18 : 0) + ohlcRows * 18 + activeOverlayValues.length * 18 + markerDots.length * 18 + (purchaseDot ? 18 : 0) + 4
+  const tooltipRowY = (row: number) => chartData.top + 56 + ohlcRows * 18 + row * 18
 
-  const activePeriodsArray = Array.from(activePeriods).sort((a, b) => a - b)
+  const activeOverlayDefs = OVERLAYS.filter((o) => activeOverlays.has(o.id))
 
   return (
     <div className="price-chart-card">
@@ -412,21 +560,54 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         <div>
           <span className="chart-detail">Last: {trimmedHistory[trimmedHistory.length - 1]?.date}</span>
           <div className="sma-selector">
-            {(['1w', '1m', '3m', '6m', '12m'] as const).map((tf) => (
+            {(['1w', '1m', '3m', '6m', '12m', '2y'] as const).map((tf) => (
               <button key={tf} className={`sma-button ${timeframe === tf ? 'active' : ''}`} onClick={() => setTimeframe(tf)}>
-                {tf === '1w' ? '1W' : tf === '1m' ? '1M' : tf === '3m' ? '3M' : tf === '6m' ? '6M' : '12M'}
+                {tf === '1w' ? '1W' : tf === '1m' ? '1M' : tf === '3m' ? '3M' : tf === '6m' ? '6M' : tf === '12m' ? '12M' : '2Y'}
               </button>
             ))}
             <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
-            {SMA_PERIODS.map((p) => (
+            <button
+              className={`sma-button ${chartType === 'line' ? 'active' : ''}`}
+              onClick={() => setChartType('line')}
+              title="Show the closing price as a line"
+            >
+              Line
+            </button>
+            <button
+              className={`sma-button ${showCandles ? 'active' : ''}`}
+              onClick={() => setChartType('candle')}
+              disabled={!hasOhlc}
+              title={hasOhlc
+                ? 'Show open/high/low/close candlesticks'
+                : 'No OHLC data stored for this period — run the backfill_ohlc tool'}
+            >
+              Candles
+            </button>
+            <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
+            <button
+              className={`sma-button ${barInterval === 'day' ? 'active' : ''}`}
+              onClick={() => setBarInterval('day')}
+              title="One bar per trading day"
+            >
+              Day
+            </button>
+            <button
+              className={`sma-button ${barInterval === 'week' ? 'active' : ''}`}
+              onClick={() => setBarInterval('week')}
+              title="One bar per week: first open, highest high, lowest low, last close"
+            >
+              Week
+            </button>
+            <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
+            {OVERLAYS.map((o) => (
               <button
-                key={p}
-                className={`sma-button ${activePeriods.has(p) ? 'active' : ''}`}
-                style={activePeriods.has(p) ? { borderColor: SMA_COLORS[p], color: SMA_COLORS[p] } : {}}
-                onClick={() => togglePeriod(p)}
-                title={activePeriods.has(p) ? `Hide SMA ${p}` : `Show SMA ${p}`}
+                key={o.id}
+                className={`sma-button ${activeOverlays.has(o.id) ? 'active' : ''}`}
+                style={activeOverlays.has(o.id) ? { borderColor: o.color, color: o.color } : {}}
+                onClick={() => toggleOverlay(o.id)}
+                title={activeOverlays.has(o.id) ? `Hide ${o.label}` : `Show ${o.label}`}
               >
-                SMA {p}
+                {o.label}
               </button>
             ))}
             {isInternational && (
@@ -479,22 +660,41 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           ))}
 
           {/* SMA lines — rendered behind price line */}
-          {chartData.smaLines
-            .filter((line) => activePeriods.has(line.period as SmaPeriod))
+          {chartData.overlayLines
+            .filter((line) => activeOverlays.has(line.id))
             .map((line) => (
               <path
-                key={line.period}
+                key={line.id}
                 d={buildPath(line.points)}
                 fill="none"
                 stroke={line.color}
                 strokeWidth="2"
-                strokeDasharray="8 6"
+                strokeDasharray={line.dash}
                 opacity="0.9"
               />
             ))}
 
-          {/* Price line */}
-          <path d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
+          {/* Price series — candlesticks or a close line */}
+          {showCandles ? (
+            chartData.candles.map((candle, index) => (
+              <g key={index}>
+                <line
+                  className="candle-wick"
+                  x1={candle.centerX} y1={candle.highY}
+                  x2={candle.centerX} y2={candle.lowY}
+                  stroke={candle.color} strokeWidth="1"
+                />
+                <rect
+                  className="candle-body"
+                  x={candle.x} y={candle.bodyY}
+                  width={candle.width} height={candle.bodyHeight}
+                  fill={candle.color}
+                />
+              </g>
+            ))
+          ) : (
+            <path className="close-line" d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
+          )}
 
           {/* Marker dots (breakthrough price / stop loss) */}
           {markerDots.map((dot, i) => (
@@ -502,9 +702,16 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           ))}
 
           {/* Purchase price dot */}
-          {purchaseDot && (
-            <circle cx={purchaseDot.x} cy={purchaseDot.y} r="6" fill={purchaseDot.onAxis ? '#ff9800' : '#4caf50'} stroke="#fff" strokeWidth="2" />
-          )}
+          {purchaseDots.map((dot, i) => (
+            <circle
+              key={`${dot.date ?? 'axis'}-${i}`}
+              cx={dot.x} cy={dot.y} r="6"
+              fill={dot.onAxis ? PURCHASE_AXIS_COLOR : PURCHASE_COLOR}
+              stroke="#fff" strokeWidth="2"
+            >
+              <title>{dot.onAxis ? 'Purchased before this range' : `Purchased ${dot.date}`} at {currSym}{dot.price.toFixed(2)}</title>
+            </circle>
+          ))}
 
           {/* Volume bars */}
           {chartData.volumeBars.map((bar, index) => (
@@ -522,9 +729,9 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
               {hoverData.priceY !== null && (
                 <circle cx={hoverData.x} cy={hoverData.priceY} r="4" fill="#2f5ce4" stroke="#fff" strokeWidth="1.5" />
               )}
-              {hoverData.smaValues.map(({ period, color, y }) =>
+              {hoverData.overlayValues.map(({ id, color, y }) =>
                 y !== null ? (
-                  <circle key={period} cx={hoverData.x} cy={y} r="4" fill={color} stroke="#fff" strokeWidth="1.5" />
+                  <circle key={id} cx={hoverData.x} cy={y} r="4" fill={color} stroke="#fff" strokeWidth="1.5" />
                 ) : null
               )}
               <rect x={tooltipX} y={chartData.top + 4} width={tooltipWidth} height={tooltipHeight} rx="6" fill="#1e2a3a" opacity="0.92" />
@@ -534,20 +741,33 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                   Price: {currSym}{hoverData.price.toFixed(2)}
                 </text>
               )}
-              {hoverData.smaValues.map(({ period, color, value }, i) =>
+              {hoverData.ohlc && (
+                <>
+                  <text x={tooltipX + 10} y={chartData.top + 56} fontSize="12" fill="#aac" fontFamily="inherit">
+                    Open: {currSym}{hoverData.ohlc.open.toFixed(2)}
+                  </text>
+                  <text x={tooltipX + 10} y={chartData.top + 74} fontSize="12" fill="#aac" fontFamily="inherit">
+                    High: {currSym}{hoverData.ohlc.high.toFixed(2)}
+                  </text>
+                  <text x={tooltipX + 10} y={chartData.top + 92} fontSize="12" fill="#aac" fontFamily="inherit">
+                    Low: {currSym}{hoverData.ohlc.low.toFixed(2)}
+                  </text>
+                </>
+              )}
+              {hoverData.overlayValues.map(({ id, label, color, value }, i) =>
                 value !== null ? (
-                  <text key={period} x={tooltipX + 10} y={chartData.top + 56 + i * 18} fontSize="12" fill={color} fontFamily="inherit">
-                    SMA {period}: {currSym}{value.toFixed(2)}
+                  <text key={id} x={tooltipX + 10} y={tooltipRowY(i)} fontSize="12" fill={color} fontFamily="inherit">
+                    {label}: {currSym}{value.toFixed(2)}
                   </text>
                 ) : null
               )}
               {markerDots.map((dot, i) => (
-                <text key={`m${i}`} x={tooltipX + 10} y={chartData.top + 56 + activeSmaValues.length * 18 + i * 18} fontSize="12" fill={dot.color} fontFamily="inherit">
+                <text key={`m${i}`} x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + i)} fontSize="12" fill={dot.color} fontFamily="inherit">
                   {dot.label}: {currSym}{dot.price.toFixed(2)}
                 </text>
               ))}
               {purchaseDot && (
-                <text x={tooltipX + 10} y={chartData.top + 56 + activeSmaValues.length * 18 + markerDots.length * 18} fontSize="12" fill={purchaseDot.onAxis ? '#ff9800' : '#4caf50'} fontFamily="inherit">
+                <text x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + markerDots.length)} fontSize="12" fill={purchaseDot.onAxis ? PURCHASE_AXIS_COLOR : PURCHASE_COLOR} fontFamily="inherit">
                   Purchase: {currSym}{purchaseDot.price.toFixed(2)}
                 </text>
               )}
@@ -556,11 +776,18 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         </svg>
       </div>
       <div className="chart-legend">
-        <span className="legend-item"><span className="legend-swatch price-line" /> Closing Price</span>
-        {activePeriodsArray.map((p) => (
-          <span key={p} className="legend-item">
-            <span className="legend-swatch" style={{ background: SMA_COLORS[p as SmaPeriod], opacity: 0.9 }} />
-            {p}-day SMA
+        {showCandles ? (
+          <>
+            <span className="legend-item"><span className="legend-swatch" style={{ background: CANDLE_UP }} /> Close ≥ Open</span>
+            <span className="legend-item"><span className="legend-swatch" style={{ background: CANDLE_DOWN }} /> Close &lt; Open</span>
+          </>
+        ) : (
+          <span className="legend-item"><span className="legend-swatch price-line" /> Closing Price</span>
+        )}
+        {activeOverlayDefs.map((o) => (
+          <span key={o.id} className="legend-item">
+            <span className="legend-swatch" style={{ background: o.color, opacity: 0.9 }} />
+            {o.period}-{barInterval} {o.kind.toUpperCase()}
           </span>
         ))}
         <span className="legend-item"><span className="legend-swatch" style={{ background: '#4caf50' }} /> Volume Up</span>

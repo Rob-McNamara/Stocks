@@ -12,6 +12,7 @@ vi.mock('../services/api', async (importOriginal) => {
     apiClient: {
       getMeta: vi.fn(),
       getHoldings: vi.fn(),
+      getCashAccounts: vi.fn(),
       getSymbolInfo: vi.fn(),
       getHoldingsSymbolFields: vi.fn(),
       getPortfolioHoldings: vi.fn(),
@@ -70,6 +71,7 @@ beforeEach(() => {
     reserved_watchlist_keys: [],
   })
   mocked.getHoldings.mockResolvedValue([])
+  mocked.getCashAccounts.mockResolvedValue([])
   mocked.getSymbolInfo.mockResolvedValue([])
   mocked.getHoldingsSymbolFields.mockResolvedValue({})
   mocked.getPortfolioHoldings.mockResolvedValue({ holdings: [], fx_rates: {} })
@@ -243,5 +245,85 @@ describe('successful save', () => {
     submitForm()
     await waitFor(() => expect(screen.getByText(/Symbol is required/)).toBeTruthy())
     expect(mocked.addHoldingTransaction).not.toHaveBeenCalled()
+  })
+})
+
+describe('dividend settlement account', () => {
+  const accounts = [
+    { id: 6, name: 'CBA Invest', currency: 'AUD', balance: 100, interest_rate: null, include_in_portfolio: true, notes: null },
+    { id: 2, name: 'IBKR', currency: 'USD', balance: 500, interest_rate: null, include_in_portfolio: true, notes: null },
+  ]
+
+  // The picker used to live inside the purchase/sale branch, so a dividend had
+  // nowhere to be paid into and silently never reached the cash ledger.
+  it('offers an account when recording a dividend', async () => {
+    mocked.getCashAccounts.mockResolvedValue(accounts)
+    await renderManager()
+    fireEvent.change(screen.getByDisplayValue('Purchase'), { target: { value: 'dividend' } })
+
+    await waitFor(() => expect(screen.getByText(/Deposit into/)).toBeTruthy())
+    expect(screen.getByText(/CBA Invest/)).toBeTruthy()
+  })
+
+  it('sends the chosen account with the dividend', async () => {
+    mocked.getCashAccounts.mockResolvedValue(accounts)
+    await renderManager()
+    fireEvent.change(screen.getByDisplayValue('Purchase'), { target: { value: 'dividend' } })
+    fireEvent.change(input(/Symbol \(e\.g\./), { target: { value: 'VAS.AX' } })
+    fireEvent.change(input(/Dividend amount/), { target: { value: '26.01' } })
+
+    const picker = screen.getByTitle(/paid into/) as HTMLSelectElement
+    fireEvent.change(picker, { target: { value: '6' } })
+    submitForm()
+
+    await waitFor(() => expect(mocked.addHoldingTransaction).toHaveBeenCalled())
+    const payload = mocked.addHoldingTransaction.mock.calls[0][0]
+    expect(payload.transaction_type).toBe('dividend')
+    expect(payload.amount).toBe(26.01)
+    expect(payload.cash_account_id).toBe(6)
+  })
+
+  // Dividends arrive in a currency too. Recorded as AUD, a US dividend would be
+  // overstated by the exchange rate.
+  it('records a foreign dividend in AUD at the rate for the date', async () => {
+    mocked.getCashAccounts.mockResolvedValue(accounts)
+    mocked.getFxRateForDate.mockResolvedValue({ rate: 1.5, date: '2026-08-07' })
+    await renderManager()
+    fireEvent.change(screen.getByDisplayValue('Purchase'), { target: { value: 'dividend' } })
+    fireEvent.change(screen.getByDisplayValue('AUD'), { target: { value: 'USD' } })
+    fireEvent.change(input(/Symbol \(e\.g\./), { target: { value: 'NSC' } })
+    await waitFor(() => expect(screen.getByPlaceholderText(/Dividend amount \(USD\)/)).toBeTruthy())
+    fireEvent.change(input(/Dividend amount/), { target: { value: '5.40' } })
+    submitForm()
+
+    await waitFor(() => expect(mocked.addHoldingTransaction).toHaveBeenCalled())
+    const payload = mocked.addHoldingTransaction.mock.calls[0][0]
+    expect(payload.currency).toBe('USD')
+    expect(payload.fx_rate).toBe(1.5)
+    expect(payload.amount).toBeCloseTo(8.10, 2)
+  })
+
+  it('refuses to save a foreign dividend with no rate for the date', async () => {
+    mocked.getCashAccounts.mockResolvedValue(accounts)
+    mocked.getFxRateForDate.mockResolvedValue(null)
+    await renderManager()
+    fireEvent.change(screen.getByDisplayValue('Purchase'), { target: { value: 'dividend' } })
+    fireEvent.change(screen.getByDisplayValue('AUD'), { target: { value: 'USD' } })
+    fireEvent.change(input(/Symbol \(e\.g\./), { target: { value: 'NSC' } })
+    fireEvent.change(input(/Dividend amount/), { target: { value: '5.40' } })
+    submitForm()
+
+    await waitFor(() => expect(screen.getByText(/No USD\/AUD exchange rate/)).toBeTruthy())
+    expect(mocked.addHoldingTransaction).not.toHaveBeenCalled()
+  })
+
+  it('offers a USD account once the dividend currency is USD', async () => {
+    mocked.getCashAccounts.mockResolvedValue(accounts)
+    mocked.getFxRateForDate.mockResolvedValue({ rate: 1.5, date: '2026-08-07' })
+    await renderManager()
+    fireEvent.change(screen.getByDisplayValue('Purchase'), { target: { value: 'dividend' } })
+    fireEvent.change(screen.getByDisplayValue('AUD'), { target: { value: 'USD' } })
+
+    await waitFor(() => expect(screen.getByText(/IBKR/)).toBeTruthy())
   })
 })

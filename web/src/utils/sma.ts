@@ -29,6 +29,54 @@ export function calculateSMA(data: PricePoint[], period: number): Array<number |
   return sma
 }
 
+/**
+ * Exponential moving average, aligned to `data` like `calculateSMA`.
+ *
+ * Seeded with the simple average of the first full window — the conventional
+ * start, and the one charting packages use, so the values line up with what a
+ * broker shows. Weight k = 2/(period+1); each later point is
+ * `close × k + previous × (1 − k)`.
+ *
+ * A null close ends the current run: the EMA is undefined from there until a
+ * fresh window of `period` values has accumulated, rather than carrying the
+ * stale average forward across the gap.
+ */
+export function calculateEMA(data: PricePoint[], period: number): Array<number | null> {
+  const ema: Array<number | null> = Array(data.length).fill(null)
+  if (period <= 0) return ema
+
+  const k = 2 / (period + 1)
+  let previous: number | null = null
+  let windowSum = 0
+  let windowCount = 0
+
+  for (let i = 0; i < data.length; i += 1) {
+    const close = data[i].close
+    if (close === null) {
+      previous = null
+      windowSum = 0
+      windowCount = 0
+      continue
+    }
+
+    if (previous === null) {
+      // Still gathering the seed window
+      windowSum += close
+      windowCount += 1
+      if (windowCount === period) {
+        previous = windowSum / period
+        ema[i] = previous
+      }
+      continue
+    }
+
+    previous = close * k + previous * (1 - k)
+    ema[i] = previous
+  }
+
+  return ema
+}
+
 export function getLatestSMA(smaArray: Array<number | null>): number | null {
   // Find the last non-null SMA value
   for (let i = smaArray.length - 1; i >= 0; i -= 1) {

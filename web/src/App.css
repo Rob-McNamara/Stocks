@@ -650,6 +650,19 @@
   overflow-x: auto;
 }
 
+/* Vertically resizable scroll container — the browser draws a drag grip in the
+   bottom-right corner. `resize` is ignored unless the element has a definite
+   height and a non-visible overflow, hence both properties here.
+   Deliberately CSS rather than an inline style: the browser writes the dragged
+   height to the element's own style attribute, and a React `style` prop would
+   overwrite it on the next render (e.g. when the table is re-sorted). */
+.resizable-table-wrapper {
+  height: 400px;
+  min-height: 120px;
+  overflow: auto;
+  resize: vertical;
+}
+
 .holdings-table {
   width: 100%;
   border-collapse: collapse;
@@ -671,6 +684,49 @@
 .holdings-table th {
   background: #f4f6fb;
   color: #444;
+}
+
+/* Top level of a two-level header — spans its child columns, so it is centred
+   and tinted a shade darker to read as a group rather than a column. Tighter
+   vertical padding keeps the extra header row from eating table height. */
+.holdings-table th.column-group {
+  text-align: center;
+  background: #dde5f3;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+/* Vertical rules bracketing a column group, carried from the header down
+   through the body so the extent of the group is visible against the data —
+   the header tint alone does not show where a group starts and stops.
+
+   Under `border-collapse: collapse` a boundary is shared between two cells and
+   the browser picks a winner. Safari does not always pick the wider one, so a
+   rule declared on only one side can vanish there. Both cells at every boundary
+   therefore declare it — the collapse then merges two identical 2px edges and
+   the outcome no longer depends on conflict resolution. */
+/* Drawn as an inset shadow rather than a border, in the header and the body
+   alike, for two reasons:
+
+   1. The <thead> is position: sticky. Under border-collapse: collapse the
+      collapsed borders belong to the table rather than to each cell, so they
+      are not carried into the sticky layer and a border-drawn rule stops at
+      the top of the body (visibly so in Safari). A shadow is painted by the
+      cell itself and travels with it.
+   2. A collapsed border straddles the grid line while a shadow starts at it,
+      so mixing the two puts the header rule about a pixel off the body's.
+      Using one mechanism throughout keeps every segment on the same axis.
+
+   Left edges only: shadows do not collapse the way borders do, so painting
+   both cells at a boundary would draw two parallel lines with the cell border
+   between them. Every boundary has a cell to its right carrying `rule-left` —
+   including the column following the last group — so one side covers them all
+   exactly once. */
+.holdings-table th.rule-left,
+.holdings-table td.rule-left {
+  box-shadow: inset 2px 0 0 0 #93a9c9;
 }
 
 .holdings-table tr:hover {

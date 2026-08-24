@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiClient, type RiskRow, type RiskTotals } from '../services/api'
-import { getEarliestRemainingPurchaseDate } from '../utils/holdings'
+import { getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from '../utils/holdings'
 import PriceChart from './PriceChart'
 
 // Thin client: FIFO cost basis, stop-loss/trailing-sell triggers, SMAs and
@@ -34,10 +34,24 @@ interface AnalysisRow {
   stopLoss: number | null
   stopLossPct: number | null
   stopLossDollar: number | null
+  /**
+   * How far the current price sits above its stop, as a percentage of the
+   * stop. Same formula as the Dashboard's Difference column so the two screens
+   * agree. Being a ratio of two same-currency figures, it needs no FX handling.
+   */
+  stopLossDiffPct: number | null
+  /**
+   * The same gap in dollars across the whole position: (price − stop) × shares.
+   * Position-level rather than per-share, matching `stopLossDollar` — the
+   * per-share gap is already readable straight off the Price and Stop Loss
+   * columns, whereas the amount at risk is not.
+   */
+  stopLossDiffDollar: number | null
   totalInvested: number | null
   isTrailingSell: boolean
   sma50: number | null
   sma150: number | null
+  ema40w: number | null
   high30d: number | null
   currency: string | null
 }
@@ -117,10 +131,19 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
     stopLoss: r.stop_loss,
     stopLossPct: r.stop_loss_pct,
     stopLossDollar: r.stop_loss_dollar,
+    stopLossDiffPct:
+      r.current_price !== null && r.stop_loss !== null && r.stop_loss !== 0
+        ? ((r.current_price - r.stop_loss) / r.stop_loss) * 100
+        : null,
+    stopLossDiffDollar:
+      r.current_price !== null && r.stop_loss !== null && r.shares > 0
+        ? (r.current_price - r.stop_loss) * r.shares
+        : null,
     totalInvested: r.total_invested,
     isTrailingSell: r.is_trailing_sell,
     sma50: r.sma50,
     sma150: r.sma150,
+    ema40w: r.ema40w,
     high30d: r.high30d,
     currency: r.currency,
   })), [riskRows])
@@ -152,8 +175,11 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
           case 'stopLoss': return row.stopLoss
           case 'sma50': return row.sma50
           case 'sma150': return row.sma150
+          case 'ema40w': return row.ema40w
           case 'high30d': return row.high30d
           case 'stopLossPct': return row.stopLossPct
+          case 'stopLossDiffPct': return row.stopLossDiffPct
+          case 'stopLossDiffDollar': return row.stopLossDiffDollar
           default: return null
         }
       }
@@ -178,7 +204,7 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
       {selectedSymbol && (
         <div className="manager-card" style={{ marginBottom: 24 }}>
           <div className="card-header" style={{ marginBottom: 8 }}>
-            <h3 style={{ margin: 0 }}>Simple Moving Average Chart</h3>
+            <h3 style={{ margin: 0 }}>Stock Chart</h3>
             <div className="chart-select">
               <label htmlFor="analysis-chart-symbol">Symbol</label>
               <select
@@ -199,6 +225,7 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
             onLoading={onLoading}
             purchasePrice={selectedRow?.purchasePrice ?? null}
             purchaseDate={getEarliestRemainingPurchaseDate(transactions, selectedSymbol)}
+            purchases={getRemainingPurchaseLots(transactions, selectedSymbol)}
             currentPrice={prices[selectedSymbol] ?? null}
             currentVolume={volumes[selectedSymbol] ?? null}
             markerPrice={selectedRow?.stopLoss ?? null}
@@ -213,20 +240,48 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
         {rows.length === 0 ? (
           <p className="empty-text">No active holdings.</p>
         ) : (
-          <div className="holdings-table-wrapper" style={{ maxHeight: 400, overflowY: 'auto' }}>
+          <div className="holdings-table-wrapper resizable-table-wrapper">
             <table className="holdings-table" style={{ position: 'relative' }}>
+              {/* Two-level header: three groups (Current, Stop Loss, SMA) over
+                  their child columns. Ungrouped columns use rowSpan={2} so their
+                  labels stay vertically centred across both rows. */}
               <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
                 <tr style={{ background: '#fff' }}>
-                  <th className="sortable-header" onClick={() => handleSort('symbol')}>Symbol{sortIndicator('symbol')}</th>
-                  <th className="sortable-header" onClick={() => handleSort('plPct')}>P/L %{sortIndicator('plPct')}</th>
-                  <th>Purchase</th>
-                  <th>Current</th>
-                  <th>50SMA</th>
-                  <th>150SMA</th>
-                  <th>30d High</th>
-                  <th>Stop Loss</th>
-                  <th className="sortable-header" onClick={() => handleSort('stopLossPct')}>P/L% at SL{sortIndicator('stopLossPct')}</th>
-                  <th className="sortable-header" onClick={() => handleSort('stopLossDollar')}>P/L$ at SL{sortIndicator('stopLossDollar')}</th>
+                  <th rowSpan={2} scope="col" className="sortable-header" onClick={() => handleSort('symbol')}>Symbol{sortIndicator('symbol')}</th>
+                  <th colSpan={2} scope="colgroup" className="column-group rule-left">Current</th>
+                  <th colSpan={5} scope="colgroup" className="column-group rule-left">Stop Loss</th>
+                  <th colSpan={3} scope="colgroup" className="column-group rule-left">Moving Avgs</th>
+                  <th rowSpan={2} scope="col" className="rule-left">30d High</th>
+                </tr>
+                {/* Second-row cells appear in column order across all groups:
+                    Current's two, then Stop Loss's four, then SMA's two. Both
+                    "Price" and "P/L%" appear twice — the group above them is
+                    what tells the two apart. */}
+                <tr style={{ background: '#fff' }}>
+                  <th scope="col" className="rule-left" title="Current price">Price</th>
+                  <th scope="col" className="sortable-header" onClick={() => handleSort('plPct')} title="Profit/loss percentage at the current price">P/L%{sortIndicator('plPct')}</th>
+                  <th scope="col" className="rule-left" title="Stop loss trigger price">Price</th>
+                  <th
+                    scope="col"
+                    className="sortable-header"
+                    onClick={() => handleSort('stopLossDiffPct')}
+                    title="How far the current price is above its stop loss, as a percentage of the stop"
+                  >
+                    Diff%{sortIndicator('stopLossDiffPct')}
+                  </th>
+                  <th
+                    scope="col"
+                    className="sortable-header"
+                    onClick={() => handleSort('stopLossDiffDollar')}
+                    title="Value given up across the whole position if the stop loss triggered at today's price"
+                  >
+                    Diff${sortIndicator('stopLossDiffDollar')}
+                  </th>
+                  <th scope="col" className="sortable-header" onClick={() => handleSort('stopLossPct')} title="Profit/loss percentage if sold at the stop loss">P/L%{sortIndicator('stopLossPct')}</th>
+                  <th scope="col" className="sortable-header" onClick={() => handleSort('stopLossDollar')} title="Profit/loss in dollars if sold at the stop loss">P/L${sortIndicator('stopLossDollar')}</th>
+                  <th scope="col" className="rule-left" title="40-week exponential moving average (weekly closes)">40we</th>
+                  <th scope="col" title="50-day simple moving average">50s</th>
+                  <th scope="col" title="150-day simple moving average">150s</th>
                 </tr>
               </thead>
               <tbody>
@@ -249,19 +304,12 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
                         </span>
                       )}
                     </td>
+                    <td className="rule-left">{row.currentPrice !== null ? `$${row.currentPrice.toFixed(2)}` : '—'}</td>
                     <td style={{ color: row.plPct !== null ? (row.plPct >= 0 ? '#4caf50' : '#f44336') : undefined, fontWeight: 600 }}>
                       {row.plPct !== null ? `${row.plPct >= 0 ? '+' : ''}${row.plPct.toFixed(1)}%` : '—'}
                     </td>
-                    <td>{row.purchasePrice !== null ? `$${row.purchasePrice.toFixed(2)}` : '—'}</td>
-                    <td>{row.currentPrice !== null ? `$${row.currentPrice.toFixed(2)}` : '—'}</td>
-                    <td style={{ color: row.sma50 !== null && row.currentPrice !== null && row.currentPrice < row.sma50 ? '#f44336' : undefined }}>
-                      {row.sma50 !== null ? `$${row.sma50.toFixed(2)}` : '—'}
-                    </td>
-                    <td style={{ color: row.sma150 !== null && row.currentPrice !== null && row.currentPrice < row.sma150 ? '#f44336' : undefined }}>
-                      {row.sma150 !== null ? `$${row.sma150.toFixed(2)}` : '—'}
-                    </td>
-                    <td>{row.high30d !== null ? `$${row.high30d.toFixed(2)}` : '—'}</td>
                     <td
+                      className="rule-left"
                       style={{ cursor: 'pointer' }}
                       title="Double-click to edit"
                       onDoubleClick={(e) => {
@@ -272,12 +320,28 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
                         setEditTrailingSellDate(symbolFields[row.symbol]?.['trailing_sell_date'] ?? '')
                       }}
                     >{row.stopLoss !== null ? `$${row.stopLoss.toFixed(2)}${row.isTrailingSell ? '*' : ''}` : '—'}</td>
+                    <td style={{ color: row.stopLossDiffPct !== null ? (row.stopLossDiffPct >= 0 ? '#4caf50' : '#f44336') : undefined, fontWeight: 600 }}>
+                      {row.stopLossDiffPct !== null ? `${row.stopLossDiffPct >= 0 ? '+' : ''}${row.stopLossDiffPct.toFixed(2)}%` : '—'}
+                    </td>
+                    <td style={{ color: row.stopLossDiffDollar !== null ? (row.stopLossDiffDollar >= 0 ? '#4caf50' : '#f44336') : undefined, fontWeight: 600 }}>
+                      {row.stopLossDiffDollar !== null ? `${row.stopLossDiffDollar >= 0 ? '+' : '-'}$${Math.abs(row.stopLossDiffDollar).toFixed(2)}` : '—'}
+                    </td>
                     <td style={{ color: row.stopLossPct !== null ? (row.stopLossPct >= 0 ? '#4caf50' : '#f44336') : undefined, fontWeight: 600 }}>
                       {row.stopLossPct !== null ? `${row.stopLossPct >= 0 ? '+' : ''}${row.stopLossPct.toFixed(1)}%` : '—'}
                     </td>
                     <td style={{ color: row.stopLossDollar !== null ? (row.stopLossDollar >= 0 ? '#4caf50' : '#f44336') : undefined, fontWeight: 600 }}>
                       {row.stopLossDollar !== null ? `${row.stopLossDollar >= 0 ? '+' : '-'}$${Math.abs(row.stopLossDollar).toFixed(2)}` : '—'}
                     </td>
+                    <td className="rule-left" style={{ color: row.ema40w !== null && row.currentPrice !== null && row.currentPrice < row.ema40w ? '#f44336' : undefined }}>
+                      {row.ema40w !== null ? `$${row.ema40w.toFixed(2)}` : '—'}
+                    </td>
+                    <td style={{ color: row.sma50 !== null && row.currentPrice !== null && row.currentPrice < row.sma50 ? '#f44336' : undefined }}>
+                      {row.sma50 !== null ? `$${row.sma50.toFixed(2)}` : '—'}
+                    </td>
+                    <td style={{ color: row.sma150 !== null && row.currentPrice !== null && row.currentPrice < row.sma150 ? '#f44336' : undefined }}>
+                      {row.sma150 !== null ? `$${row.sma150.toFixed(2)}` : '—'}
+                    </td>
+                    <td className="rule-left">{row.high30d !== null ? `$${row.high30d.toFixed(2)}` : '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -288,13 +352,25 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
                 return (
                   <tfoot>
                     <tr style={{ borderTop: '2px solid #ccc', fontWeight: 700 }}>
-                      <td colSpan={8} style={{ textAlign: 'right' }}>Total if all sold at Stop Loss:</td>
+                      {/* Cells are split on the group boundaries rather than
+                          merged into one wide spacer, so the vertical group
+                          rules run unbroken from the header through to here.
+                          The label therefore starts at the Current group rather
+                          than the Symbol column. */}
+                      <td />
+                      <td colSpan={2} className="rule-left" style={{ textAlign: 'right' }}>Total if all sold at Stop Loss:</td>
+                      <td className="rule-left" />
+                      <td />
+                      <td />
                       <td style={{ color: totalSlPct !== null ? (totalSlPct >= 0 ? '#4caf50' : '#f44336') : undefined }}>
                         {totalSlPct !== null ? `${totalSlPct >= 0 ? '+' : ''}${totalSlPct.toFixed(1)}%` : '—'}
                       </td>
                       <td style={{ color: totalSlDollar >= 0 ? '#4caf50' : '#f44336' }}>
                         {`${totalSlDollar >= 0 ? '+' : '-'}$${Math.abs(totalSlDollar).toFixed(2)}`}
                       </td>
+                      {/* SMA and 30d High have no total */}
+                      <td colSpan={3} className="rule-left" />
+                      <td className="rule-left" />
                     </tr>
                   </tfoot>
                 )

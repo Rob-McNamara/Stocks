@@ -101,6 +101,11 @@ struct CurrentPrice {
     change: Option<f64>,
     change_percent: Option<f64>,
     volume: Option<i64>,
+    /// Session OHLC for the day `price_date` refers to. `price` is the running
+    /// close, so these three complete today's candle while the market is open.
+    day_open: Option<f64>,
+    day_high: Option<f64>,
+    day_low: Option<f64>,
     last_updated: String,
     price_date: Option<String>,
     error: Option<String>,
@@ -123,6 +128,8 @@ struct HoldingTransaction {
     currency: String,
     original_price: Option<f64>,
     fx_rate: Option<f64>,
+    /// Cash account this trade settles against, when it has one.
+    cash_account_id: Option<i64>,
     #[serde(default)]
     custom_fields: std::collections::HashMap<String, String>,
 }
@@ -162,6 +169,11 @@ struct NewHoldingTransaction {
     original_price: Option<f64>,
     fx_rate: Option<f64>,
     custom_fields: Option<std::collections::HashMap<String, String>>,
+    /// Cash account this trade settles against. Omit to record the trade
+    /// without touching the cash ledger, as every pre-ledger trade does.
+    cash_account_id: Option<i64>,
+    /// Tax withheld from this payment, overriding the symbol's standing rate.
+    withholding_amount: Option<f64>,
     /// Set true to record a sale of more shares than currently held
     /// (the API responds 409 with a warning otherwise).
     confirm: Option<bool>,
@@ -744,8 +756,17 @@ async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web::Query<FxR
         Ok(d) => d,
         Err(_) => return err_bad_request("Invalid date format, use YYYY-MM-DD"),
     };
+    // Prefer the stored rate history: it covers every past date, avoids a Yahoo
+    // round trip per lookup, and returns the same rate the valuation code will
+    // use. Only fall through to the network when the date is not yet stored.
+    if let Ok(conn) = open_db(db_path.as_ref())
+        && let Some(rate) = fx_rate_on(&conn, &currency, &query.date)
+    {
+        return HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": query.date, "source": "stored" }));
+    }
+
     match fetch_fx_rate_on_date(&currency, target_date).await {
-        Ok((rate, date)) => HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": date })),
+        Ok((rate, date)) => HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": date, "source": "yahoo" })),
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "fx_fetch", "api", None, &err);
             if err.starts_with("No ") {
@@ -946,34 +967,83 @@ async fn rename_holding_symbol(
 /// metadata, in a single transaction. Per-transaction custom fields are keyed
 /// by transaction id, so they follow automatically. Returns the number of
 /// holdings_transactions rows updated.
+/// Every table that keys rows by ticker, and so has to follow a symbol when it
+/// is renamed.
+///
+/// `event_log` is deliberately absent. It records what happened at the time,
+/// under the name in use then; rewriting it would falsify the history it exists
+/// to preserve. That is the same reasoning that keeps the log tables out of the
+/// audit triggers — see the Audit Logging section of CLAUDE.md.
+const SYMBOL_KEYED_TABLES: &[&str] = &[
+    "holdings_transactions",
+    "holdings_symbol_fields",
+    "symbol_info",
+    "prices",
+    "dividend_events",
+    "dividend_exclusions",
+    "cached_current_prices",
+    "watchlist_symbols",
+    "watchlist_memberships",
+    "watchlist_prices",
+    "watchlist_symbol_fields",
+    "stock_analysis_messages",
+];
+
+/// Move every row keyed to `old_symbol` across to `new_symbol`, returning how
+/// many `holdings_transactions` moved.
+///
+/// One rule covers every table: `UPDATE OR IGNORE` moves what it can, and where
+/// the target already holds that key its own row wins, leaving the stale
+/// duplicate to be deleted. Being column-blind is the point — copying row by
+/// row meant naming each column, and a column added later was silently left
+/// behind. That is exactly how a rename used to drop
+/// `symbol_info.dividend_withholding_pct` and start crediting US distributions
+/// gross again.
+///
+/// Table names come from the constant above, never from input, so interpolating
+/// them into the statement is safe.
+fn migrate_symbol_rows(tx: &Connection, old_symbol: &str, new_symbol: &str) -> Result<usize, String> {
+    let mut holdings_moved = 0usize;
+    for table in SYMBOL_KEYED_TABLES {
+        // Some of these are legacy: `watchlist_prices` still holds rows in
+        // databases created by older versions but is no longer built by
+        // `init_db`. Touching a table that isn't there would abort the whole
+        // rename mid-transaction, so absence is simply skipped.
+        let present: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if present == 0 {
+            continue;
+        }
+
+        let moved = tx
+            .execute(
+                &format!("UPDATE OR IGNORE {} SET symbol = ?1 WHERE symbol = ?2", table),
+                params![new_symbol, old_symbol],
+            )
+            .map_err(|e| format!("Renaming {} in {}: {}", old_symbol, table, e))?;
+        if *table == "holdings_transactions" {
+            holdings_moved = moved;
+        }
+        // Whatever could not move is a row the target already has under that
+        // key; the old copy is stale either way.
+        tx.execute(
+            &format!("DELETE FROM {} WHERE symbol = ?1", table),
+            params![old_symbol],
+        )
+        .map_err(|e| format!("Clearing {} from {}: {}", old_symbol, table, e))?;
+    }
+    Ok(holdings_moved)
+}
+
 fn rename_holdings_symbol(db_path: &PathBuf, old_symbol: &str, new_symbol: &str) -> Result<usize, String> {
     let mut conn = open_db(db_path).map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let affected = tx
-        .execute(
-            "UPDATE holdings_transactions SET symbol = ?1 WHERE symbol = ?2",
-            params![new_symbol, old_symbol],
-        )
-        .map_err(|e| e.to_string())?;
-    // Move symbol-level fields, skipping any keys already present on the target.
-    tx.execute(
-        "INSERT OR IGNORE INTO holdings_symbol_fields (symbol, field_key, value)
-         SELECT ?1, field_key, value FROM holdings_symbol_fields WHERE symbol = ?2",
-        params![new_symbol, old_symbol],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM holdings_symbol_fields WHERE symbol = ?1",
-        params![old_symbol],
-    )
-    .map_err(|e| e.to_string())?;
-    // Carry over instrument info if the target doesn't already have it.
-    tx.execute(
-        "INSERT OR IGNORE INTO symbol_info (symbol, instrument_type, long_name, currency, updated_at)
-         SELECT ?1, instrument_type, long_name, currency, updated_at FROM symbol_info WHERE symbol = ?2",
-        params![new_symbol, old_symbol],
-    )
-    .map_err(|e| e.to_string())?;
+    let affected = migrate_symbol_rows(&tx, old_symbol, new_symbol)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(affected)
 }
@@ -1039,6 +1109,11 @@ struct PriceHistoryQuery {
 #[derive(Serialize)]
 struct PriceHistoryPoint {
     date: String,
+    /// OHLC is absent for rows written before OHLC ingest existed, and for
+    /// any bar Yahoo returns without it — clients must tolerate nulls.
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
     close: Option<f64>,
     volume: Option<i64>,
 }
@@ -1068,27 +1143,70 @@ async fn get_price_history(
     if query.include_live == Some(true) {
         // Replace or append the latest point with the cached live price so
         // every client renders today's bar consistently.
-        let live: Option<(Option<f64>, Option<String>, Option<i64>)> = open_db(db_path.as_ref()).ok().and_then(|conn| {
+        struct LiveBar {
+            price: Option<f64>,
+            price_date: Option<String>,
+            volume: Option<i64>,
+            open: Option<f64>,
+            high: Option<f64>,
+            low: Option<f64>,
+        }
+        let live: Option<LiveBar> = open_db(db_path.as_ref()).ok().and_then(|conn| {
             conn.query_row(
-                "SELECT price, price_date, volume FROM cached_current_prices WHERE symbol = ?1",
+                "SELECT price, price_date, volume, day_open, day_high, day_low FROM cached_current_prices WHERE symbol = ?1",
                 params![symbol],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(LiveBar {
+                        price: row.get(0)?,
+                        price_date: row.get(1)?,
+                        volume: row.get(2)?,
+                        open: row.get(3)?,
+                        high: row.get(4)?,
+                        low: row.get(5)?,
+                    })
+                },
             )
             .optional()
             .ok()
             .flatten()
         });
-        if let Some((Some(price), price_date, volume)) = live {
-            let date = price_date.unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+        if let Some(bar) = live
+            && let Some(price) = bar.price
+        {
+            let date = bar.price_date.clone().unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
             match history.last() {
-                None => history.push(PriceHistoryPoint { date, close: Some(price), volume }),
+                None => history.push(PriceHistoryPoint {
+                    date,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: Some(price),
+                    volume: bar.volume,
+                }),
                 Some(last) if date == last.date => {
-                    let existing_volume = last.volume;
+                    // Live session values win, but keep whatever the stored bar
+                    // already had so a partial live quote can't blank the candle.
+                    let (stored_open, stored_high, stored_low, stored_volume) =
+                        (last.open, last.high, last.low, last.volume);
                     let n = history.len();
-                    history[n - 1] = PriceHistoryPoint { date, close: Some(price), volume: volume.or(existing_volume) };
+                    history[n - 1] = PriceHistoryPoint {
+                        date,
+                        open: bar.open.or(stored_open),
+                        high: bar.high.or(stored_high),
+                        low: bar.low.or(stored_low),
+                        close: Some(price),
+                        volume: bar.volume.or(stored_volume),
+                    };
                 }
                 Some(last) if date > last.date.clone() => {
-                    history.push(PriceHistoryPoint { date, close: Some(price), volume });
+                    history.push(PriceHistoryPoint {
+                        date,
+                        open: bar.open,
+                        high: bar.high,
+                        low: bar.low,
+                        close: Some(price),
+                        volume: bar.volume,
+                    });
                 }
                 _ => {}
             }
@@ -1197,6 +1315,35 @@ async fn fetch_dividend_events_for_symbol(client: &Client, symbol: &str) -> Resu
     Ok(events)
 }
 
+/// Days within which two identical amounts are taken to be one distribution.
+/// Yahoo has been seen listing a Vanguard quarterly three days apart.
+const DIVIDEND_DUPLICATE_WINDOW_DAYS: i64 = 4;
+
+/// Collapse the same distribution reported more than once.
+///
+/// Yahoo's feed genuinely repeats some events: VAE.AX comes back with
+/// timestamps exactly 86400 apart carrying an identical 0.677876, which is one
+/// distribution described twice, not two payments. Left alone it is paid twice
+/// into the cash ledger. Duplicates are matched on an identical amount within a
+/// few days, and the earliest is kept — that is the real ex-date, the later
+/// copy being the artefact.
+fn dedupe_dividend_events(events: &[DividendEvent]) -> Vec<DividendEvent> {
+    let mut sorted: Vec<DividendEvent> = events.to_vec();
+    sorted.sort_by(|a, b| a.ex_date.cmp(&b.ex_date));
+
+    let mut kept: Vec<DividendEvent> = Vec::with_capacity(sorted.len());
+    for event in sorted {
+        let is_repeat = kept.iter().any(|k| {
+            (k.amount - event.amount).abs() < 1e-6
+                && (event.ex_date - k.ex_date).num_days() <= DIVIDEND_DUPLICATE_WINDOW_DAYS
+        });
+        if !is_repeat {
+            kept.push(event);
+        }
+    }
+    kept
+}
+
 fn store_dividend_events_for_symbol(db_path: &PathBuf, symbol: &str, events: &[DividendEvent]) -> Result<(), String> {
     let mut conn = open_db(db_path).map_err(|e| e.to_string())?;
     conn.execute_batch(
@@ -1213,8 +1360,26 @@ fn store_dividend_events_for_symbol(db_path: &PathBuf, symbol: &str, events: &[D
         CREATE INDEX IF NOT EXISTS idx_dividend_events_symbol_date ON dividend_events(symbol, ex_date);",
     ).map_err(|e| e.to_string())?;
 
+    // An empty fetch is a failure to learn anything, not news that the symbol
+    // never paid a dividend, so it must not be allowed to erase real history.
+    if events.is_empty() {
+        return Ok(());
+    }
+    let events = dedupe_dividend_events(events);
+    let events = &events[..];
+
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     {
+        // Yahoo returns the symbol's complete dividend history, so the fetch is
+        // the authority: a stored row it no longer reports is stale, not merely
+        // unrefreshed. Upserting alone made this table grow-only — when a
+        // date-handling change moved ex-dates by a day, every refresh added a
+        // second copy of every dividend rather than correcting the first,
+        // because the key is (symbol, ex_date). Replacing the symbol's whole
+        // set is what makes a refresh converge.
+        tx.execute("DELETE FROM dividend_events WHERE symbol = ?1", params![symbol])
+            .map_err(|e| e.to_string())?;
+
         let mut stmt = tx.prepare(
             "INSERT OR REPLACE INTO dividend_events (symbol, ex_date, payment_date, record_date, amount, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1336,11 +1501,200 @@ async fn refresh_dividends_for_symbols(db_path: &PathBuf, symbols: Vec<String>) 
     DividendRefreshResult { updated, errors }
 }
 
+/// Outcome of materialising fetched dividend events as transactions.
+#[derive(Serialize, Default)]
+struct DividendRecordResult {
+    recorded: usize,
+    /// Already had a transaction.
+    already_present: usize,
+    /// Declined by the user; see `dividend_exclusions`.
+    excluded: usize,
+    /// Currencies with no configured destination account, so nothing was
+    /// recorded for them.
+    unconfigured_currencies: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Where dividends in `currency` are paid, from `app_config`.
+///
+/// Keyed by currency because that is how the accounts actually divide: AUD
+/// distributions land in the everyday investment account, USD ones in the
+/// foreign broker. A currency with no key configured is left alone rather than
+/// guessed at — inventing a destination would move real money to the wrong
+/// place.
+fn dividend_account_for_currency(conn: &Connection, currency: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT value FROM app_config WHERE key = ?1",
+        params![format!("dividend_account_{}", currency.to_uppercase())],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|v| v.trim().parse::<i64>().ok())
+}
+
+/// Record every fetched dividend event the holder was entitled to and has not
+/// already recorded or declined.
+///
+/// Runs after each dividend refresh so a newly fetched event reaches the cash
+/// ledger on its own. Previously this was a one-off script, and anything
+/// fetched afterwards sat in the Transactions screen as a derived row with no
+/// account, invisible in the cash balance until someone remembered to re-run
+/// it.
+fn record_new_dividends(db_path: &PathBuf) -> Result<DividendRecordResult, String> {
+    let mut result = DividendRecordResult::default();
+    let conn = open_db(db_path).map_err(|e| e.to_string())?;
+
+    let events: Vec<(String, String, f64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.symbol, e.ex_date, e.amount
+                   FROM dividend_events e
+                  WHERE NOT EXISTS (SELECT 1 FROM holdings_transactions h
+                                     WHERE h.symbol = e.symbol AND h.date = e.ex_date
+                                       AND h.transaction_type = 'dividend')
+                  ORDER BY e.ex_date, e.symbol",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // One read of the ledger, grouped by symbol — the entitlement check runs
+    // per event and there can be hundreds.
+    let all_txs = fetch_holdings(db_path)?;
+    let mut by_symbol: HashMap<String, Vec<HoldingTransaction>> = HashMap::new();
+    for tx in all_txs {
+        by_symbol.entry(tx.symbol.clone()).or_default().push(tx);
+    }
+
+    let mut unconfigured: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (symbol, ex_date, per_share) in events {
+        let excluded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dividend_exclusions WHERE symbol = ?1 AND ex_date = ?2",
+                params![symbol, ex_date],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if excluded > 0 {
+            result.excluded += 1;
+            continue;
+        }
+
+        // Entitlement follows the shares held at the ex-date, using the same
+        // convention as the rest of the engine.
+        let Some(txs) = by_symbol.get(&symbol) else { continue };
+        let shares = portfolio::shares_on_date(&to_portfolio_txs(txs), &ex_date);
+        if shares <= 0.0 {
+            continue;
+        }
+
+        // The currency the symbol trades in, taken from its own transactions
+        // so it matches how the trades were recorded.
+        let currency = txs
+            .iter()
+            .find(|t| !t.currency.is_empty())
+            .map(|t| t.currency.to_uppercase())
+            .unwrap_or_else(|| "AUD".to_string());
+        let Some(account_id) = dividend_account_for_currency(&conn, &currency) else {
+            unconfigured.insert(currency);
+            continue;
+        };
+
+        let mut payload = NewHoldingTransaction {
+            symbol: symbol.clone(),
+            transaction_type: "dividend".to_string(),
+            date: ex_date.clone(),
+            quantity: Some(shares),
+            price: Some(per_share),
+            amount: Some(shares * per_share),
+            brokerage: None,
+            notes: None,
+            currency: Some(currency.clone()),
+            original_price: None,
+            fx_rate: None,
+            custom_fields: None,
+            cash_account_id: Some(account_id),
+            withholding_amount: None,
+            confirm: None,
+        };
+        if currency != "AUD" {
+            // `amount` and `price` are stored in AUD, as they are for a trade;
+            // the native figures ride alongside so a foreign-currency account
+            // can be credited in its own currency.
+            let Some(rate) = fx_rate_on(&conn, &currency, &ex_date) else {
+                result.errors.push(format!("{} {}: no {}/AUD rate", symbol, ex_date, currency));
+                continue;
+            };
+            payload.original_price = Some(per_share);
+            payload.price = Some(per_share * rate);
+            payload.fx_rate = Some(rate);
+            payload.amount = Some(shares * per_share * rate);
+        }
+
+        match insert_holding_transaction(db_path, &symbol, payload) {
+            Ok(_) => result.recorded += 1,
+            Err(err) => result.errors.push(format!("{} {}: {}", symbol, ex_date, err)),
+        }
+    }
+
+    result.unconfigured_currencies = {
+        let mut v: Vec<String> = unconfigured.into_iter().collect();
+        v.sort();
+        v
+    };
+    for ccy in &result.unconfigured_currencies {
+        let _ = insert_event_log(
+            db_path,
+            "warn",
+            "dividend_record",
+            "api",
+            None,
+            &format!(
+                "Dividends in {} were not recorded: set app_config key 'dividend_account_{}' to the destination account id",
+                ccy, ccy
+            ),
+        );
+    }
+    if result.recorded > 0 {
+        let _ = insert_event_log(db_path, "info", "dividend_record", "api", None,
+            &format!("Recorded {} newly fetched dividend(s)", result.recorded));
+    }
+    Ok(result)
+}
+
+/// Fetch result plus what recording those events produced.
+///
+/// Recording runs on the same request as the fetch: an event that arrives and
+/// is not immediately recorded shows in the Transactions screen as a derived
+/// row with no cash account, which reads as a bug rather than as pending work.
+fn with_recorded_dividends(db_path: &PathBuf, fetched: DividendRefreshResult) -> serde_json::Value {
+    let recorded = match record_new_dividends(db_path) {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = insert_event_log(db_path, "error", "dividend_record", "api", None, &err);
+            DividendRecordResult { errors: vec![err], ..Default::default() }
+        }
+    };
+    serde_json::json!({
+        "updated": fetched.updated,
+        "errors": fetched.errors,
+        "recorded": recorded,
+    })
+}
+
 #[utoipa::path(post, path = "/api/v1/dividends/refresh", tag = "dividends", responses((status = 200, description = "Refresh dividends")))]
 #[post("/api/dividends/refresh")]
 async fn refresh_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_holding_symbols(&db_path) {
-        Ok(symbols) => HttpResponse::Ok().json(refresh_dividends_for_symbols(&db_path, symbols).await),
+        Ok(symbols) => {
+            let fetched = refresh_dividends_for_symbols(&db_path, symbols).await;
+            HttpResponse::Ok().json(with_recorded_dividends(&db_path, fetched))
+        }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", None, &err);
             err_internal(err)
@@ -1352,7 +1706,10 @@ async fn refresh_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
 #[post("/api/dividends/refresh-sold")]
 async fn refresh_sold_dividends(db_path: web::Data<PathBuf>) -> impl Responder {
     match load_sold_symbols(&db_path) {
-        Ok(symbols) => HttpResponse::Ok().json(refresh_dividends_for_symbols(&db_path, symbols).await),
+        Ok(symbols) => {
+            let fetched = refresh_dividends_for_symbols(&db_path, symbols).await;
+            HttpResponse::Ok().json(with_recorded_dividends(&db_path, fetched))
+        }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "dividend_fetch", "api", None, &err);
             err_internal(err)
@@ -1508,17 +1865,11 @@ async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl Responder 
         }
     };
 
-    let mut first_purchase: HashMap<String, String> = HashMap::new();
+    // Grouped once, to test entitlement per event below.
+    let mut by_symbol: HashMap<String, Vec<HoldingTransaction>> = HashMap::new();
     let mut manual_dividend_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tx in &txs {
-        if tx.transaction_type == "purchase" {
-            match first_purchase.get(&tx.symbol) {
-                Some(existing) if *existing <= tx.date => {}
-                _ => {
-                    first_purchase.insert(tx.symbol.clone(), tx.date.clone());
-                }
-            }
-        }
+        by_symbol.entry(tx.symbol.clone()).or_default().push(tx.clone());
         if tx.transaction_type == "dividend" {
             manual_dividend_keys.insert(format!("{}|{}", tx.symbol, tx.date));
         }
@@ -1540,6 +1891,7 @@ async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl Responder 
             "amount": tx.amount,
             "brokerage": tx.brokerage,
             "notes": tx.notes,
+            "cash_account_id": tx.cash_account_id,
             "per_share": false,
             "payment_date": serde_json::Value::Null,
             "custom_fields": tx.custom_fields,
@@ -1561,8 +1913,13 @@ async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl Responder 
     match events_result {
         Ok(events) => {
             for (symbol, ex_date, payment_date, amount) in events {
-                let Some(first) = first_purchase.get(&symbol) else { continue };
-                if ex_date < *first {
+                // Show an event only where the shares were actually held on
+                // the ex-date. Testing only "on or after the first purchase"
+                // guarded the wrong end: a dividend declared after the holding
+                // was sold still appeared, as a row that could never be
+                // recorded because there was no entitlement to record.
+                let Some(symbol_txs) = by_symbol.get(&symbol) else { continue };
+                if portfolio::shares_on_date(&to_portfolio_txs(symbol_txs), &ex_date) <= 0.0 {
                     continue;
                 }
                 if manual_dividend_keys.contains(&format!("{}|{}", symbol, ex_date)) {
@@ -1582,6 +1939,9 @@ async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl Responder 
                     "amount": amount,
                     "brokerage": serde_json::Value::Null,
                     "notes": serde_json::Value::Null,
+                    // Synthetic rows from dividend_events, not stored trades, so
+                    // they have no settlement account to carry.
+                    "cash_account_id": serde_json::Value::Null,
                     "per_share": true,
                     "payment_date": payment_date,
                     "custom_fields": serde_json::json!({}),
@@ -2056,7 +2416,10 @@ impl utoipa::Modify for SecurityAddon {
         add_holding_from_watchlist, update_holdings_symbol_fields,
         get_holdings_symbol_fields, get_transactions_ledger,
         get_cached_prices, get_current_prices, get_price_history,
-        get_symbol_info, get_fx_rate_for_date, get_fx_rates,
+        get_symbol_info, get_fx_rate_for_date, get_fx_rates, post_fx_sync,
+        get_cash_accounts, add_cash_account, update_cash_account, delete_cash_account,
+        get_cash_transactions, add_cash_transaction, update_cash_transaction,
+        delete_cash_transaction, add_cash_transfer, get_portfolio_history,
         get_dividends, refresh_dividends, refresh_sold_dividends, refresh_all,
         get_analysis_history, post_stock_analysis, delete_analysis_history,
         get_config, update_config, get_events,
@@ -2080,6 +2443,22 @@ async fn main() -> std::io::Result<()> {
         eprintln!("Failed to initialize database: {err}");
         std::io::Error::other(err)
     })?;
+
+    // Keep stored FX rate history current. Spawned rather than awaited so a
+    // slow or unreachable Yahoo cannot delay the server binding its port; a
+    // failure is logged to event_log and retried on the next start.
+    {
+        let db_path = db_path.clone();
+        tokio::spawn(async move {
+            let report = sync_fx_history(&db_path, 600).await;
+            if report.fetched > 0 || !report.errors.is_empty() {
+                log::info!(
+                    "FX sync: {} pair(s) updated, {} already current, {} bar(s) written, {} error(s)",
+                    report.fetched, report.skipped, report.bars_written, report.errors.len()
+                );
+            }
+        });
+    }
 
     let host = env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("API_PORT").ok().and_then(|value| value.parse::<u16>().ok()).unwrap_or(3001);
@@ -2160,6 +2539,18 @@ async fn main() -> std::io::Result<()> {
             .service(update_holding_transaction)
             .service(delete_holding_transaction)
             .service(get_price_history)
+            .service(post_fx_sync)
+            .service(get_cash_accounts)
+            .service(export_cash_account_csv)
+            .service(add_cash_account)
+            .service(update_cash_account)
+            .service(delete_cash_account)
+            .service(get_cash_transactions)
+            .service(add_cash_transaction)
+            .service(update_cash_transaction)
+            .service(delete_cash_transaction)
+            .service(add_cash_transfer)
+            .service(get_portfolio_history)
             .service(get_symbol_info)
             .service(get_fx_rate_for_date)
             .service(get_fx_rates)
@@ -2249,6 +2640,20 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             [],
         )
         .map_err(|err| err.to_string())?;
+
+    // Dividend events the user has deliberately declined to record. Without
+    // this, automatic recording resurrects them on the next refresh — deleting
+    // a dividend has to mean "not this one", not "record it again shortly".
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dividend_exclusions (
+            symbol TEXT NOT NULL,
+            ex_date TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (symbol, ex_date)
+        );",
+    )
+    .map_err(|err| err.to_string())?;
 
     // dividend_events table
     conn.execute_batch(
@@ -2341,12 +2746,76 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
+    // Cash accounts and their ledger.
+    //
+    // A balance is never stored — it is SUM(amount) up to a date, the same way
+    // positions are derived from holdings_transactions rather than cached. That
+    // keeps a back-dated entry correct instead of silently stale.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cash_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            currency TEXT NOT NULL,
+            -- Nominal annual rate, for display and projection only. Interest is
+            -- recorded as it is actually credited, not accrued from this.
+            interest_rate REAL,
+            -- Whether this account counts toward portfolio value and returns.
+            -- An everyday savings account can be tracked without treating its
+            -- balance as invested capital.
+            include_in_portfolio INTEGER NOT NULL DEFAULT 1,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cash_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+            date TEXT NOT NULL,
+            -- Signed, in the account's own currency: positive is money in.
+            amount REAL NOT NULL,
+            -- One of CASH_TX_KINDS; validated on write rather than by a CHECK
+            -- constraint, which could only be changed by rebuilding the table.
+            kind TEXT NOT NULL,
+            -- The trade this leg settles, when kind is trade_buy/trade_sell.
+            holding_tx_id INTEGER REFERENCES holdings_transactions(id),
+            -- Pairs the two legs of a currency conversion, which move value
+            -- between accounts without any money entering or leaving.
+            transfer_group_id TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_tx_account_date ON cash_transactions(account_id, date);
+        CREATE INDEX IF NOT EXISTS idx_cash_tx_date ON cash_transactions(date);
+        CREATE INDEX IF NOT EXISTS idx_cash_tx_holding ON cash_transactions(holding_tx_id);
+        CREATE INDEX IF NOT EXISTS idx_cash_tx_transfer ON cash_transactions(transfer_group_id);",
+    )
+    .map_err(|err| err.to_string())?;
+
     // Migrate: add columns if they don't exist
     add_column_if_missing(&conn, "holdings_transactions", "brokerage", "REAL")?;
+    // Which cash account a trade settles against — the source of funds on a
+    // buy, the destination on a sale.
+    add_column_if_missing(&conn, "holdings_transactions", "cash_account_id", "INTEGER")?;
+    // Tax withheld at source on this specific payment, in the trade's currency.
+    // Distinct from `symbol_info.dividend_withholding_pct`: that is a standing
+    // rate for a symbol (US funds withhold on every distribution), whereas this
+    // is a one-off amount, such as TFN withholding on the unfranked portion of
+    // a single distribution, which varies with each payment's franking and
+    // stops once a TFN is quoted.
+    add_column_if_missing(&conn, "holdings_transactions", "withholding_amount", "REAL")?;
     add_column_if_missing(&conn, "holdings_transactions", "currency", "TEXT NOT NULL DEFAULT 'AUD'")?;
     add_column_if_missing(&conn, "holdings_transactions", "original_price", "REAL")?;
     add_column_if_missing(&conn, "holdings_transactions", "fx_rate", "REAL")?;
     add_column_if_missing(&conn, "symbol_info", "currency", "TEXT")?;
+    // Non-resident withholding deducted before the cash reaches the account.
+    // US-domiciled funds (VEU.AX, VTS.AX) withhold 30% statutory / 15% by treaty,
+    // and Yahoo reports the gross distribution, so without this the ledger
+    // credits money that never arrived.
+    add_column_if_missing(&conn, "symbol_info", "dividend_withholding_pct", "REAL")?;
+    // Session OHLC for the cached live price, so today's candle is complete
+    // before the daily bar lands in `prices`.
+    add_column_if_missing(&conn, "cached_current_prices", "day_open", "REAL")?;
+    add_column_if_missing(&conn, "cached_current_prices", "day_high", "REAL")?;
+    add_column_if_missing(&conn, "cached_current_prices", "day_low", "REAL")?;
 
     // Migrate watchlist_symbols to the normalised two-table design:
     //   watchlist_symbols     — one row per symbol (holds notes)
@@ -2359,8 +2828,18 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             .collect()
     };
 
+    // The presence of watchlist_memberships means the normalised two-table
+    // design is already in place. Both legacy rebuilds below drop every column
+    // they don't explicitly copy — notes, breakthrough_price, stop_loss_price —
+    // so once we are normalised they must never run again. Step 1's guard is
+    // "list_name is absent", which is *also* true of the normalised table, so
+    // without this check every API restart silently wiped those three columns.
+    let has_memberships = conn
+        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='watchlist_memberships'", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0) > 0;
+
     // Step 1: old single-column table → multi-list table (legacy migration)
-    if !cols.contains(&"list_name".to_string()) {
+    if !has_memberships && !cols.contains(&"list_name".to_string()) {
         conn.execute_batch(
             "ALTER TABLE watchlist_symbols RENAME TO watchlist_symbols_old;
              CREATE TABLE watchlist_symbols (
@@ -2377,9 +2856,6 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
     }
 
     // Step 2: multi-list table → normalised two-table design
-    let has_memberships = conn
-        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='watchlist_memberships'", [], |row| row.get::<_, i64>(0))
-        .unwrap_or(0) > 0;
     if !has_memberships {
         // notes may or may not exist on the old multi-list table; add it if needed before copying
         let _ = conn.execute("ALTER TABLE watchlist_symbols ADD COLUMN notes TEXT", []);
@@ -2476,28 +2952,83 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         );
     }
 
+    // Drop every audit trigger before recreating it below. The CREATE
+    // statements are `IF NOT EXISTS`, so without this an edit to a trigger's
+    // column list would silently never reach a database where the trigger
+    // already exists — which is how breakthrough_price and stop_loss_price
+    // went unrecorded for months. Dropping first makes this code the single
+    // source of truth: triggers hold no state, so recreating them is free.
+    let drop_trigger_sql = "
+        DROP TRIGGER IF EXISTS audit_watchlist_symbols_insert;
+        DROP TRIGGER IF EXISTS audit_watchlist_symbols_update;
+        DROP TRIGGER IF EXISTS audit_watchlist_symbols_delete;
+        DROP TRIGGER IF EXISTS audit_watchlist_memberships_insert;
+        DROP TRIGGER IF EXISTS audit_watchlist_memberships_update;
+        DROP TRIGGER IF EXISTS audit_watchlist_memberships_delete;
+        DROP TRIGGER IF EXISTS audit_watchlist_symbol_fields_insert;
+        DROP TRIGGER IF EXISTS audit_watchlist_symbol_fields_update;
+        DROP TRIGGER IF EXISTS audit_watchlist_symbol_fields_delete;
+        DROP TRIGGER IF EXISTS audit_holdings_transactions_insert;
+        DROP TRIGGER IF EXISTS audit_holdings_transactions_update;
+        DROP TRIGGER IF EXISTS audit_holdings_transactions_delete;
+        DROP TRIGGER IF EXISTS audit_holdings_custom_fields_insert;
+        DROP TRIGGER IF EXISTS audit_holdings_custom_fields_update;
+        DROP TRIGGER IF EXISTS audit_holdings_custom_fields_delete;
+        DROP TRIGGER IF EXISTS audit_holdings_symbol_fields_insert;
+        DROP TRIGGER IF EXISTS audit_holdings_symbol_fields_update;
+        DROP TRIGGER IF EXISTS audit_holdings_symbol_fields_delete;
+        DROP TRIGGER IF EXISTS audit_app_config_insert;
+        DROP TRIGGER IF EXISTS audit_app_config_update;
+        DROP TRIGGER IF EXISTS audit_app_config_delete;
+        DROP TRIGGER IF EXISTS audit_dividend_exclusions_insert;
+        DROP TRIGGER IF EXISTS audit_dividend_exclusions_update;
+        DROP TRIGGER IF EXISTS audit_dividend_exclusions_delete;
+        DROP TRIGGER IF EXISTS audit_dividend_events_insert;
+        DROP TRIGGER IF EXISTS audit_dividend_events_update;
+        DROP TRIGGER IF EXISTS audit_dividend_events_delete;
+        DROP TRIGGER IF EXISTS audit_symbol_info_insert;
+        DROP TRIGGER IF EXISTS audit_symbol_info_update;
+        DROP TRIGGER IF EXISTS audit_symbol_info_delete;
+        DROP TRIGGER IF EXISTS audit_stock_analysis_messages_insert;
+        DROP TRIGGER IF EXISTS audit_stock_analysis_messages_update;
+        DROP TRIGGER IF EXISTS audit_stock_analysis_messages_delete;
+        DROP TRIGGER IF EXISTS audit_cash_accounts_insert;
+        DROP TRIGGER IF EXISTS audit_cash_accounts_update;
+        DROP TRIGGER IF EXISTS audit_cash_accounts_delete;
+        DROP TRIGGER IF EXISTS audit_cash_transactions_insert;
+        DROP TRIGGER IF EXISTS audit_cash_transactions_update;
+        DROP TRIGGER IF EXISTS audit_cash_transactions_delete;
+    ";
+    conn.execute_batch(drop_trigger_sql).map_err(|err| err.to_string())?;
+
     // Create triggers for all tracked tables.
-    // Each trigger captures old/new values as JSON.
+    // Each trigger captures old/new values as JSON. Every column of the table
+    // must appear here — see the Audit Logging rule in CLAUDE.md. The
+    // `audit_triggers_cover_every_column` test enforces this.
     let trigger_sql = "
         -- watchlist_symbols
         CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbols_insert AFTER INSERT ON watchlist_symbols
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbols', 'INSERT', NEW.symbol, NULL,
-                json_object('symbol', NEW.symbol, 'notes', NEW.notes, 'updated_at', NEW.updated_at));
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'notes', NEW.notes, 'updated_at', NEW.updated_at,
+                    'breakthrough_price', NEW.breakthrough_price, 'stop_loss_price', NEW.stop_loss_price));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbols_update AFTER UPDATE ON watchlist_symbols
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbols', 'UPDATE', NEW.symbol,
-                json_object('symbol', OLD.symbol, 'notes', OLD.notes, 'updated_at', OLD.updated_at),
-                json_object('symbol', NEW.symbol, 'notes', NEW.notes, 'updated_at', NEW.updated_at));
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'notes', OLD.notes, 'updated_at', OLD.updated_at,
+                    'breakthrough_price', OLD.breakthrough_price, 'stop_loss_price', OLD.stop_loss_price),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'notes', NEW.notes, 'updated_at', NEW.updated_at,
+                    'breakthrough_price', NEW.breakthrough_price, 'stop_loss_price', NEW.stop_loss_price));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_watchlist_symbols_delete AFTER DELETE ON watchlist_symbols
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'watchlist_symbols', 'DELETE', OLD.symbol,
-                json_object('symbol', OLD.symbol, 'notes', OLD.notes, 'updated_at', OLD.updated_at), NULL);
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'notes', OLD.notes, 'updated_at', OLD.updated_at,
+                    'breakthrough_price', OLD.breakthrough_price, 'stop_loss_price', OLD.stop_loss_price), NULL);
         END;
 
         -- watchlist_memberships
@@ -2549,7 +3080,7 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'INSERT', CAST(NEW.id AS TEXT), NULL,
                 json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
                     'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
-                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate));
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_update AFTER UPDATE ON holdings_transactions
         BEGIN
@@ -2557,10 +3088,10 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'UPDATE', CAST(NEW.id AS TEXT),
                 json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
                     'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
-                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate),
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount),
                 json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
                     'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
-                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate));
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_delete AFTER DELETE ON holdings_transactions
         BEGIN
@@ -2568,7 +3099,7 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'DELETE', CAST(OLD.id AS TEXT),
                 json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
                     'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
-                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate), NULL);
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount), NULL);
         END;
 
         -- holdings_custom_fields
@@ -2639,20 +3170,103 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'INSERT', CAST(NEW.id AS TEXT), NULL,
-                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount));
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount,
+                    'payment_date', NEW.payment_date, 'record_date', NEW.record_date, 'fetched_at', NEW.fetched_at));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_dividend_events_update AFTER UPDATE ON dividend_events
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'UPDATE', CAST(NEW.id AS TEXT),
-                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount),
-                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount));
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount,
+                    'payment_date', OLD.payment_date, 'record_date', OLD.record_date, 'fetched_at', OLD.fetched_at),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount,
+                    'payment_date', NEW.payment_date, 'record_date', NEW.record_date, 'fetched_at', NEW.fetched_at));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_dividend_events_delete AFTER DELETE ON dividend_events
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'DELETE', CAST(OLD.id AS TEXT),
-                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount), NULL);
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount,
+                    'payment_date', OLD.payment_date, 'record_date', OLD.record_date, 'fetched_at', OLD.fetched_at), NULL);
+        END;
+
+        -- cash_accounts
+        CREATE TRIGGER IF NOT EXISTS audit_cash_accounts_insert AFTER INSERT ON cash_accounts
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_accounts', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'name', NEW.name, 'currency', NEW.currency,
+                    'interest_rate', NEW.interest_rate, 'include_in_portfolio', NEW.include_in_portfolio,
+                    'notes', NEW.notes, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_cash_accounts_update AFTER UPDATE ON cash_accounts
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_accounts', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'name', OLD.name, 'currency', OLD.currency,
+                    'interest_rate', OLD.interest_rate, 'include_in_portfolio', OLD.include_in_portfolio,
+                    'notes', OLD.notes, 'created_at', OLD.created_at),
+                json_object('id', NEW.id, 'name', NEW.name, 'currency', NEW.currency,
+                    'interest_rate', NEW.interest_rate, 'include_in_portfolio', NEW.include_in_portfolio,
+                    'notes', NEW.notes, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_cash_accounts_delete AFTER DELETE ON cash_accounts
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_accounts', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'name', OLD.name, 'currency', OLD.currency,
+                    'interest_rate', OLD.interest_rate, 'include_in_portfolio', OLD.include_in_portfolio,
+                    'notes', OLD.notes, 'created_at', OLD.created_at), NULL);
+        END;
+
+        -- cash_transactions
+        CREATE TRIGGER IF NOT EXISTS audit_cash_transactions_insert AFTER INSERT ON cash_transactions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_transactions', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'account_id', NEW.account_id, 'date', NEW.date,
+                    'amount', NEW.amount, 'kind', NEW.kind, 'holding_tx_id', NEW.holding_tx_id,
+                    'transfer_group_id', NEW.transfer_group_id, 'notes', NEW.notes, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_cash_transactions_update AFTER UPDATE ON cash_transactions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_transactions', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'account_id', OLD.account_id, 'date', OLD.date,
+                    'amount', OLD.amount, 'kind', OLD.kind, 'holding_tx_id', OLD.holding_tx_id,
+                    'transfer_group_id', OLD.transfer_group_id, 'notes', OLD.notes, 'created_at', OLD.created_at),
+                json_object('id', NEW.id, 'account_id', NEW.account_id, 'date', NEW.date,
+                    'amount', NEW.amount, 'kind', NEW.kind, 'holding_tx_id', NEW.holding_tx_id,
+                    'transfer_group_id', NEW.transfer_group_id, 'notes', NEW.notes, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_cash_transactions_delete AFTER DELETE ON cash_transactions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_transactions', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'account_id', OLD.account_id, 'date', OLD.date,
+                    'amount', OLD.amount, 'kind', OLD.kind, 'holding_tx_id', OLD.holding_tx_id,
+                    'transfer_group_id', OLD.transfer_group_id, 'notes', OLD.notes, 'created_at', OLD.created_at), NULL);
+        END;
+
+        -- dividend_exclusions
+        CREATE TRIGGER IF NOT EXISTS audit_dividend_exclusions_insert AFTER INSERT ON dividend_exclusions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_exclusions', 'INSERT', NEW.symbol || ':' || NEW.ex_date, NULL,
+                json_object('symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'reason', NEW.reason, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_dividend_exclusions_update AFTER UPDATE ON dividend_exclusions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_exclusions', 'UPDATE', NEW.symbol || ':' || NEW.ex_date,
+                json_object('symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'reason', OLD.reason, 'created_at', OLD.created_at),
+                json_object('symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'reason', NEW.reason, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_dividend_exclusions_delete AFTER DELETE ON dividend_exclusions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_exclusions', 'DELETE', OLD.symbol || ':' || OLD.ex_date,
+                json_object('symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'reason', OLD.reason, 'created_at', OLD.created_at), NULL);
         END;
 
         -- symbol_info
@@ -2660,20 +3274,24 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'INSERT', NEW.symbol, NULL,
-                json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name, 'currency', NEW.currency));
+                json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name,
+                    'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'updated_at', NEW.updated_at));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_symbol_info_update AFTER UPDATE ON symbol_info
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'UPDATE', NEW.symbol,
-                json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name, 'currency', OLD.currency),
-                json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name, 'currency', NEW.currency));
+                json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name,
+                    'currency', OLD.currency, 'dividend_withholding_pct', OLD.dividend_withholding_pct, 'updated_at', OLD.updated_at),
+                json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name,
+                    'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'updated_at', NEW.updated_at));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_symbol_info_delete AFTER DELETE ON symbol_info
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'DELETE', OLD.symbol,
-                json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name, 'currency', OLD.currency), NULL);
+                json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name,
+                    'currency', OLD.currency, 'dividend_withholding_pct', OLD.dividend_withholding_pct, 'updated_at', OLD.updated_at), NULL);
         END;
     ";
     conn.execute_batch(trigger_sql).map_err(|err| err.to_string())?;
@@ -2688,6 +3306,36 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_analysis_messages_symbol ON stock_analysis_messages(symbol, created_at);",
+    ).map_err(|err| err.to_string())?;
+
+    // Audit triggers for stock_analysis_messages. These live here rather than
+    // in the main trigger batch because the table is created after it, and a
+    // trigger cannot be created before its table exists. The corresponding
+    // DROPs are in drop_trigger_sql above.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS audit_stock_analysis_messages_insert AFTER INSERT ON stock_analysis_messages
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'stock_analysis_messages', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'role', NEW.role, 'content', NEW.content,
+                    'model_used', NEW.model_used, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_stock_analysis_messages_update AFTER UPDATE ON stock_analysis_messages
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'stock_analysis_messages', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'role', OLD.role, 'content', OLD.content,
+                    'model_used', OLD.model_used, 'created_at', OLD.created_at),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'role', NEW.role, 'content', NEW.content,
+                    'model_used', NEW.model_used, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_stock_analysis_messages_delete AFTER DELETE ON stock_analysis_messages
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'stock_analysis_messages', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'role', OLD.role, 'content', OLD.content,
+                    'model_used', OLD.model_used, 'created_at', OLD.created_at), NULL);
+        END;",
     ).map_err(|err| err.to_string())?;
 
     Ok(())
@@ -2924,7 +3572,7 @@ fn fetch_holdings(db_path: &PathBuf) -> Result<Vec<HoldingTransaction>, String> 
     let conn = open_db(db_path).map_err(|err| err.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
+            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id
              FROM holdings_transactions
              ORDER BY date DESC, id DESC",
         )
@@ -2947,6 +3595,7 @@ fn fetch_holdings(db_path: &PathBuf) -> Result<Vec<HoldingTransaction>, String> 
                 currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
                 original_price: row.get(11)?,
                 fx_rate: row.get(12)?,
+                cash_account_id: row.get(13)?,
                 custom_fields: std::collections::HashMap::new(),
             })
         })
@@ -3115,8 +3764,8 @@ fn insert_holding_transaction(
     let created_at = Utc::now().to_rfc3339();
     let currency = transaction.currency.as_deref().unwrap_or("AUD");
     conn.execute(
-        "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             symbol,
             tx_type,
@@ -3130,11 +3779,14 @@ fn insert_holding_transaction(
             currency,
             transaction.original_price,
             transaction.fx_rate,
+            transaction.cash_account_id,
+            transaction.withholding_amount,
         ],
     )
     .map_err(|err| err.to_string())?;
 
     let id = conn.last_insert_rowid();
+    sync_trade_cash_leg(&conn, id)?;
 
     // Save custom fields (per-transaction and per-symbol)
     if let Some(ref fields) = transaction.custom_fields {
@@ -3158,7 +3810,7 @@ fn insert_holding_transaction(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
+            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id
              FROM holdings_transactions
              WHERE id = ?1",
         )
@@ -3181,6 +3833,7 @@ fn insert_holding_transaction(
                 currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
                 original_price: row.get(11)?,
                 fx_rate: row.get(12)?,
+                cash_account_id: row.get(13)?,
                 custom_fields: std::collections::HashMap::new(),
             })
         })
@@ -3224,7 +3877,7 @@ fn modify_holding_transaction(
     let conn = open_db(db_path).map_err(|err| err.to_string())?;
     let currency = transaction.currency.as_deref().unwrap_or("AUD");
     conn.execute(
-        "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11 WHERE id = ?12",
+        "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11, cash_account_id = ?13, withholding_amount = COALESCE(?14, withholding_amount) WHERE id = ?12",
         params![
             symbol,
             tx_type,
@@ -3238,9 +3891,16 @@ fn modify_holding_transaction(
             transaction.original_price,
             transaction.fx_rate,
             id,
+            transaction.cash_account_id,
+            transaction.withholding_amount,
         ],
     )
     .map_err(|err| err.to_string())?;
+
+    // Rewrite the settlement leg from the row as just stored: an edited price,
+    // quantity or account has to flow through, and clearing the account removes
+    // the leg entirely.
+    sync_trade_cash_leg(&conn, id)?;
 
     // Update custom fields: delete all then re-insert (per-transaction and per-symbol)
     conn.execute("DELETE FROM holdings_custom_fields WHERE transaction_id = ?1", params![id])
@@ -3261,7 +3921,7 @@ fn modify_holding_transaction(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate
+            "SELECT id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id
              FROM holdings_transactions
              WHERE id = ?1",
         )
@@ -3284,6 +3944,7 @@ fn modify_holding_transaction(
                 currency: row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "AUD".to_string()),
                 original_price: row.get(11)?,
                 fx_rate: row.get(12)?,
+                cash_account_id: row.get(13)?,
                 custom_fields: std::collections::HashMap::new(),
             })
         })
@@ -3299,21 +3960,1351 @@ fn modify_holding_transaction(
 
 fn remove_holding_transaction(db_path: &PathBuf, id: i64) -> Result<bool, String> {
     let conn = open_db(db_path).map_err(|err| err.to_string())?;
+    // Captured before the delete so the exclusion below knows what went.
+    let doomed: Option<(String, String)> = conn
+        .query_row(
+            "SELECT symbol, date FROM holdings_transactions WHERE id = ?1 AND transaction_type = 'dividend'",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
     conn.execute("DELETE FROM holdings_custom_fields WHERE transaction_id = ?1", params![id])
+        .map_err(|err| err.to_string())?;
+    // The settlement leg belongs to the trade; leaving it would strand cash
+    // movements against a trade that no longer exists.
+    conn.execute("DELETE FROM cash_transactions WHERE holding_tx_id = ?1", params![id])
         .map_err(|err| err.to_string())?;
     let affected = conn
         .execute("DELETE FROM holdings_transactions WHERE id = ?1", params![id])
         .map_err(|err| err.to_string())?;
+
+    // Deleting a dividend that came from a fetched event has to mean "not this
+    // one". Without recording that, the next refresh would helpfully record it
+    // again, and the deletion would look like it silently failed.
+    if let Some((symbol, date)) = doomed {
+        let is_event: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dividend_events WHERE symbol = ?1 AND ex_date = ?2",
+                params![symbol, date],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if is_event > 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO dividend_exclusions (symbol, ex_date, reason, created_at)
+                 VALUES (?1, ?2, 'deleted by user', ?3)",
+                params![symbol, date, Utc::now().to_rfc3339()],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+    }
     Ok(affected > 0)
 }
 
-fn cache_current_price(conn: &Connection, price: &CurrentPrice) -> Result<(), String> {
+// ---------------------------------------------------------------------------
+// Portfolio value over time
+// ---------------------------------------------------------------------------
+
+/// A symbol's or currency's closes, oldest first, with a cursor for the sweep.
+struct SeriesCursor {
+    points: Vec<(String, f64)>,
+    index: usize,
+    current: Option<f64>,
+}
+
+impl SeriesCursor {
+    fn new(points: Vec<(String, f64)>) -> Self {
+        Self { points, index: 0, current: None }
+    }
+
+    /// Advance to `date`, returning the latest close at or before it. Values
+    /// carry forward, so weekends, holidays and missing bars hold the last
+    /// traded price rather than dropping the holding out of the valuation.
+    fn value_on(&mut self, date: &str) -> Option<f64> {
+        while self.index < self.points.len() && self.points[self.index].0.as_str() <= date {
+            self.current = Some(self.points[self.index].1);
+            self.index += 1;
+        }
+        self.current
+    }
+
+    /// True once `date` is past the last stored bar — where a delisted or
+    /// suspended holding stops having real prices and a manual valuation, if
+    /// one is set, takes over.
+    fn is_past_end(&self, date: &str) -> bool {
+        match self.points.last() {
+            Some((last, _)) => date > last.as_str(),
+            None => true,
+        }
+    }
+}
+
+/// Manually entered prices, keyed by symbol, from `app_config`.
+///
+/// Set for holdings the market no longer prices — a delisted ticker keeps its
+/// last real close forever otherwise, which would quietly misstate the
+/// portfolio's value from the day it stopped trading.
+fn manual_prices(conn: &Connection) -> HashMap<String, f64> {
+    let mut stmt = match conn.prepare("SELECT key, value FROM app_config WHERE key LIKE 'manual_price_%'") {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map(|rows| {
+            rows.flatten()
+                .filter_map(|(key, value)| {
+                    let symbol = key.strip_prefix("manual_price_")?.to_string();
+                    let price = value.trim().parse::<f64>().ok().filter(|p| *p > 0.0)?;
+                    Some((symbol, price))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The most recent stored bar for each symbol, as `(close, date)`.
+///
+/// Used when the live feed has nothing to say — a delisted symbol keeps its
+/// last traded price rather than falling out of the portfolio entirely.
+fn latest_closes(db_path: &PathBuf, symbols: &[String]) -> HashMap<String, (f64, String)> {
+    let mut out = HashMap::new();
+    let Ok(conn) = open_db(db_path) else { return out };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT close, date FROM prices
+          WHERE symbol = ?1 AND close IS NOT NULL AND close > 0
+          ORDER BY date DESC LIMIT 1",
+    ) else {
+        return out;
+    };
+    for symbol in symbols {
+        if let Ok(row) = stmt.query_row(params![symbol], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?))) {
+            out.insert(symbol.clone(), row);
+        }
+    }
+    out
+}
+
+fn load_close_series(conn: &Connection, symbol: &str) -> Vec<(String, f64)> {
+    let mut stmt = match conn
+        .prepare("SELECT date, close FROM prices WHERE symbol = ?1 AND close IS NOT NULL ORDER BY date")
+    {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![symbol], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+struct HistoryPoint {
+    date: String,
+    stocks: f64,
+    cash: f64,
+    total: f64,
+    flow: f64,
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// Daily portfolio value in AUD, with the external flows needed to measure
+/// return.
+///
+/// A trade that names no cash account is treated as externally funded: the
+/// shares appear with no matching cash movement, so without this the purchase
+/// would look like value materialising from nowhere and inflate the return.
+/// Every transaction recorded before the cash ledger existed is in that state,
+/// which is what makes the full history usable rather than only the part after
+/// the ledger starts.
+///
+/// The first element is an **anchor**: the day before the requested window,
+/// carrying the value the window opens with. Without it the first day inside
+/// the window would have nothing to be compared against, so its movement would
+/// drop out of the return, and its own contributions would be double counted —
+/// once in the opening value and again in the contribution total.
+fn build_portfolio_history(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Vec<portfolio::DailyValue>, String> {
+    #[derive(Clone)]
+    struct Trade {
+        date: String,
+        symbol: String,
+        tx_type: String,
+        quantity: f64,
+        price_aud: f64,
+        brokerage_aud: f64,
+        has_cash_leg: bool,
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT date, symbol, transaction_type, COALESCE(quantity, 0), COALESCE(price, 0),
+                    COALESCE(brokerage, 0), cash_account_id
+               FROM holdings_transactions ORDER BY date, id",
+        )
+        .map_err(|e| e.to_string())?;
+    let trades: Vec<Trade> = stmt
+        .query_map([], |row| {
+            Ok(Trade {
+                date: row.get(0)?,
+                symbol: row.get(1)?,
+                tx_type: row.get(2)?,
+                quantity: row.get(3)?,
+                price_aud: row.get(4)?,
+                brokerage_aud: row.get(5)?,
+                has_cash_leg: row.get::<_, Option<i64>>(6)?.is_some(),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Only accounts counted toward the portfolio; an everyday savings account
+    // can be tracked without being treated as invested capital.
+    let mut account_stmt = conn
+        .prepare("SELECT id, currency FROM cash_accounts WHERE include_in_portfolio = 1")
+        .map_err(|e| e.to_string())?;
+    let accounts: HashMap<i64, String> = account_stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut cash_stmt = conn
+        .prepare("SELECT date, account_id, amount, kind FROM cash_transactions ORDER BY date, id")
+        .map_err(|e| e.to_string())?;
+    let cash_txs: Vec<(String, i64, f64, String)> = cash_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .filter(|(_, account_id, _, _)| accounts.contains_key(account_id))
+        .collect();
+
+    if trades.is_empty() && cash_txs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let earliest = trades
+        .iter()
+        .map(|t| t.date.clone())
+        .chain(cash_txs.iter().map(|c| c.0.clone()))
+        .min()
+        .unwrap_or_default();
+    let start = from.map(str::to_string).unwrap_or(earliest);
+    let end = to.map(str::to_string).unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    let (Ok(start_date), Ok(end_date)) = (
+        NaiveDate::parse_from_str(&start, "%Y-%m-%d"),
+        NaiveDate::parse_from_str(&end, "%Y-%m-%d"),
+    ) else {
+        return Err("Invalid date range. Use YYYY-MM-DD.".to_string());
+    };
+    if end_date < start_date {
+        return Err("`to` must not be before `from`".to_string());
+    }
+
+    // Price and rate cursors, one per symbol and per currency.
+    let symbols: Vec<String> = {
+        let mut seen: Vec<String> = trades.iter().map(|t| t.symbol.clone()).collect();
+        seen.sort();
+        seen.dedup();
+        seen
+    };
+    let symbol_currency: HashMap<String, String> = {
+        let mut stmt = conn
+            .prepare("SELECT symbol, COALESCE(currency, 'AUD') FROM symbol_info")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    let manual = manual_prices(conn);
+    let mut prices: HashMap<String, SeriesCursor> = symbols
+        .iter()
+        .map(|s| (s.clone(), SeriesCursor::new(load_close_series(conn, s))))
+        .collect();
+
+    let mut currencies: Vec<String> = symbol_currency.values().cloned().collect();
+    currencies.extend(accounts.values().cloned());
+    currencies.sort();
+    currencies.dedup();
+    let mut rates: HashMap<String, SeriesCursor> = currencies
+        .iter()
+        .filter(|c| c.as_str() != "AUD")
+        .map(|c| (c.clone(), SeriesCursor::new(load_close_series(conn, &fx_pair_symbol(c)))))
+        .collect();
+
+    let mut shares: HashMap<String, f64> = HashMap::new();
+    let mut balances: HashMap<i64, f64> = HashMap::new();
+    let mut trade_index = 0usize;
+    let mut cash_index = 0usize;
+    let mut series = Vec::new();
+
+    // Start a day early to produce the anchor described above.
+    let mut date = start_date.pred_opt().unwrap_or(start_date);
+    while date <= end_date {
+        let day = date.format("%Y-%m-%d").to_string();
+        let mut flow = 0.0;
+
+        // Apply everything dated on or before today that has not been applied
+        // yet, so transactions before `from` are folded into the opening state.
+        while trade_index < trades.len() && trades[trade_index].date <= day {
+            let trade = &trades[trade_index];
+            let signed = match trade.tx_type.as_str() {
+                "purchase" => trade.quantity,
+                "sale" => -trade.quantity,
+                _ => 0.0,
+            };
+            *shares.entry(trade.symbol.clone()).or_insert(0.0) += signed;
+
+            // Externally funded trades count as money in or out on their day.
+            if !trade.has_cash_leg && trade.date == day {
+                match trade.tx_type.as_str() {
+                    "purchase" => flow += trade.quantity * trade.price_aud + trade.brokerage_aud,
+                    "sale" => flow -= trade.quantity * trade.price_aud - trade.brokerage_aud,
+                    _ => {}
+                }
+            }
+            trade_index += 1;
+        }
+
+        while cash_index < cash_txs.len() && cash_txs[cash_index].0 <= day {
+            let (tx_date, account_id, amount, kind) = &cash_txs[cash_index];
+            *balances.entry(*account_id).or_insert(0.0) += amount;
+            if tx_date == &day && matches!(kind.as_str(), "deposit" | "withdrawal" | "opening_balance") {
+                let currency = accounts.get(account_id).cloned().unwrap_or_else(|| "AUD".to_string());
+                let rate = if currency == "AUD" {
+                    Some(1.0)
+                } else {
+                    rates.get_mut(&currency).and_then(|c| c.value_on(&day))
+                };
+                flow += amount * rate.unwrap_or(0.0);
+            }
+            cash_index += 1;
+        }
+
+        let mut stocks = 0.0;
+        for (symbol, held) in &shares {
+            if *held <= 0.0 {
+                continue;
+            }
+            // Past the last real bar, a manual valuation wins over a stale close.
+            let close = match prices.get_mut(symbol) {
+                Some(cursor) => {
+                    let stored = cursor.value_on(&day);
+                    if cursor.is_past_end(&day) {
+                        manual.get(symbol).copied().or(stored)
+                    } else {
+                        stored
+                    }
+                }
+                None => manual.get(symbol).copied(),
+            };
+            let Some(close) = close else { continue };
+            let currency = symbol_currency.get(symbol).cloned().unwrap_or_else(|| "AUD".to_string());
+            let rate = if currency == "AUD" {
+                Some(1.0)
+            } else {
+                rates.get_mut(&currency).and_then(|c| c.value_on(&day))
+            };
+            let Some(rate) = rate else { continue };
+            stocks += held * close * rate;
+        }
+
+        let mut cash = 0.0;
+        for (account_id, balance) in &balances {
+            let currency = accounts.get(account_id).cloned().unwrap_or_else(|| "AUD".to_string());
+            let rate = if currency == "AUD" {
+                Some(1.0)
+            } else {
+                rates.get_mut(&currency).and_then(|c| c.value_on(&day))
+            };
+            let Some(rate) = rate else { continue };
+            cash += balance * rate;
+        }
+
+        series.push(portfolio::DailyValue { date: day, stocks, cash, flow });
+        date = match date.succ_opt() {
+            Some(d) => d,
+            None => break,
+        };
+    }
+
+    Ok(series)
+}
+
+#[utoipa::path(get, path = "/api/v1/portfolio/history", tag = "portfolio", responses((status = 200, description = "Daily portfolio value and time-weighted return")))]
+#[get("/api/portfolio/history")]
+async fn get_portfolio_history(db_path: web::Data<PathBuf>, query: web::Query<HistoryQuery>) -> impl Responder {
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let series = match build_portfolio_history(&conn, query.from.as_deref(), query.to.as_deref()) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "portfolio_history", "api", None, &err);
+            return err_bad_request(err);
+        }
+    };
+
+    // Element 0 is the anchor: the value carried into the window, which is not
+    // part of it. Returns chain across the whole vector so the first real day
+    // still counts; contributions and the reported range cover the window only.
+    let twr = portfolio::time_weighted_return(&series);
+    let opening_value = series.first().map(|p| p.total()).unwrap_or(0.0);
+    let window = if series.is_empty() { &series[..] } else { &series[1..] };
+    let contributions = portfolio::net_contributions(window);
+    let end_value = window.last().map(|p| p.total()).unwrap_or(opening_value);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "series": window.iter().map(|p| HistoryPoint {
+            date: p.date.clone(),
+            stocks: p.stocks,
+            cash: p.cash,
+            total: p.total(),
+            flow: p.flow,
+        }).collect::<Vec<_>>(),
+        "summary": {
+            "start_date": window.first().map(|p| p.date.clone()),
+            "end_date": window.last().map(|p| p.date.clone()),
+            "opening_value": opening_value,
+            "end_value": end_value,
+            "net_contributions": contributions,
+            // What the portfolio earned: the change in value that contributions
+            // do not account for. opening + contributions + gain = end.
+            "gain": end_value - opening_value - contributions,
+            "twr_pct": twr.map(|r| r * 100.0),
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Cash ledger
+// ---------------------------------------------------------------------------
+
+fn is_valid_cash_tx_kind(kind: &str) -> bool {
+    CASH_TX_KINDS.contains(&kind)
+}
+
+/// Kinds that only ever originate from a transaction, so the manual endpoints
+/// refuse to create them directly.
+///
+/// Note this is about *entry*, not ownership: `dividend` is absent because a
+/// hand-entered dividend is legitimate (an account can be credited without the
+/// app having fetched the event). Ownership is decided by `holding_tx_id`
+/// instead — see `is_transaction_owned`.
+fn is_trade_owned_kind(kind: &str) -> bool {
+    kind == "trade_buy" || kind == "trade_sell"
+}
+
+/// Whether a cash row was written by `sync_trade_cash_leg` on behalf of a
+/// transaction. Such a row is regenerated whenever that transaction is saved,
+/// so editing it by hand is silently undone — the manual endpoints refuse
+/// instead. Keyed on the link rather than the kind, because a dividend leg and
+/// a hand-entered dividend share a kind but not an owner.
+fn is_transaction_owned(holding_tx_id: Option<i64>) -> bool {
+    holding_tx_id.is_some()
+}
+
+fn cash_account_currency(conn: &Connection, account_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT currency FROM cash_accounts WHERE id = ?1",
+        params![account_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Balance of an account in its own currency, optionally as at a date.
+/// Derived from the ledger every time — never stored — so a back-dated entry
+/// is reflected immediately.
+fn cash_balance(conn: &Connection, account_id: i64, as_of: Option<&str>) -> f64 {
+    let (sql, bind_date) = match as_of {
+        Some(_) => (
+            "SELECT COALESCE(SUM(amount), 0) FROM cash_transactions WHERE account_id = ?1 AND date <= ?2",
+            true,
+        ),
+        None => ("SELECT COALESCE(SUM(amount), 0) FROM cash_transactions WHERE account_id = ?1", false),
+    };
+    let result = if bind_date {
+        conn.query_row(sql, params![account_id, as_of.unwrap()], |row| row.get::<_, f64>(0))
+    } else {
+        conn.query_row(sql, params![account_id], |row| row.get::<_, f64>(0))
+    };
+    result.unwrap_or(0.0)
+}
+
+#[derive(Deserialize)]
+struct CashAccountPayload {
+    name: String,
+    currency: String,
+    interest_rate: Option<f64>,
+    include_in_portfolio: Option<bool>,
+    notes: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CashAccountRow {
+    id: i64,
+    name: String,
+    currency: String,
+    interest_rate: Option<f64>,
+    include_in_portfolio: bool,
+    notes: Option<String>,
+    created_at: String,
+    /// Balance in the account's own currency.
+    balance: f64,
+    /// The same balance in AUD at today's stored rate, or null when no rate is
+    /// available yet for that currency.
+    balance_aud: Option<f64>,
+    transaction_count: i64,
+}
+
+fn load_cash_accounts(conn: &Connection) -> Result<Vec<CashAccountRow>, String> {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, currency, interest_rate, include_in_portfolio, notes, created_at
+               FROM cash_accounts ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(i64, String, String, Option<f64>, i64, Option<String>, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, currency, interest_rate, include, notes, created_at)| {
+            let balance = cash_balance(conn, id, None);
+            let balance_aud = fx_rate_on(conn, &currency, &today).map(|rate| balance * rate);
+            let transaction_count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cash_transactions WHERE account_id = ?1",
+                    params![id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            CashAccountRow {
+                id,
+                name,
+                currency,
+                interest_rate,
+                include_in_portfolio: include != 0,
+                notes,
+                created_at,
+                balance,
+                balance_aud,
+                transaction_count,
+            }
+        })
+        .collect())
+}
+
+#[utoipa::path(get, path = "/api/v1/cash/accounts", tag = "cash", responses((status = 200, description = "List cash accounts with balances")))]
+#[get("/api/cash/accounts")]
+async fn get_cash_accounts(db_path: web::Data<PathBuf>) -> impl Responder {
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    match load_cash_accounts(&conn) {
+        Ok(rows) => HttpResponse::Ok().json(rows),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "cash_accounts_fetch", "api", None, &err);
+            err_internal(err)
+        }
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/cash/accounts", tag = "cash", responses((status = 200, description = "Create a cash account")))]
+#[post("/api/cash/accounts")]
+async fn add_cash_account(db_path: web::Data<PathBuf>, payload: web::Json<CashAccountPayload>) -> impl Responder {
+    let payload = payload.into_inner();
+    let name = payload.name.trim().to_string();
+    let currency = payload.currency.trim().to_uppercase();
+    if name.is_empty() {
+        return err_bad_request("Account name is required");
+    }
+    if currency.len() != 3 {
+        return err_bad_request("Currency must be a 3-letter code, e.g. AUD");
+    }
+
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let result = conn.execute(
+        "INSERT INTO cash_accounts (name, currency, interest_rate, include_in_portfolio, notes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            name,
+            currency,
+            payload.interest_rate,
+            if payload.include_in_portfolio.unwrap_or(true) { 1 } else { 0 },
+            payload.notes,
+            Utc::now().to_rfc3339(),
+        ],
+    );
+    match result {
+        Ok(_) => {
+            let id = conn.last_insert_rowid();
+            let _ = insert_event_log(&db_path, "info", "cash_account_create", "api", None, &format!("Created cash account {} ({})", name, currency));
+            HttpResponse::Ok().json(serde_json::json!({ "id": id }))
+        }
+        Err(err) => {
+            let message = format!("Failed to create cash account: {}", err);
+            let _ = insert_event_log(&db_path, "error", "cash_account_create", "api", None, &message);
+            err_bad_request(message)
+        }
+    }
+}
+
+#[utoipa::path(put, path = "/api/v1/cash/accounts/{id}", tag = "cash", params(("id" = i64, Path, description = "id")), responses((status = 200, description = "Update a cash account")))]
+#[put("/api/cash/accounts/{id}")]
+async fn update_cash_account(
+    db_path: web::Data<PathBuf>,
+    path: web::Path<i64>,
+    payload: web::Json<CashAccountPayload>,
+) -> impl Responder {
+    let id = path.into_inner();
+    let payload = payload.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    // Changing currency would silently reinterpret every existing amount.
+    let existing = cash_account_currency(&conn, id);
+    let Some(existing_currency) = existing else {
+        return err_not_found(format!("Cash account {} not found", id));
+    };
+    let currency = payload.currency.trim().to_uppercase();
+    if currency != existing_currency
+        && cash_balance(&conn, id, None) != 0.0
+    {
+        return err_bad_request(format!(
+            "Cannot change currency from {} to {} while the account has a non-zero balance",
+            existing_currency, currency
+        ));
+    }
+
+    let result = conn.execute(
+        "UPDATE cash_accounts SET name = ?2, currency = ?3, interest_rate = ?4,
+                include_in_portfolio = ?5, notes = ?6
+          WHERE id = ?1",
+        params![
+            id,
+            payload.name.trim(),
+            currency,
+            payload.interest_rate,
+            if payload.include_in_portfolio.unwrap_or(true) { 1 } else { 0 },
+            payload.notes,
+        ],
+    );
+    match result {
+        Ok(0) => err_not_found(format!("Cash account {} not found", id)),
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "id": id })),
+        Err(err) => {
+            let message = format!("Failed to update cash account {}: {}", id, err);
+            let _ = insert_event_log(&db_path, "error", "cash_account_update", "api", None, &message);
+            err_bad_request(message)
+        }
+    }
+}
+
+#[utoipa::path(delete, path = "/api/v1/cash/accounts/{id}", tag = "cash", params(("id" = i64, Path, description = "id")), responses((status = 204, description = "Delete a cash account")))]
+#[delete("/api/cash/accounts/{id}")]
+async fn delete_cash_account(db_path: web::Data<PathBuf>, path: web::Path<i64>) -> impl Responder {
+    let id = path.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    // Deleting an account with history would orphan its ledger, and SQLite's
+    // foreign keys are not enforced here, so the check has to be explicit.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cash_transactions WHERE account_id = ?1", params![id], |r| r.get(0))
+        .unwrap_or(0);
+    if count > 0 {
+        return err_bad_request(format!(
+            "Cash account {} still has {} transaction(s); delete or reassign them first",
+            id, count
+        ));
+    }
+
+    match conn.execute("DELETE FROM cash_accounts WHERE id = ?1", params![id]) {
+        Ok(0) => err_not_found(format!("Cash account {} not found", id)),
+        Ok(_) => {
+            let _ = insert_event_log(&db_path, "info", "cash_account_delete", "api", None, &format!("Deleted cash account {}", id));
+            HttpResponse::NoContent().finish()
+        }
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CashTxPayload {
+    account_id: i64,
+    date: String,
+    amount: f64,
+    kind: String,
+    notes: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CashTxRow {
+    id: i64,
+    account_id: i64,
+    account_name: String,
+    currency: String,
+    date: String,
+    amount: f64,
+    kind: String,
+    holding_tx_id: Option<i64>,
+    transfer_group_id: Option<String>,
+    notes: Option<String>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct CashTxQuery {
+    account_id: Option<i64>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// Quote a CSV field only when it needs it, doubling any embedded quotes.
+///
+/// Notes are free text and routinely contain commas — an unquoted
+/// "purchase SPCX — USD 810.00 at 1.4189" would split into two columns and
+/// shift every field after it.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// One cash account's ledger as a CSV download, with a running balance.
+///
+/// Served as a file rather than JSON the browser assembles: the balance is a
+/// running total that only means anything in a fixed order, so the order and
+/// the arithmetic are settled here rather than depending on however the client
+/// happens to sort.
+#[utoipa::path(get, path = "/api/v1/cash/accounts/{id}/transactions.csv", tag = "cash",
+    params(("id" = i64, Path, description = "id")),
+    responses((status = 200, description = "Cash account ledger as CSV")))]
+#[get("/api/cash/accounts/{id}/transactions.csv")]
+async fn export_cash_account_csv(db_path: web::Data<PathBuf>, path: web::Path<i64>) -> impl Responder {
+    let account_id = path.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    let account: Option<(String, String)> = conn
+        .query_row(
+            "SELECT name, currency FROM cash_accounts WHERE id = ?1",
+            params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((name, currency)) = account else {
+        return err_not_found(format!("Cash account {} not found", account_id));
+    };
+
+    let rows = (|| -> Result<Vec<(String, String, String, f64)>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.date, c.kind, c.amount, c.notes, c.transfer_group_id,
+                        h.symbol, h.transaction_type
+                   FROM cash_transactions c
+                   LEFT JOIN holdings_transactions h ON h.id = c.holding_tx_id
+                  WHERE c.account_id = ?1
+                  ORDER BY c.date, c.id",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map(params![account_id], |r| {
+                let date: String = r.get(0)?;
+                let kind: String = r.get(1)?;
+                let amount: f64 = r.get(2)?;
+                let notes: Option<String> = r.get(3)?;
+                let group: Option<String> = r.get(4)?;
+                let symbol: Option<String> = r.get(5)?;
+                let tx_type: Option<String> = r.get(6)?;
+                // A leg written before notes were generated has none; say what
+                // it is rather than leaving the column blank.
+                let description = match (notes, group, symbol, tx_type) {
+                    (Some(n), _, _, _) if !n.trim().is_empty() => n,
+                    (_, Some(_), _, _) => "Transfer between accounts".to_string(),
+                    (_, _, Some(sym), Some(t)) => format!("{} {}", t, sym),
+                    _ => String::new(),
+                };
+                Ok((date, kind, description, amount))
+            })
+            .map_err(|e| e.to_string())?;
+        mapped.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    })();
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "cash_export", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+
+    let mut csv = format!(
+        "Date,Transaction,Description,Amount ({0}),Balance ({0})\n",
+        currency
+    );
+    let mut balance = 0.0_f64;
+    for (date, kind, description, amount) in &rows {
+        balance += amount;
+        csv.push_str(&format!(
+            "{},{},{},{:.2},{:.2}\n",
+            csv_field(date),
+            csv_field(kind),
+            csv_field(description),
+            amount,
+            balance
+        ));
+    }
+
+    // A filename the user can tell apart from the other accounts' exports.
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    HttpResponse::Ok()
+        .content_type("text/csv; charset=utf-8")
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"cash-{}.csv\"", slug),
+        ))
+        .body(csv)
+}
+
+#[utoipa::path(get, path = "/api/v1/cash/transactions", tag = "cash", responses((status = 200, description = "List cash transactions")))]
+#[get("/api/cash/transactions")]
+async fn get_cash_transactions(db_path: web::Data<PathBuf>, query: web::Query<CashTxQuery>) -> impl Responder {
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT t.id, t.account_id, a.name, a.currency, t.date, t.amount, t.kind,
+                t.holding_tx_id, t.transfer_group_id, t.notes, t.created_at
+           FROM cash_transactions t
+           JOIN cash_accounts a ON a.id = t.account_id
+          WHERE (?1 IS NULL OR t.account_id = ?1)
+            AND (?2 IS NULL OR t.date >= ?2)
+            AND (?3 IS NULL OR t.date <= ?3)
+          ORDER BY t.date DESC, t.id DESC",
+    ) {
+        Ok(s) => s,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let rows = stmt.query_map(params![query.account_id, query.from, query.to], |row| {
+        Ok(CashTxRow {
+            id: row.get(0)?,
+            account_id: row.get(1)?,
+            account_name: row.get(2)?,
+            currency: row.get(3)?,
+            date: row.get(4)?,
+            amount: row.get(5)?,
+            kind: row.get(6)?,
+            holding_tx_id: row.get(7)?,
+            transfer_group_id: row.get(8)?,
+            notes: row.get(9)?,
+            created_at: row.get(10)?,
+        })
+    });
+    match rows {
+        Ok(rows) => HttpResponse::Ok().json(rows.filter_map(|r| r.ok()).collect::<Vec<_>>()),
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
+/// Shared validation for a manually entered cash transaction.
+fn validate_cash_tx(conn: &Connection, payload: &CashTxPayload) -> Result<String, String> {
+    if !is_valid_cash_tx_kind(&payload.kind) {
+        return Err(format!("Unknown kind '{}'. Valid kinds: {}", payload.kind, CASH_TX_KINDS.join(", ")));
+    }
+    if is_trade_owned_kind(&payload.kind) {
+        return Err(format!(
+            "'{}' entries are created from the trade that settles them, not entered directly",
+            payload.kind
+        ));
+    }
+    if NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d").is_err() {
+        return Err("Invalid date format. Use YYYY-MM-DD.".to_string());
+    }
+    if !payload.amount.is_finite() || payload.amount == 0.0 {
+        return Err("Amount must be a non-zero number".to_string());
+    }
+    cash_account_currency(conn, payload.account_id)
+        .ok_or_else(|| format!("Cash account {} not found", payload.account_id))
+}
+
+#[utoipa::path(post, path = "/api/v1/cash/transactions", tag = "cash", responses((status = 200, description = "Record a cash transaction")))]
+#[post("/api/cash/transactions")]
+async fn add_cash_transaction(db_path: web::Data<PathBuf>, payload: web::Json<CashTxPayload>) -> impl Responder {
+    let payload = payload.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    if let Err(err) = validate_cash_tx(&conn, &payload) {
+        return err_bad_request(err);
+    }
+
+    let result = conn.execute(
+        "INSERT INTO cash_transactions (account_id, date, amount, kind, notes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![payload.account_id, payload.date, payload.amount, payload.kind, payload.notes, Utc::now().to_rfc3339()],
+    );
+    match result {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "id": conn.last_insert_rowid() })),
+        Err(err) => {
+            let message = format!("Failed to record cash transaction: {}", err);
+            let _ = insert_event_log(&db_path, "error", "cash_tx_create", "api", None, &message);
+            err_internal(message)
+        }
+    }
+}
+
+#[utoipa::path(put, path = "/api/v1/cash/transactions/{id}", tag = "cash", params(("id" = i64, Path, description = "id")), responses((status = 200, description = "Update a cash transaction")))]
+#[put("/api/cash/transactions/{id}")]
+async fn update_cash_transaction(
+    db_path: web::Data<PathBuf>,
+    path: web::Path<i64>,
+    payload: web::Json<CashTxPayload>,
+) -> impl Responder {
+    let id = path.into_inner();
+    let payload = payload.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    let existing: Option<(String, Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT kind, transfer_group_id, holding_tx_id FROM cash_transactions WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    match existing {
+        None => return err_not_found(format!("Cash transaction {} not found", id)),
+        Some((_, _, holding_tx_id)) if is_transaction_owned(holding_tx_id) => {
+            return err_bad_request("This entry belongs to a transaction — edit the transaction instead".to_string());
+        }
+        // Both legs of a conversion have to move together. Editing one in
+        // isolation would create money in one currency and destroy it in the
+        // other; deleting removes the pair, so re-entering is the safe path.
+        Some((_, Some(_), _)) => {
+            return err_bad_request(
+                "This is one leg of a transfer between accounts — delete it and record the transfer again".to_string(),
+            );
+        }
+        Some((_, None, _)) => {}
+    }
+    if let Err(err) = validate_cash_tx(&conn, &payload) {
+        return err_bad_request(err);
+    }
+
+    match conn.execute(
+        "UPDATE cash_transactions SET account_id = ?2, date = ?3, amount = ?4, kind = ?5, notes = ?6 WHERE id = ?1",
+        params![id, payload.account_id, payload.date, payload.amount, payload.kind, payload.notes],
+    ) {
+        Ok(0) => err_not_found(format!("Cash transaction {} not found", id)),
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({ "id": id })),
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
+#[utoipa::path(delete, path = "/api/v1/cash/transactions/{id}", tag = "cash", params(("id" = i64, Path, description = "id")), responses((status = 204, description = "Delete a cash transaction")))]
+#[delete("/api/cash/transactions/{id}")]
+async fn delete_cash_transaction(db_path: web::Data<PathBuf>, path: web::Path<i64>) -> impl Responder {
+    let id = path.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT transfer_group_id, holding_tx_id FROM cash_transactions WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((transfer_group_id, holding_tx_id)) = row else {
+        return err_not_found(format!("Cash transaction {} not found", id));
+    };
+    if is_transaction_owned(holding_tx_id) {
+        return err_bad_request("This entry belongs to a transaction — delete the transaction instead".to_string());
+    }
+
+    // Removing one leg of a conversion would invent money in one currency and
+    // destroy it in another, so both legs go together.
+    let deleted = match &transfer_group_id {
+        Some(group) => conn.execute("DELETE FROM cash_transactions WHERE transfer_group_id = ?1", params![group]),
+        None => conn.execute("DELETE FROM cash_transactions WHERE id = ?1", params![id]),
+    };
+    match deleted {
+        Ok(0) => err_not_found(format!("Cash transaction {} not found", id)),
+        Ok(n) => {
+            let _ = insert_event_log(&db_path, "info", "cash_tx_delete", "api", None, &format!("Deleted {} cash transaction row(s) for id {}", n, id));
+            HttpResponse::NoContent().finish()
+        }
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
+/// Rewrite the cash leg belonging to one trade.
+///
+/// Re-read from the stored row rather than the request payload, so the leg
+/// reflects what was actually persisted — including a price and rate the server
+/// resolved rather than the client supplying. Delete-then-insert keeps this
+/// idempotent: calling it after any create or edit converges on exactly one leg,
+/// or none when the trade names no account.
+///
+/// The settlement is expressed in the trade's own currency. `price` is AUD and
+/// `original_price` is native, but `brokerage` is AUD by the existing engine's
+/// convention (`realised_pl = qty * price - brokerage - cost`), so a foreign
+/// trade converts it back at that trade's own recorded rate.
+fn sync_trade_cash_leg(conn: &Connection, holding_tx_id: i64) -> Result<(), String> {
+    conn.execute("DELETE FROM cash_transactions WHERE holding_tx_id = ?1", params![holding_tx_id])
+        .map_err(|e| e.to_string())?;
+
+    let row: Option<(Option<i64>, String, String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, String, Option<f64>)> = conn
+        .query_row(
+            "SELECT cash_account_id, transaction_type, date, quantity, price, original_price, fx_rate, brokerage, symbol, amount
+               FROM holdings_transactions WHERE id = ?1",
+            params![holding_tx_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some((Some(account_id), tx_type, date, quantity, price, original_price, fx_rate, brokerage, symbol, total_amount)) = row else {
+        return Ok(()); // no trade, or it settles against no account
+    };
+
+    let account_currency = cash_account_currency(conn, account_id)
+        .ok_or_else(|| format!("Cash account {} not found", account_id))?;
+    let trade_currency: String = conn
+        .query_row(
+            "SELECT COALESCE(currency, 'AUD') FROM holdings_transactions WHERE id = ?1",
+            params![holding_tx_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let is_foreign = trade_currency != "AUD";
+
+    // Two settlement styles, because brokers differ:
+    //
+    //   * Matching currencies (AUD/AUD, USD/USD) book in that currency. This is
+    //     an account that carries a real balance in it, like IBKR's USD.
+    //   * A foreign trade against an AUD account converts at the trade's own
+    //     rate. CommSec International works this way — the account holds only
+    //     AUD and the broker converts per trade, so no USD balance ever exists
+    //     to settle against. The rate is not lost: `fx_rate` is stored on the
+    //     trade, `price` is the AUD it produced, and the note records it.
+    //
+    // Anything else (a USD account against a EUR trade, say) is a conversion we
+    // have no rate for, and still has to be split into a transfer plus a trade.
+    let settle_converted = if account_currency == trade_currency {
+        false
+    } else if account_currency == "AUD" && is_foreign {
+        true
+    } else {
+        return Err(format!(
+            "{} trade settles in {} but the chosen cash account is {}. \
+             Convert the funds first, then settle from an account in the trade's currency.",
+            symbol, trade_currency, account_currency
+        ));
+    };
+
+    // `price` is always AUD; `original_price` is the trade's own currency.
+    let book_native = is_foreign && !settle_converted;
+
+    // Brokerage is stored in AUD, so it only needs converting when the leg is
+    // booked in a foreign currency.
+    let brokerage_settled = match (brokerage, book_native, fx_rate) {
+        (Some(b), true, Some(rate)) if rate != 0.0 => b / rate,
+        (Some(b), false, _) => b,
+        (Some(_), true, _) => {
+            return Err(format!(
+                "{} trade has brokerage but no exchange rate, so the fee cannot be expressed in {}",
+                symbol, trade_currency
+            ))
+        }
+        (None, _, _) => 0.0,
+    };
+
+    // A trade is defined by quantity and unit price; a dividend is defined by
+    // its total, and that is all the form requires. Deriving both the same way
+    // would leave a hand-entered dividend — total only, no share count — with
+    // no cash leg at all.
+    let gross = if tx_type == "dividend" {
+        let native_total = quantity.zip(original_price).map(|(q, unit)| q * unit);
+        let aud_total = total_amount.or_else(|| quantity.zip(price).map(|(q, unit)| q * unit));
+        let settled = if book_native {
+            native_total.or_else(|| {
+                aud_total
+                    .zip(fx_rate)
+                    .and_then(|(total, rate)| (rate != 0.0).then_some(total / rate))
+            })
+        } else {
+            aud_total
+        };
+        let Some(settled) = settled else { return Ok(()) };
+        settled
+    } else {
+        let unit_price = if book_native { original_price } else { price };
+        let (Some(unit_price), Some(quantity)) = (unit_price, quantity) else { return Ok(()) };
+        quantity * unit_price
+    };
+    let (amount, kind) = match tx_type.as_str() {
+        "purchase" => (-(gross + brokerage_settled), "trade_buy"),
+        "sale" => (gross - brokerage_settled, "trade_sell"),
+        // Income, not a flow: `dividend` is classified as return in
+        // CASH_TX_KINDS, so it lifts the growth figure instead of being
+        // written off as money the portfolio was handed from outside.
+        "dividend" => (gross - brokerage_settled, "dividend"),
+        _ => return Ok(()),
+    };
+
+    // A dividend is filed under its ex-date, but the cash lands on the payment
+    // date — often weeks later. Settling on the ex-date would credit the
+    // account before the money existed, so use the payment date when the
+    // fetched event knows it.
+    let settle_date = if tx_type == "dividend" {
+        conn.query_row(
+            "SELECT payment_date FROM dividend_events WHERE symbol = ?1 AND ex_date = ?2",
+            params![symbol, date],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .unwrap_or_else(|| date.clone())
+    } else {
+        date.clone()
+    };
+
+    // A converted leg states the foreign amount and rate on its face, so the
+    // ledger reads as an explanation rather than an unexplained AUD figure.
+    let foreign_total = quantity.zip(original_price).map(|(q, unit)| q * unit);
+    let note = match (settle_converted, foreign_total, fx_rate) {
+        (true, Some(native), Some(rate)) => format!(
+            "{} {} — {} {:.2} at {:.4}",
+            tx_type, symbol, trade_currency, native, rate
+        ),
+        _ => format!("{} {}", tx_type, symbol),
+    };
+
     conn.execute(
-        "INSERT OR REPLACE INTO cached_current_prices (symbol, price, change, change_percent, volume, last_updated, price_date)
+        "INSERT INTO cash_transactions (account_id, date, amount, kind, holding_tx_id, notes, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
+            account_id,
+            settle_date,
+            amount,
+            kind,
+            holding_tx_id,
+            note,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Withholding is deducted at source, so the bank only ever sees the net.
+    // It is booked as a second leg rather than by shrinking the dividend: the
+    // tax withheld is a figure you need at tax time, and netting it away
+    // destroys it. `fee` is classified as return in CASH_TX_KINDS, so gross
+    // less withholding lands on the growth figure as the net actually received.
+    if tx_type == "dividend" {
+        // An amount recorded against the payment wins over the symbol's
+        // standing rate. TFN withholding applies to the unfranked portion, so
+        // it varies with each distribution's franking and stops once a TFN is
+        // quoted — a per-symbol percentage cannot express that.
+        let explicit: Option<f64> = conn
+            .query_row(
+                "SELECT withholding_amount FROM holdings_transactions WHERE id = ?1",
+                params![holding_tx_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+
+        let withholding_pct: Option<f64> = conn
+            .query_row(
+                "SELECT dividend_withholding_pct FROM symbol_info WHERE symbol = ?1",
+                params![symbol],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+
+        let (withheld, label) = match (explicit.filter(|a| *a > 0.0), withholding_pct.filter(|p| *p > 0.0)) {
+            (Some(a), _) => (
+                (a * 100.0).round() / 100.0,
+                format!("tax withheld on {} dividend", symbol),
+            ),
+            (None, Some(pct)) => {
+                // Round the net, then take the fee as the remainder, so the two
+                // legs always sum to the cash the account actually received.
+                let net = ((amount * (1.0 - pct / 100.0)) * 100.0).round() / 100.0;
+                (
+                    ((amount - net) * 100.0).round() / 100.0,
+                    format!("withholding tax {}% on {} dividend", pct, symbol),
+                )
+            }
+            (None, None) => (0.0, String::new()),
+        };
+
+        if withheld.abs() >= 0.005 {
+            conn.execute(
+                "INSERT INTO cash_transactions (account_id, date, amount, kind, holding_tx_id, notes, created_at)
+                 VALUES (?1, ?2, ?3, 'fee', ?4, ?5, ?6)",
+                params![
+                    account_id,
+                    settle_date,
+                    -withheld,
+                    holding_tx_id,
+                    label,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct CashTransferPayload {
+    from_account_id: i64,
+    to_account_id: i64,
+    date: String,
+    /// Amount leaving the source account, in the source account's currency.
+    from_amount: f64,
+    /// Amount arriving in the destination account, in its own currency.
+    to_amount: f64,
+    notes: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/v1/cash/transfer", tag = "cash", responses((status = 200, description = "Move cash between accounts, including across currencies")))]
+#[post("/api/cash/transfer")]
+async fn add_cash_transfer(db_path: web::Data<PathBuf>, payload: web::Json<CashTransferPayload>) -> impl Responder {
+    let payload = payload.into_inner();
+    let mut conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+
+    if payload.from_account_id == payload.to_account_id {
+        return err_bad_request("Source and destination accounts must differ");
+    }
+    if NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d").is_err() {
+        return err_bad_request("Invalid date format. Use YYYY-MM-DD.");
+    }
+    if payload.from_amount <= 0.0 || payload.to_amount <= 0.0 {
+        return err_bad_request("Both amounts must be positive; direction is set by the accounts");
+    }
+    for id in [payload.from_account_id, payload.to_account_id] {
+        if cash_account_currency(&conn, id).is_none() {
+            return err_not_found(format!("Cash account {} not found", id));
+        }
+    }
+
+    // Both legs share a group id and are written in one transaction: a half
+    // written transfer would silently change the portfolio's total value.
+    let group = format!("xfer-{}", Utc::now().timestamp_micros());
+    let created_at = Utc::now().to_rfc3339();
+    let tx = match conn.transaction() {
+        Ok(t) => t,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let legs = [
+        (payload.from_account_id, -payload.from_amount, "fx_out"),
+        (payload.to_account_id, payload.to_amount, "fx_in"),
+    ];
+    for (account_id, amount, kind) in legs {
+        if let Err(err) = tx.execute(
+            "INSERT INTO cash_transactions (account_id, date, amount, kind, transfer_group_id, notes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![account_id, payload.date, amount, kind, group, payload.notes, created_at],
+        ) {
+            let message = format!("Failed to record transfer: {}", err);
+            let _ = insert_event_log(&db_path, "error", "cash_transfer", "api", None, &message);
+            return err_internal(message);
+        }
+    }
+    match tx.commit() {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "transfer_group_id": group,
+            "implied_rate": payload.to_amount / payload.from_amount,
+        })),
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
+fn cache_current_price(conn: &Connection, price: &CurrentPrice) -> Result<(), String> {
+    // Backstop for any caller that hasn't checked: overwriting a good cached
+    // price with a delisted symbol's zero is what makes a holding vanish.
+    if !is_usable_quote(price.price) {
+        log_event_on_conn(
+            conn,
+            "warn",
+            "price_cache",
+            Some(&price.symbol),
+            &format!("Refusing to cache non-positive price {:?} — keeping the last good quote", price.price),
+        );
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO cached_current_prices (symbol, price, change, change_percent, volume, day_open, day_high, day_low, last_updated, price_date)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
             price.symbol, price.price, price.change, price.change_percent,
-            price.volume, price.last_updated, price.price_date,
+            price.volume, price.day_open, price.day_high, price.day_low,
+            price.last_updated, price.price_date,
         ],
     ).map_err(|err| err.to_string())?;
     Ok(())
@@ -3324,7 +5315,7 @@ fn load_cached_prices(db_path: &PathBuf, symbols: &[String]) -> Result<Vec<Curre
     let conn = open_db(db_path).map_err(|err| err.to_string())?;
     let placeholders: Vec<String> = symbols.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
     let sql = format!(
-        "SELECT symbol, price, change, change_percent, volume, last_updated, price_date FROM cached_current_prices WHERE symbol IN ({})",
+        "SELECT symbol, price, change, change_percent, volume, last_updated, price_date, day_open, day_high, day_low FROM cached_current_prices WHERE symbol IN ({})",
         placeholders.join(",")
     );
     let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
@@ -3338,6 +5329,9 @@ fn load_cached_prices(db_path: &PathBuf, symbols: &[String]) -> Result<Vec<Curre
             volume: row.get(4)?,
             last_updated: row.get(5)?,
             price_date: row.get(6)?,
+            day_open: row.get(7)?,
+            day_high: row.get(8)?,
+            day_low: row.get(9)?,
             error: None,
         })
     }).map_err(|err| err.to_string())?;
@@ -3356,6 +5350,9 @@ fn load_cached_prices_with_fallback(db_path: &PathBuf, symbols: &[String]) -> Re
                 change: None,
                 change_percent: None,
                 volume: None,
+                day_open: None,
+                day_high: None,
+                day_low: None,
                 last_updated: String::new(),
                 price_date: None,
                 error: None,
@@ -3442,25 +5439,63 @@ fn log_event_on_conn(conn: &Connection, level: &str, event_type: &str, symbol: O
 fn persist_price_history(conn: &Connection, symbol: &str, records: &[PriceHistoryPoint]) {
     let now = Utc::now().to_rfc3339();
     for r in records {
+        // COALESCE on the OHLC columns so a close-only refresh can never blank
+        // out bars the backfill already filled.
         if let Some(close) = r.close
             && let Err(err) = conn.execute(
-                "INSERT INTO prices (symbol, date, close, volume, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
-                params![symbol, r.date, close, r.volume, now],
+                "INSERT INTO prices (symbol, date, open, high, low, close, volume, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(symbol, date) DO UPDATE SET
+                   open = COALESCE(excluded.open, open),
+                   high = COALESCE(excluded.high, high),
+                   low = COALESCE(excluded.low, low),
+                   close = excluded.close,
+                   volume = excluded.volume,
+                   fetched_at = excluded.fetched_at",
+                params![symbol, r.date, r.open, r.high, r.low, close, r.volume, now],
             ) {
                 log_event_on_conn(conn, "warn", "price_persist", Some(symbol), &format!("Failed to persist price history: {}", err));
             }
     }
 }
 
+/// Whether a fetched quote is a real price rather than an absence of one.
+///
+/// Yahoo answers a delisted or unknown symbol with `regularMarketPrice: 0.0`
+/// rather than null, so an `is_some()` check lets it through as though it were
+/// a quote. Zero is never a price for an equity — it means the feed has nothing
+/// — and treating it as one values the holding at nothing. That is how 3
+/// ETPMPM.AX shares came to be marked at $0.00 once the symbol stopped trading,
+/// and, worse, how a zero close could overwrite a good historical bar.
+///
+/// When there is no usable quote the last good price must stand.
+fn is_usable_quote(price: Option<f64>) -> bool {
+    matches!(price, Some(p) if p.is_finite() && p > 0.0)
+}
+
 fn persist_price_to_history(conn: &Connection, symbol: &str, price: &CurrentPrice, fetched_at: &str) {
+    if !is_usable_quote(price.price) {
+        log_event_on_conn(
+            conn,
+            "warn",
+            "price_persist",
+            Some(symbol),
+            &format!("Refusing to write non-positive close {:?} — keeping the last good bar", price.price),
+        );
+        return;
+    }
     if let (Some(close), Some(date)) = (price.price, &price.price_date)
         && let Err(err) = conn.execute(
-            "INSERT INTO prices (symbol, date, close, volume, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(symbol, date) DO UPDATE SET close = excluded.close, volume = excluded.volume, fetched_at = excluded.fetched_at",
-            params![symbol, date, close, price.volume, fetched_at],
+            "INSERT INTO prices (symbol, date, open, high, low, close, volume, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(symbol, date) DO UPDATE SET
+               open = COALESCE(excluded.open, open),
+               high = COALESCE(excluded.high, high),
+               low = COALESCE(excluded.low, low),
+               close = excluded.close,
+               volume = excluded.volume,
+               fetched_at = excluded.fetched_at",
+            params![symbol, date, price.day_open, price.day_high, price.day_low, close, price.volume, fetched_at],
         ) {
             log_event_on_conn(conn, "warn", "price_persist", Some(symbol), &format!("Failed to persist current price: {}", err));
         }
@@ -3543,6 +5578,9 @@ async fn fetch_and_cache_current_prices(
                     change,
                     change_percent,
                     volume: meta.regular_market_volume,
+                    day_open: meta.day_open,
+                    day_high: meta.regular_market_day_high,
+                    day_low: meta.regular_market_day_low,
                     last_updated: now.clone(),
                     price_date,
                     error: None,
@@ -3566,6 +5604,9 @@ async fn fetch_and_cache_current_prices(
                     change: None,
                     change_percent: None,
                     volume: None,
+                    day_open: None,
+                    day_high: None,
+                    day_low: None,
                     last_updated: now.clone(),
                     price_date: None,
                     error: Some(error_message),
@@ -3578,11 +5619,17 @@ async fn fetch_and_cache_current_prices(
     match open_db(db_path) {
         Ok(conn) => {
             for p in &prices {
-                if p.price.is_some() {
+                // A delisted symbol comes back as 0.0, not null. Skipping it
+                // leaves the last good price in place rather than marking the
+                // holding worthless.
+                if is_usable_quote(p.price) {
                     if let Err(err) = cache_current_price(&conn, p) {
                         let _ = insert_event_log(db_path, "error", "price_cache", "api", Some(&p.symbol), &format!("Failed to cache price: {}", err));
                     }
                     persist_price_to_history(&conn, &p.symbol, p, &now);
+                } else {
+                    let _ = insert_event_log(db_path, "warn", "price_fetch", "api", Some(&p.symbol),
+                        &format!("No usable quote (got {:?}) — symbol may be delisted; last known price retained", p.price));
                 }
             }
             if let Err(err) = conn.execute(
@@ -3607,7 +5654,7 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
         let conn = open_db(db_path).map_err(|err| err.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT date, close, volume FROM prices
+                "SELECT date, open, high, low, close, volume FROM prices
                  WHERE symbol = ?1 AND close IS NOT NULL
                  ORDER BY date DESC
                  LIMIT ?2",
@@ -3618,8 +5665,11 @@ async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i64) -> Resu
             .query_map(params![symbol, days], |row| {
                 Ok(PriceHistoryPoint {
                     date: row.get(0)?,
-                    close: row.get(1)?,
-                    volume: row.get(2)?,
+                    open: row.get(1)?,
+                    high: row.get(2)?,
+                    low: row.get(3)?,
+                    close: row.get(4)?,
+                    volume: row.get(5)?,
                 })
             })
             .map_err(|err| err.to_string())?;
@@ -3721,6 +5771,95 @@ async fn fetch_histories(db_path: &PathBuf, symbols: &[String], days: i64) -> Ha
 /// markets even open; US symbols keep a ~10:00 UTC cutoff, with Friday the
 /// last expected bar before it. Without the split, Monday-afternoon Sydney
 /// sessions would be treated as up to date on Friday's data.
+/// Valid `cash_transactions.kind` values.
+///
+/// Grouped by how each behaves in a time-weighted return, which is the whole
+/// point of recording them separately:
+///
+/// - `deposit` / `withdrawal` — **external flows**. Money entering or leaving
+///   the portfolio. Excluded from return, so a monthly contribution cannot
+///   masquerade as growth.
+/// - `opening_balance` — establishes the starting value when an account is
+///   first tracked. Not a flow; it is the V₀ the first return is measured from.
+/// - `dividend` / `interest` — **return**. Income the portfolio generated.
+///   Treating these as flows would erase exactly the earnings being measured.
+/// - `fee` — **return**, negative. A cost the portfolio bore.
+/// - `trade_buy` / `trade_sell` — **neutral**. Value moves between cash and
+///   shares; the total is unchanged at the moment of the trade.
+/// - `fx_out` / `fx_in` — **neutral**. The paired legs of a currency
+///   conversion between accounts you already own.
+/// - `adjustment` — reconciliation against a real statement. Neutral by
+///   default; a large one is a sign something upstream was mis-recorded.
+const CASH_TX_KINDS: &[&str] = &[
+    "deposit",
+    "withdrawal",
+    "opening_balance",
+    "dividend",
+    "interest",
+    "fee",
+    "trade_buy",
+    "trade_sell",
+    "fx_out",
+    "fx_in",
+    "adjustment",
+];
+
+/// Yahoo's symbol for "how many AUD one unit of `currency` buys", e.g. USDAUD=X.
+///
+/// FX pairs are stored in `prices` as ordinary symbols. Yahoo serves them as
+/// daily OHLC bars exactly like equities, so the whole existing pipeline —
+/// fetch, persist, and the backfill_ohlc tool — works on them unchanged, and
+/// `prices` is already exempt from audit triggers as re-fetchable machine data.
+fn fx_pair_symbol(currency: &str) -> String {
+    format!("{}AUD=X", currency.trim().to_uppercase())
+}
+
+/// Currencies the portfolio actually holds value in, excluding AUD (the base).
+///
+/// Derived from the data rather than configured, so adding a GBP holding starts
+/// its rate history automatically. Reads both `symbol_info` (the authority for a
+/// symbol's currency) and `holdings_transactions` (which carries the currency a
+/// trade actually settled in, and covers symbols missing from symbol_info).
+fn fx_currencies_in_use(conn: &Connection) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT UPPER(TRIM(currency)) AS ccy FROM (
+             SELECT currency FROM symbol_info WHERE currency IS NOT NULL
+             UNION ALL
+             SELECT currency FROM holdings_transactions WHERE currency IS NOT NULL
+         )
+         WHERE ccy <> '' AND ccy <> 'AUD'
+         ORDER BY ccy",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// The AUD value of one unit of `currency` on `date`, from stored rates.
+///
+/// As-of semantics: FX does not trade at weekends, and a holding still needs
+/// valuing on those days, so this takes the most recent rate on or before the
+/// date rather than requiring an exact match. AUD is the base and always 1.0.
+fn fx_rate_on(conn: &Connection, currency: &str, date: &str) -> Option<f64> {
+    let ccy = currency.trim().to_uppercase();
+    if ccy.is_empty() || ccy == "AUD" {
+        return Some(1.0);
+    }
+    conn.query_row(
+        "SELECT close FROM prices
+          WHERE symbol = ?1 AND close IS NOT NULL AND date <= ?2
+          ORDER BY date DESC LIMIT 1",
+        params![fx_pair_symbol(&ccy), date],
+        |row| row.get::<_, f64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 fn last_expected_trading_day(now: chrono::DateTime<Utc>, symbol: &str) -> String {
     let monday_cutoff_hour = if symbol.to_uppercase().ends_with(".AX") { 7 } else { 10 };
     let days_back = match now.weekday() {
@@ -3929,6 +6068,14 @@ struct YahooMeta {
     regular_market_volume: Option<i64>,
     #[serde(rename = "chartPreviousClose")]
     chart_previous_close: Option<f64>,
+    #[serde(rename = "regularMarketDayHigh")]
+    regular_market_day_high: Option<f64>,
+    #[serde(rename = "regularMarketDayLow")]
+    regular_market_day_low: Option<f64>,
+    /// Yahoo's chart meta has no open field — filled from the quote arrays in
+    /// `fetch_current_price`, hence `default` rather than a rename.
+    #[serde(default)]
+    day_open: Option<f64>,
     #[serde(rename = "instrumentType")]
     instrument_type: Option<String>,
     #[serde(rename = "longName")]
@@ -3976,8 +6123,110 @@ struct YahooHistoryIndicators {
 
 #[derive(Deserialize)]
 struct YahooHistoryQuote {
+    open: Option<Vec<Option<f64>>>,
+    high: Option<Vec<Option<f64>>>,
+    low: Option<Vec<Option<f64>>>,
     close: Option<Vec<Option<f64>>>,
     volume: Option<Vec<Option<i64>>>,
+}
+
+/// Result of one FX sync pass, for logging and the manual endpoint.
+#[derive(Serialize, Default)]
+struct FxSyncReport {
+    currencies: Vec<String>,
+    fetched: usize,
+    skipped: usize,
+    bars_written: usize,
+    errors: Vec<String>,
+}
+
+/// Bring stored FX history up to date for every currency the portfolio uses.
+///
+/// Valuing a foreign holding on a past date needs that date's rate, so the
+/// rates live in `prices` as daily bars rather than being fetched live per
+/// lookup. Already-current pairs cost one indexed query and no network, which
+/// makes this safe to call on every startup.
+async fn sync_fx_history(db_path: &PathBuf, days: i64) -> FxSyncReport {
+    let mut report = FxSyncReport::default();
+
+    let currencies = match open_db(db_path) {
+        Ok(conn) => fx_currencies_in_use(&conn),
+        Err(err) => {
+            let message = format!("FX sync could not read currencies: {}", err);
+            let _ = insert_event_log(db_path, "error", "fx_sync", "api", None, &message);
+            report.errors.push(message);
+            return report;
+        }
+    };
+    report.currencies = currencies.clone();
+    if currencies.is_empty() {
+        return report;
+    }
+
+    let client = match Client::builder().user_agent("stocks-api/1.0").build() {
+        Ok(c) => c,
+        Err(err) => {
+            let message = format!("FX sync could not build HTTP client: {}", err);
+            let _ = insert_event_log(db_path, "error", "fx_sync", "api", None, &message);
+            report.errors.push(message);
+            return report;
+        }
+    };
+
+    for currency in &currencies {
+        let pair = fx_pair_symbol(currency);
+
+        // Skip the network when the latest stored bar is already the most
+        // recent one we could expect.
+        let latest: Option<String> = open_db(db_path).ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT MAX(date) FROM prices WHERE symbol = ?1 AND close IS NOT NULL",
+                params![pair],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+        });
+        if latest.as_deref().unwrap_or("") >= last_expected_trading_day(Utc::now(), &pair).as_str() {
+            report.skipped += 1;
+            continue;
+        }
+
+        match fetch_price_history_from_yahoo(&client, &pair, days).await {
+            Ok(records) => match open_db(db_path) {
+                Ok(conn) => {
+                    persist_price_history(&conn, &pair, &records);
+                    report.fetched += 1;
+                    report.bars_written += records.len();
+                }
+                Err(err) => {
+                    let message = format!("FX rates for {} could not be persisted: {}", pair, err);
+                    let _ = insert_event_log(db_path, "error", "fx_sync", "api", Some(&pair), &message);
+                    report.errors.push(message);
+                }
+            },
+            Err(err) => {
+                let message = format!("FX rate history fetch failed for {}: {}", pair, err);
+                let _ = insert_event_log(db_path, "warn", "fx_sync", "api", Some(&pair), &message);
+                report.errors.push(message);
+            }
+        }
+    }
+
+    report
+}
+
+#[utoipa::path(post, path = "/api/v1/fx/sync", tag = "prices", responses((status = 200, description = "Refresh stored FX rate history")))]
+#[post("/api/fx/sync")]
+async fn post_fx_sync(db_path: web::Data<PathBuf>) -> impl Responder {
+    // `fetch_price_history_from_yahoo` asks for a 2-year range for any days > 365,
+    // so this is the widest window available through the shared fetch path —
+    // ample, given the earliest holding transaction is 2025-01-02. Extending
+    // beyond that would need explicit period1/period2 bounds, as backfill_ohlc
+    // uses, because Yahoo downsamples `range=max` to monthly bars.
+    HttpResponse::Ok().json(sync_fx_history(db_path.as_ref(), 600).await)
 }
 
 async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str, days: i64) -> Result<Vec<PriceHistoryPoint>, String> {
@@ -4028,9 +6277,12 @@ async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str, days: i64
 
         let close = quote.close.as_ref().and_then(|v| v.get(index).cloned().flatten());
         let volume = quote.volume.as_ref().and_then(|v| v.get(index).cloned().flatten());
+        let open = quote.open.as_ref().and_then(|v| v.get(index).cloned().flatten());
+        let high = quote.high.as_ref().and_then(|v| v.get(index).cloned().flatten());
+        let low = quote.low.as_ref().and_then(|v| v.get(index).cloned().flatten());
 
         if close.is_some() {
-            records.push(PriceHistoryPoint { date, close, volume });
+            records.push(PriceHistoryPoint { date, open, high, low, close, volume });
         }
     }
 
@@ -4067,13 +6319,29 @@ async fn fetch_current_price(client: &Client, symbol: &str) -> Result<YahooMeta,
         .ok_or_else(|| "No chart data available".to_string())?;
 
     let mut meta = result.meta;
+    let day_quote = result.indicators.as_ref().and_then(|ind| ind.quote.first());
     // Fall back to the time-series volume when regularMarketVolume is absent in metadata
     if meta.regular_market_volume.is_none() {
-        meta.regular_market_volume = result.indicators
-            .as_ref()
-            .and_then(|ind| ind.quote.first())
+        meta.regular_market_volume = day_quote
             .and_then(|q| q.volume.as_ref())
             .and_then(|vols| vols.iter().filter_map(|v| *v).next_back());
+    }
+    // range=1d returns a single daily bar, so the session's open is its first
+    // non-null open; high/low fall back to the bar when meta omits them.
+    if let Some(q) = day_quote {
+        meta.day_open = q.open.as_ref().and_then(|v| v.iter().flatten().next().copied());
+        if meta.regular_market_day_high.is_none() {
+            meta.regular_market_day_high = q
+                .high
+                .as_ref()
+                .and_then(|v| v.iter().flatten().copied().reduce(f64::max));
+        }
+        if meta.regular_market_day_low.is_none() {
+            meta.regular_market_day_low = q
+                .low
+                .as_ref()
+                .and_then(|v| v.iter().flatten().copied().reduce(f64::min));
+        }
     }
     Ok(meta)
 }
@@ -4250,7 +6518,7 @@ async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -> HashMap<S
         if let Some(client) = &client {
             match fetch_current_price(client, &pair).await {
                 Ok(meta) => {
-                    live = meta.regular_market_price;
+                    live = meta.regular_market_price.filter(|p| is_usable_quote(Some(*p)));
                     if live.is_some()
                         && let Ok(conn) = open_db(db_path) {
                             let _ = cache_current_price(&conn, &CurrentPrice {
@@ -4259,6 +6527,9 @@ async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -> HashMap<S
                                 change: None,
                                 change_percent: None,
                                 volume: None,
+                                day_open: None,
+                                day_high: None,
+                                day_low: None,
                                 last_updated: Utc::now().to_rfc3339(),
                                 price_date: None,
                                 error: None,
@@ -4289,6 +6560,96 @@ fn stored_sma(conn: &Connection, symbol: &str, period: usize) -> Option<f64> {
         return None;
     }
     Some(closes.iter().sum::<f64>() / period as f64)
+}
+
+/// Latest N-day exponential moving average from stored daily closes (no network).
+///
+/// Seeded with the simple average of the oldest full window, then iterated
+/// forward with k = 2/(period+1) — the same definition as `calculateEMA` in the
+/// web client, over the same 600-bar window the chart requests, so the Analysis
+/// table and the chart's EMA overlay agree.
+/// Exponential moving average over *weekly* closes.
+///
+/// A 40-week EMA is not a 200-day EMA. Both span roughly the same calendar, but
+/// the weekly one is computed from one close per week, so it steps once a week
+/// and is far less sensitive to a single day's move. Chartists mean the weekly
+/// figure, so it is what gets computed.
+///
+/// Weeks start on Monday and take that week's last available close, matching
+/// `toWeeklyBars` in the web client — the table and the chart's Week interval
+/// must not disagree about what a week is.
+fn stored_weekly_ema(conn: &Connection, symbol: &str, period: usize) -> Option<f64> {
+    if period == 0 {
+        return None;
+    }
+    // Daily rows to read before collapsing. An EMA needs history well beyond
+    // its period to settle, and a week costs ~5 rows, so this is the weekly
+    // equivalent of `stored_ema`'s lookback.
+    const LOOKBACK_DAYS: i64 = 3000;
+    let mut stmt = conn
+        .prepare(
+            "SELECT date, close FROM prices
+              WHERE symbol = ?1 AND close IS NOT NULL
+              ORDER BY date DESC LIMIT ?2",
+        )
+        .ok()?;
+    let mut rows: Vec<(String, f64)> = stmt
+        .query_map(params![symbol, LOOKBACK_DAYS], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .ok()?
+        .flatten()
+        .collect();
+    rows.reverse(); // oldest first, so each week's last close wins
+
+    let mut weekly: Vec<f64> = Vec::new();
+    let mut current_week: Option<NaiveDate> = None;
+    for (date, close) in rows {
+        let Ok(parsed) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") else { continue };
+        let monday = parsed.week(chrono::Weekday::Mon).first_day();
+        if current_week == Some(monday) {
+            // Same week — this later close replaces the earlier one.
+            *weekly.last_mut()? = close;
+        } else {
+            current_week = Some(monday);
+            weekly.push(close);
+        }
+    }
+
+    if weekly.len() < period {
+        return None;
+    }
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut ema = weekly[..period].iter().sum::<f64>() / period as f64;
+    for close in &weekly[period..] {
+        ema = close * k + ema * (1.0 - k);
+    }
+    Some(ema)
+}
+
+fn stored_ema(conn: &Connection, symbol: &str, period: usize) -> Option<f64> {
+    // An EMA needs history well beyond its period to settle, unlike an SMA
+    // which only ever looks at exactly `period` closes.
+    const LOOKBACK: i64 = 600;
+    let mut stmt = conn
+        .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL ORDER BY date DESC LIMIT ?2")
+        .ok()?;
+    let mut closes: Vec<f64> = stmt
+        .query_map(params![symbol, LOOKBACK], |row| row.get::<_, f64>(0))
+        .ok()?
+        .flatten()
+        .collect();
+    if closes.len() < period || period == 0 {
+        return None;
+    }
+    closes.reverse(); // query returns newest first; the EMA walks forward
+
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut ema = closes[..period].iter().sum::<f64>() / period as f64;
+    for close in &closes[period..] {
+        ema = close * k + ema * (1.0 - k);
+    }
+    Some(ema)
 }
 
 struct EffectivePrice {
@@ -4408,17 +6769,31 @@ async fn build_portfolio_context(db_path: &PathBuf) -> Result<PortfolioContext, 
 
     let cached = load_cached_prices(db_path, &symbols)?;
     let cached_map: HashMap<String, CurrentPrice> = cached.into_iter().map(|p| (p.symbol.clone(), p)).collect();
+    // Last traded bar per symbol, for anything the live feed no longer quotes.
+    let last_closes = latest_closes(db_path, &symbols);
     let mut prices: HashMap<String, EffectivePrice> = HashMap::new();
     for symbol in &symbols {
         let c = cached_map.get(symbol);
-        let mut native = c.and_then(|p| p.price);
+        let mut native = c.and_then(|p| p.price).filter(|p| *p > 0.0);
         let mut source = if native.is_some() { "cache" } else { "none" };
-        if (native.is_none() || native == Some(0.0))
+        let mut price_date = c.and_then(|p| p.price_date.clone());
+        if native.is_none()
             && let Some(manual) = config.get(&format!("manual_price_{}", symbol))
                 && let Ok(v) = manual.parse::<f64>() {
                     native = Some(v);
                     source = "manual";
                 }
+        // A delisted symbol has no quote and often no manual override either.
+        // Its last traded price is the only honest figure available — better
+        // than nothing, which would drop the holding out of the portfolio
+        // total, and far better than the feed's zero. `source` says where it
+        // came from so the UI can mark it stale.
+        if native.is_none()
+            && let Some((close, date)) = last_closes.get(symbol) {
+                native = Some(*close);
+                source = "last_close";
+                price_date = Some(date.clone());
+            }
         let currency = info.get(symbol).and_then(|i| i.2.clone()).map(|c| c.to_uppercase());
         let aud = match (&native, &currency) {
             (Some(n), Some(cur)) if cur != "AUD" => match fx_rates.get(cur).copied().flatten() {
@@ -4432,7 +6807,7 @@ async fn build_portfolio_context(db_path: &PathBuf) -> Result<PortfolioContext, 
             native,
             aud,
             source,
-            price_date: c.and_then(|p| p.price_date.clone()),
+            price_date,
             change: c.and_then(|p| p.change),
             change_percent: c.and_then(|p| p.change_percent),
             volume: c.and_then(|p| p.volume),
@@ -4541,8 +6916,20 @@ fn effective_stop_loss(
         .filter(|v| *v > 0.0)?;
     let mut reference = current_price;
     if let Some(since) = sym_fields.and_then(|f| f.get("trailing_sell_date")).filter(|d| !d.is_empty()) {
-        let mut closes: Vec<f64> = conn
-            .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL AND date >= ?2")
+        // A trailing stop ratchets on the highest price actually *reached*, so
+        // the peak is taken from the intraday high — that is what brokers trail
+        // on. Using the close instead understates the peak whenever a bar spikes
+        // and gives back the gain (TXG: high 60.69 vs close 58.48, a $1.80
+        // difference in the resulting stop).
+        //
+        // COALESCE falls back to the close for bars predating OHLC ingest that
+        // the backfill could not reach, so a missing high degrades to the old
+        // behaviour for that bar rather than dropping it from the peak.
+        let mut peaks: Vec<f64> = conn
+            .prepare(
+                "SELECT COALESCE(high, close) FROM prices
+                  WHERE symbol = ?1 AND COALESCE(high, close) IS NOT NULL AND date >= ?2",
+            )
             .ok()
             .and_then(|mut stmt| {
                 stmt.query_map(params![symbol, since], |row| row.get::<_, f64>(0))
@@ -4551,19 +6938,52 @@ fn effective_stop_loss(
             })
             .unwrap_or_default();
         if let Some(c) = current_price {
-            closes.push(c);
+            peaks.push(c);
         }
-        if !closes.is_empty() {
-            reference = closes.into_iter().reduce(f64::max);
+        if !peaks.is_empty() {
+            reference = peaks.into_iter().reduce(f64::max);
         }
     }
     let r = reference.filter(|r| *r != 0.0)?;
     Some((r * (1.0 - pct / 100.0), true))
 }
 
+#[derive(Deserialize)]
+struct PortfolioOverviewQuery {
+    /// Per-list sort override, as comma-separated `list_key:asc|desc` pairs
+    /// (e.g. `stop_losses:desc`). Overrides the `sort` in each list's config.
+    ///
+    /// This has to be a server-side concern: each list is ranked and then
+    /// truncated to its `limit` before being sent, so reversing the order in
+    /// the browser would only reverse the rows that survived the cut. Sorting
+    /// here changes *which* rows are selected.
+    list_sort: Option<String>,
+}
+
+/// Parse a `list_sort` parameter into list_key → direction. Unknown or
+/// malformed pairs are ignored so a bad query degrades to configured order
+/// rather than failing the whole dashboard.
+fn parse_list_sort(raw: Option<&str>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(raw) = raw else { return out };
+    for pair in raw.split(',') {
+        if let Some((key, dir)) = pair.split_once(':') {
+            let dir = dir.trim().to_ascii_lowercase();
+            if dir == "asc" || dir == "desc" {
+                out.insert(key.trim().to_string(), dir);
+            }
+        }
+    }
+    out
+}
+
 #[utoipa::path(get, path = "/api/v1/portfolio/overview", tag = "portfolio", responses((status = 200, description = "Get portfolio overview")))]
 #[get("/api/portfolio/overview")]
-async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
+async fn get_portfolio_overview(
+    db_path: web::Data<PathBuf>,
+    query: web::Query<PortfolioOverviewQuery>,
+) -> impl Responder {
+    let list_sort_overrides = parse_list_sort(query.list_sort.as_deref());
     let ctx = match build_portfolio_context(&db_path).await {
         Ok(c) => c,
         Err(err) => {
@@ -4835,6 +7255,13 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                 }
             }
 
+            // A request-time override beats the list's configured direction, so
+            // clicking the Difference header re-ranks before the truncate below
+            // and can surface rows that were previously cut.
+            let sort_dir = list_sort_overrides
+                .get(&def.key)
+                .map(|s| s.as_str())
+                .or(def.sort.as_deref());
             let pct_op = def.operator == "pct_above" || def.operator == "pct_below";
             entries.sort_by(|a, b| {
                 let cmp = if pct_op {
@@ -4843,9 +7270,11 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                     a.pct_diff.partial_cmp(&b.pct_diff)
                 }
                 .unwrap_or(std::cmp::Ordering::Equal);
-                if def.sort.as_deref() == Some("desc") { cmp.reverse() } else { cmp }
+                if sort_dir == Some("desc") { cmp.reverse() } else { cmp }
             });
-            entries.truncate(def.limit.unwrap_or(15));
+            let limit = def.limit.unwrap_or(15);
+            let truncated = entries.len() > limit;
+            entries.truncate(limit);
 
             let builtin_labels: HashMap<&str, &str> = HashMap::from([
                 ("breakthrough_price", "Breakthrough Price"),
@@ -4870,6 +7299,14 @@ async fn get_portfolio_overview(db_path: web::Data<PathBuf>) -> impl Responder {
                 "field_source": field_source,
                 "operator": def.operator,
                 "field_label": field_label,
+                // The direction actually applied — the request override if one
+                // was given, else the list's config, else the "asc" default. The
+                // client renders its sort indicator from this rather than
+                // assuming, so the arrow is right on first load too.
+                "sort": sort_dir.unwrap_or("asc"),
+                // True when more rows qualified than `limit` allowed through, so
+                // the UI can say the view is truncated rather than complete.
+                "truncated": truncated,
                 "entries": entries.iter().map(|e| serde_json::json!({
                     "symbol": e.symbol,
                     "price": e.price,
@@ -5064,8 +7501,21 @@ async fn get_portfolio_risk(db_path: web::Data<PathBuf>) -> impl Responder {
 
         let sma50 = stored_sma(&conn, symbol, 50).map(&to_display);
         let sma150 = stored_sma(&conn, symbol, 150).map(&to_display);
+        let ema40w = stored_weekly_ema(&conn, symbol, 40).map(&to_display);
+        // Highest price *reached* over the window, so an intraday spike counts.
+        // Taking the close instead understates it whenever a bar runs up and
+        // gives the gain back — RMS.AX touched 3.79 on a day it closed at 3.67,
+        // which put a real purchase at 3.76 above its own "30d High".
+        //
+        // The row filter stays on `close IS NOT NULL` so the window is still the
+        // 30 most recent trading bars, and COALESCE falls back to the close for
+        // bars the OHLC backfill could not reach.
         let high30d: Option<f64> = conn
-            .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL ORDER BY date DESC LIMIT 30")
+            .prepare(
+                "SELECT COALESCE(high, close) FROM prices
+                  WHERE symbol = ?1 AND close IS NOT NULL
+                  ORDER BY date DESC LIMIT 30",
+            )
             .ok()
             .and_then(|mut stmt| {
                 stmt.query_map(params![symbol], |row| row.get::<_, f64>(0))
@@ -5089,8 +7539,13 @@ async fn get_portfolio_risk(db_path: web::Data<PathBuf>) -> impl Responder {
             "stop_loss_dollar": stop_loss_dollar,
             "sma50": sma50,
             "sma150": sma150,
+            "ema40w": ema40w,
             "high30d": high30d,
             "total_invested": invested,
+            // Needed to express the gap to the stop loss as a position-level
+            // dollar amount. Deriving it client-side from total_invested /
+            // purchase_price breaks whenever purchase_price is absent or zero.
+            "shares": shares,
         }));
     }
 
@@ -5180,6 +7635,9 @@ async fn get_meta(db_path: web::Data<PathBuf>) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({
         "sectors": sectors,
         "currencies": SUPPORTED_CURRENCIES,
+        // The cash ledger's vocabulary, published so clients build their
+        // pickers from the server's list rather than a duplicated constant.
+        "cash_transaction_kinds": CASH_TX_KINDS,
         "holdings_custom_fields": parse_defs("holdings_custom_fields"),
         "watchlist_custom_fields": parse_defs("watchlist_custom_fields"),
         "dashboard_custom_lists": parse_defs("dashboard_custom_lists"),
@@ -5214,6 +7672,7 @@ mod tests {
             currency: "AUD".to_string(),
             original_price: None,
             fx_rate: None,
+            cash_account_id: None,
             custom_fields: Default::default(),
         }
     }
@@ -5236,6 +7695,183 @@ mod tests {
         (file, path)
     }
 
+    /// Enforces the Audit Logging rule in CLAUDE.md: every column of every
+    /// audited table must appear in its triggers' `json_object(...)` payloads.
+    ///
+    /// Columns get added with `add_column_if_missing()` long after a trigger is
+    /// written, and nothing about that fails loudly — the audit log keeps
+    /// working and quietly omits the new field. That is exactly how
+    /// `watchlist_symbols.breakthrough_price` and `stop_loss_price` went
+    /// unrecorded, leaving them unrecoverable when the rows were wiped.
+    #[test]
+    fn audit_triggers_cover_every_column() {
+        // High-volume machine-fetched data is deliberately not audited: `prices`
+        // alone would dwarf the database, and both are re-derivable from Yahoo.
+        const NOT_AUDITED: &[&str] = &[
+            "prices",
+            "cached_current_prices",
+            "audit_log",
+            "event_log",
+            "watchlist_prices",
+            "sqlite_sequence",
+        ];
+
+        let (_file, path) = setup_test_db();
+        let conn = open_db(&path).unwrap();
+
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        for table in tables {
+            if NOT_AUDITED.contains(&table.as_str()) {
+                continue;
+            }
+
+            // Checked per trigger, not against all three concatenated: adding a
+            // column to two of the three is the realistic mistake, and a
+            // combined check would wave it through.
+            let triggers: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name = ?1")
+                    .unwrap();
+                let rows = stmt
+                    .query_map(params![table], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .unwrap();
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            if triggers.is_empty() {
+                failures.push(format!("{}: no audit triggers at all", table));
+                continue;
+            }
+            for action in ["insert", "update", "delete"] {
+                if !triggers.iter().any(|(name, _)| name.ends_with(action)) {
+                    failures.push(format!("{}: no {} trigger", table, action));
+                }
+            }
+
+            let columns: Vec<String> = {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table)).unwrap();
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+                rows.filter_map(|r| r.ok()).collect()
+            };
+
+            // Each trigger must reference the aliases it actually has: an
+            // update sees both sides, and recording only one loses half the
+            // change; an insert has only NEW, a delete only OLD.
+            for column in &columns {
+                for (name, sql) in &triggers {
+                    let aliases: &[&str] = if name.ends_with("update") {
+                        &["NEW", "OLD"]
+                    } else if name.ends_with("insert") {
+                        &["NEW"]
+                    } else {
+                        &["OLD"]
+                    };
+                    for alias in aliases {
+                        if !sql.contains(&format!("{}.{}", alias, column)) {
+                            failures.push(format!("{}: {}.{} missing from {}", table, alias, column, name));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(failures.is_empty(), "audit trigger coverage gaps:\n  {}", failures.join("\n  "));
+    }
+
+    /// The static check above proves the trigger *text* names every column.
+    /// This proves the values actually land in audit_log — and, critically,
+    /// that re-running `init_db` replaces an existing trigger rather than
+    /// leaving a stale `IF NOT EXISTS` definition in place.
+    #[test]
+    fn audit_log_records_watchlist_prices_after_reinit() {
+        let (_file, path) = setup_test_db();
+        // A second init_db is what a restart does; the drop-then-create must win.
+        init_db(&path).unwrap();
+
+        let conn = open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO watchlist_symbols (symbol, notes, updated_at, breakthrough_price, stop_loss_price)
+             VALUES ('TST.AX', 'thesis', '2026-01-01T00:00:00Z', 12.5, 9.75)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE watchlist_symbols SET breakthrough_price = 14.0 WHERE symbol = 'TST.AX'",
+            [],
+        )
+        .unwrap();
+
+        let (old_bt, new_bt, new_sl): (Option<f64>, Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT json_extract(old_values,'$.breakthrough_price'),
+                        json_extract(new_values,'$.breakthrough_price'),
+                        json_extract(new_values,'$.stop_loss_price')
+                   FROM audit_log
+                  WHERE table_name='watchlist_symbols' AND action='UPDATE'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old_bt, Some(12.5), "pre-change breakthrough_price must be recorded");
+        assert_eq!(new_bt, Some(14.0), "post-change breakthrough_price must be recorded");
+        assert_eq!(new_sl, Some(9.75), "stop_loss_price must be recorded");
+    }
+
+    /// Regression: `init_db` runs on every API start, and the two legacy
+    /// watchlist rebuilds only copy the columns they name. Step 1's guard is
+    /// "list_name is absent", which is also true of the *normalised* table, so
+    /// it used to fire on every restart — dropping notes, breakthrough_price
+    /// and stop_loss_price, then Step 3 rebuilt the table and the ALTERs below
+    /// re-added them empty. The schema looked right; the user's data was gone.
+    #[test]
+    fn repeated_init_db_preserves_watchlist_notes_and_prices() {
+        let (_file, path) = setup_test_db();
+        let conn = open_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO watchlist_symbols (symbol, notes, updated_at, breakthrough_price, stop_loss_price)
+             VALUES ('TST.AX', 'my thesis', '2026-01-01T00:00:00Z', 12.5, 9.75)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watchlist_memberships (symbol, list_name, added_at) VALUES ('TST.AX', 'Default', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Three more startups, as if the server were restarted three times
+        for _ in 0..3 {
+            init_db(&path).unwrap();
+        }
+
+        let conn = open_db(&path).unwrap();
+        let (notes, breakthrough, stop_loss): (Option<String>, Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT notes, breakthrough_price, stop_loss_price FROM watchlist_symbols WHERE symbol = 'TST.AX'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(notes.as_deref(), Some("my thesis"), "notes must survive restarts");
+        assert_eq!(breakthrough, Some(12.5), "breakthrough_price must survive restarts");
+        assert_eq!(stop_loss, Some(9.75), "stop_loss_price must survive restarts");
+
+        // The membership must still be there too
+        let memberships: i64 = conn
+            .query_row("SELECT COUNT(*) FROM watchlist_memberships WHERE symbol = 'TST.AX'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(memberships, 1);
+    }
+
     fn insert_tx(db_path: &PathBuf, id: i64, tx_type: &str, date: &str, qty: f64, price: f64, brokerage: f64) {
         let conn = open_db(db_path).unwrap();
         conn.execute(
@@ -5243,6 +7879,91 @@ mod tests {
              VALUES (?1, 'TST.AX', ?2, ?3, ?4, ?5, ?6, '2024-01-01T00:00:00Z')",
             rusqlite::params![id, tx_type, date, qty, price, brokerage],
         ).unwrap();
+    }
+
+    /// A refresh has to converge on what Yahoo now reports. Upserting alone let
+    /// the table grow: when a date fix shifted ex-dates by a day, each refresh
+    /// added a parallel copy of every dividend instead of correcting it, and
+    /// the duplicates were then paid twice into the cash ledger.
+    #[test]
+    fn refetching_dividends_replaces_the_symbols_history() {
+        let (_file, db_path) = setup_test_db();
+        let stored = |db: &PathBuf| -> Vec<(String, f64)> {
+            let conn = open_db(db).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT ex_date, amount FROM dividend_events WHERE symbol = 'TST.AX' ORDER BY ex_date")
+                .unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let event = |ex_date: &str, amount: f64| DividendEvent {
+            symbol: "TST.AX".to_string(),
+            ex_date: NaiveDate::parse_from_str(ex_date, "%Y-%m-%d").unwrap(),
+            payment_date: None,
+            record_date: None,
+            amount,
+            fetched_at: "2026-08-14T00:00:00Z".to_string(),
+        };
+
+        store_dividend_events_for_symbol(&db_path, "TST.AX", &[event("2025-02-27", 0.10)]).unwrap();
+        assert_eq!(stored(&db_path), vec![("2025-02-27".to_string(), 0.10)]);
+
+        // The same dividend, re-reported a day later after the date fix.
+        store_dividend_events_for_symbol(&db_path, "TST.AX", &[event("2025-02-28", 0.10)]).unwrap();
+        assert_eq!(
+            stored(&db_path),
+            vec![("2025-02-28".to_string(), 0.10)],
+            "the corrected date should replace the old one, not sit alongside it"
+        );
+
+        // A failed fetch reports nothing; that is not evidence of no dividends.
+        store_dividend_events_for_symbol(&db_path, "TST.AX", &[]).unwrap();
+        assert_eq!(
+            stored(&db_path),
+            vec![("2025-02-28".to_string(), 0.10)],
+            "an empty fetch must not erase real history"
+        );
+    }
+
+    /// Yahoo repeats some distributions on adjacent days with an identical
+    /// amount — one payment described twice. Paid into the cash ledger as-is,
+    /// the holder is credited double.
+    #[test]
+    fn duplicate_dividend_reports_collapse_to_the_earliest() {
+        let ev = |ex_date: &str, amount: f64| DividendEvent {
+            symbol: "VAE.AX".to_string(),
+            ex_date: NaiveDate::parse_from_str(ex_date, "%Y-%m-%d").unwrap(),
+            payment_date: None,
+            record_date: None,
+            amount,
+            fetched_at: "x".to_string(),
+        };
+        let dates = |events: Vec<DividendEvent>| -> Vec<String> {
+            events.iter().map(|e| e.ex_date.format("%Y-%m-%d").to_string()).collect()
+        };
+
+        // The real VAE.AX case: 86400 apart, identical to six decimals.
+        assert_eq!(
+            dates(dedupe_dividend_events(&[ev("2025-07-02", 0.677876), ev("2025-07-01", 0.677876)])),
+            vec!["2025-07-01"],
+            "the earlier date is the true ex-date"
+        );
+        // Also seen three days apart.
+        assert_eq!(
+            dates(dedupe_dividend_events(&[ev("2024-10-01", 0.72522), ev("2024-10-04", 0.72522)])),
+            vec!["2024-10-01"]
+        );
+        // Quarterly distributions of the same size must survive — far apart.
+        assert_eq!(
+            dates(dedupe_dividend_events(&[ev("2025-01-02", 0.5), ev("2025-04-01", 0.5)])).len(),
+            2,
+            "a genuine repeat months later is not a duplicate"
+        );
+        // Different amounts on adjacent days are two real events.
+        assert_eq!(
+            dates(dedupe_dividend_events(&[ev("2025-07-01", 0.10), ev("2025-07-02", 0.25)])).len(),
+            2
+        );
     }
 
     fn insert_dividend_event(db_path: &PathBuf, ex_date: &str, amount: f64) {
@@ -5441,6 +8162,8 @@ mod tests {
             original_price: None,
             fx_rate: None,
             custom_fields: None,
+            cash_account_id: None,
+            withholding_amount: None,
             confirm: None,
         };
 
@@ -5474,6 +8197,8 @@ mod tests {
             original_price: None,
             fx_rate: None,
             custom_fields: None,
+            cash_account_id: None,
+            withholding_amount: None,
             confirm: None,
         };
 
@@ -5594,8 +8319,19 @@ mod tests {
         assert_eq!(result, Some((9.0, true)));
     }
 
+    fn insert_ohlc(db_path: &PathBuf, symbol: &str, date: &str, high: f64, close: f64) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO prices (symbol, date, high, close, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![symbol, date, high, close, "2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+    }
+
+    /// Bars written before OHLC ingest existed have a NULL high, so the peak
+    /// falls back to the close for those rows rather than skipping them.
     #[test]
-    fn trailing_uses_highest_close_since_placement_date() {
+    fn trailing_falls_back_to_close_when_high_is_missing() {
         let (_file, db_path) = setup_test_db();
         insert_price(&db_path, "TST.AX", "2026-05-01", 20.0); // before placement — excluded
         insert_price(&db_path, "TST.AX", "2026-05-12", 12.0);
@@ -5607,6 +8343,52 @@ mod tests {
         let (sl, trailing) = result.unwrap();
         assert!((sl - 10.8).abs() < 1e-9, "expected 10.8, got {sl}");
         assert!(trailing);
+    }
+
+    /// A trailing stop ratchets on the highest price *reached*, which is what a
+    /// broker trails on. This is the TXG case: an intraday spike to 60.69 that
+    /// closed back at 58.48 must still lift the stop.
+    #[test]
+    fn trailing_uses_intraday_high_not_the_close() {
+        let (_file, db_path) = setup_test_db();
+        insert_ohlc(&db_path, "TST.AX", "2026-06-10", 52.22, 52.03);
+        insert_ohlc(&db_path, "TST.AX", "2026-06-11", 59.87, 58.57);
+        insert_ohlc(&db_path, "TST.AX", "2026-06-12", 60.69, 58.48); // spiked, gave it back
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "15"), ("trailing_sell_date", "2026-06-09")]);
+
+        let (sl, trailing) = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(58.48), |p| p).unwrap();
+        assert!(trailing);
+        // Peak 60.69 × 0.85 = 51.5865, matching the broker — not 58.57 × 0.85 = 49.78
+        assert!((sl - 51.5865).abs() < 1e-4, "expected ~51.59 from the high, got {sl}");
+        assert!(sl > 58.57 * 0.85, "must not trail the highest close");
+    }
+
+    /// Mixed history: a backfilled bar with a high and a legacy close-only bar
+    /// whose close beats every recorded high.
+    #[test]
+    fn trailing_peak_spans_bars_with_and_without_highs() {
+        let (_file, db_path) = setup_test_db();
+        insert_ohlc(&db_path, "TST.AX", "2026-05-12", 11.0, 10.0);
+        insert_price(&db_path, "TST.AX", "2026-05-13", 12.0); // no high; close is the peak
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "2026-05-10")]);
+
+        let (sl, _) = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(9.0), |p| p).unwrap();
+        assert!((sl - 10.8).abs() < 1e-9, "peak should be 12.0 from the close-only bar, got stop {sl}");
+    }
+
+    /// The live price still counts: an intraday move above every stored bar
+    /// lifts the stop immediately rather than waiting for the bar to land.
+    #[test]
+    fn trailing_peak_includes_the_live_price() {
+        let (_file, db_path) = setup_test_db();
+        insert_ohlc(&db_path, "TST.AX", "2026-05-12", 11.0, 10.5);
+        let conn = open_db(&db_path).unwrap();
+        let fields = sym_fields(&[("trailing_sell_pct", "10"), ("trailing_sell_date", "2026-05-10")]);
+
+        let (sl, _) = effective_stop_loss(&conn, "TST.AX", Some(&fields), Some(20.0), |p| p).unwrap();
+        assert!((sl - 18.0).abs() < 1e-9, "live 20.0 should set the peak, got stop {sl}");
     }
 
     #[test]
@@ -5833,6 +8615,94 @@ mod tests {
         v.as_f64().map(|f| (f - expected).abs() < 1e-6).unwrap_or(false)
     }
 
+    /// Re-point the stop_losses list at a smaller limit so the truncate is the
+    /// thing under test.
+    fn set_stop_loss_limit(db_path: &std::path::Path, limit: usize) {
+        let conn = open_db(&db_path.to_path_buf()).unwrap();
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('dashboard_custom_lists', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![format!(
+                "[{{\"key\":\"stop_losses\",\"label\":\"Stop Losses\",\"source\":\"holdings\",\"field_key\":\"holdings:stop_loss\",\"operator\":\"pct_below\",\"limit\":{}}}]",
+                limit
+            )],
+        )
+        .unwrap();
+    }
+
+    fn stop_loss_list(body: &serde_json::Value) -> &serde_json::Value {
+        body["custom_lists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["key"] == "stop_losses")
+            .expect("stop_losses list missing")
+    }
+
+    /// The whole point of sorting server-side: the list is ranked *then* cut to
+    /// `limit`, so flipping the direction must change which rows survive — not
+    /// just their order. Reversing client-side could never surface the row that
+    /// fell outside the cut (the TXG case).
+    #[actix_web::test]
+    async fn list_sort_override_changes_which_rows_survive_the_limit() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        // Two qualifying holdings: TRL.AX at +3.7%, MAN.AX at +33.33%.
+        set_stop_loss_limit(&db_path, 1);
+
+        // Ascending (the default) keeps the row closest to triggering.
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = stop_loss_list(&body);
+        let entries = list["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["symbol"], "TRL.AX");
+        assert_eq!(list["sort"], "asc");
+        assert_eq!(list["truncated"], true, "a row was cut, so the list is truncated");
+
+        // Descending re-ranks before the cut and surfaces the other row.
+        let body = get_json(&db_path, "/api/portfolio/overview?list_sort=stop_losses:desc").await;
+        let list = stop_loss_list(&body);
+        let entries = list["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["symbol"], "MAN.AX",
+            "desc must surface the furthest-from-trigger row, which asc cut"
+        );
+        assert_eq!(list["sort"], "desc");
+    }
+
+    #[actix_web::test]
+    async fn list_sort_override_is_scoped_and_fails_safe() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        set_stop_loss_limit(&db_path, 1);
+
+        // An override naming a different list must not affect stop_losses
+        let body = get_json(&db_path, "/api/portfolio/overview?list_sort=some_other_list:desc").await;
+        assert_eq!(stop_loss_list(&body)["entries"][0]["symbol"], "TRL.AX");
+
+        // Malformed values degrade to the configured order rather than erroring
+        for uri in [
+            "/api/portfolio/overview?list_sort=stop_losses:sideways",
+            "/api/portfolio/overview?list_sort=stop_losses",
+            "/api/portfolio/overview?list_sort=",
+        ] {
+            let body = get_json(&db_path, uri).await;
+            let list = stop_loss_list(&body);
+            assert_eq!(list["entries"][0]["symbol"], "TRL.AX", "{uri} should fall back to configured order");
+            assert_eq!(list["sort"], "asc");
+        }
+    }
+
+    #[test]
+    fn parse_list_sort_accepts_only_valid_directions() {
+        let parsed = parse_list_sort(Some("a:desc, b:ASC ,c:nonsense,d,:desc,e:"));
+        assert_eq!(parsed.get("a").map(String::as_str), Some("desc"));
+        assert_eq!(parsed.get("b").map(String::as_str), Some("asc"), "whitespace and case tolerated");
+        assert!(!parsed.contains_key("c"));
+        assert!(!parsed.contains_key("d"));
+        assert!(!parsed.contains_key("e"));
+        assert!(parse_list_sort(None).is_empty());
+    }
+
     #[actix_web::test]
     async fn holdings_endpoint_reports_positions_and_stop_losses() {
         let (_file, db_path) = seed_portfolio_fixture();
@@ -5939,6 +8809,1452 @@ mod tests {
         assert!(close_to(&totals["total_invested"], 2060.0));
         assert!(close_to(&totals["total_sl_dollar"], 250.0), "−100 + 350 + 0");
         assert!(close_to(&totals["total_sl_pct"], 250.0 / 2060.0 * 100.0));
+    }
+
+    /// "30d High" must be the highest price *reached*, not the highest close.
+    /// RMS.AX touched 3.79 on a day it closed at 3.67 — reporting 3.70 put a
+    /// real purchase at 3.76 above the stock's own 30-day high.
+    #[actix_web::test]
+    async fn high30d_uses_intraday_highs() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        {
+            let conn = open_db(&db_path).unwrap();
+            // A bar that spiked well above every close in the window
+            conn.execute(
+                "INSERT INTO prices (symbol, date, high, close, fetched_at)
+                 VALUES ('MAN.AX', '2026-07-02', 15.5, 11.0, '2026-07-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let body = get_json(&db_path, "/api/portfolio/risk").await;
+        let man = find(&body["rows"], "MAN.AX");
+        assert!(
+            close_to(&man["high30d"], 15.5),
+            "expected the intraday high 15.5, got {:?}",
+            man["high30d"]
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Portfolio value over time
+    // -------------------------------------------------------------------------
+
+    fn seed_close(conn: &Connection, symbol: &str, date: &str, close: f64) {
+        conn.execute(
+            "INSERT OR REPLACE INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, 'x')",
+            params![symbol, date, close],
+        )
+        .unwrap();
+    }
+
+    fn history_on(series: &[portfolio::DailyValue], date: &str) -> portfolio::DailyValue {
+        series.iter().find(|p| p.date == date).unwrap_or_else(|| panic!("no point for {date}")).clone()
+    }
+
+    /// Shares are valued at the day's close and carried across non-trading days.
+    #[test]
+    fn history_values_holdings_at_each_day_close() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        seed_cash_account(&db_path, 1, "Settlement AUD", "AUD");
+        conn.execute(
+            "INSERT INTO cash_transactions (account_id, date, amount, kind, created_at)
+             VALUES (1, '2026-03-02', 1000.0, 'deposit', 'x')",
+            [],
+        )
+        .unwrap();
+
+        let mut buy = trade_payload("BHP.AX", "purchase", 10.0, 40.0);
+        buy.date = "2026-03-02".to_string();
+        buy.cash_account_id = Some(1);
+        insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+
+        seed_close(&conn, "BHP.AX", "2026-03-02", 40.0);
+        seed_close(&conn, "BHP.AX", "2026-03-03", 44.0);
+        // No bar on the 4th — the last close carries forward
+
+        let series = build_portfolio_history(&conn, None, Some("2026-03-04")).unwrap();
+        let d2 = history_on(&series, "2026-03-02");
+        assert!((d2.stocks - 400.0).abs() < 1e-9, "stocks {}", d2.stocks);
+        assert!((d2.cash - 600.0).abs() < 1e-9, "cash {}", d2.cash); // 1000 deposited − 400 spent
+        assert!((d2.flow - 1000.0).abs() < 1e-9, "only the deposit is a flow");
+
+        let d3 = history_on(&series, "2026-03-03");
+        assert!((d3.stocks - 440.0).abs() < 1e-9);
+        assert!(d3.flow.abs() < 1e-9, "a price rise is not a flow");
+        assert!((history_on(&series, "2026-03-04").stocks - 440.0).abs() < 1e-9, "close carries forward");
+    }
+
+    /// A trade with no cash leg is externally funded — every transaction
+    /// recorded before the ledger existed is in that state, and without this
+    /// the shares would look like value appearing from nowhere.
+    #[test]
+    fn trades_without_a_cash_leg_count_as_external_funding() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+
+        let mut buy = trade_payload("BHP.AX", "purchase", 10.0, 40.0);
+        buy.date = "2026-03-02".to_string();
+        buy.brokerage = Some(9.5);
+        insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        seed_close(&conn, "BHP.AX", "2026-03-02", 40.0);
+        seed_close(&conn, "BHP.AX", "2026-03-03", 44.0);
+
+        let series = build_portfolio_history(&conn, None, Some("2026-03-03")).unwrap();
+        let funded = history_on(&series, "2026-03-02");
+        assert!((funded.flow - 409.5).abs() < 1e-9, "cost plus brokerage entered the portfolio");
+        assert!((funded.total() - 400.0).abs() < 1e-9);
+
+        // The purchase must not register as a gain, only the later price rise
+        let twr = portfolio::time_weighted_return(&series).unwrap();
+        assert!((twr - 0.10).abs() < 1e-9, "expected +10%, got {}", twr * 100.0);
+    }
+
+    /// Foreign holdings and foreign cash are both converted at the day's rate.
+    #[test]
+    fn history_converts_foreign_holdings_and_cash_to_aud() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('AAPL', 'USD', 'x')",
+            [],
+        )
+        .unwrap();
+        seed_cash_account(&db_path, 1, "Settlement USD", "USD");
+        conn.execute(
+            "INSERT INTO cash_transactions (account_id, date, amount, kind, created_at)
+             VALUES (1, '2026-03-02', 500.0, 'deposit', 'x')",
+            [],
+        )
+        .unwrap();
+
+        let mut buy = trade_payload("AAPL", "purchase", 10.0, 150.0);
+        buy.date = "2026-03-02".to_string();
+        buy.currency = Some("USD".to_string());
+        buy.original_price = Some(100.0);
+        buy.fx_rate = Some(1.5);
+        buy.cash_account_id = Some(1);
+        insert_holding_transaction(&db_path, "AAPL", buy).unwrap();
+
+        seed_close(&conn, "AAPL", "2026-03-02", 100.0); // USD close
+        seed_close(&conn, "USDAUD=X", "2026-03-02", 1.5);
+
+        let day = history_on(&build_portfolio_history(&conn, None, Some("2026-03-02")).unwrap(), "2026-03-02");
+        // 10 shares × US$100 × 1.5
+        assert!((day.stocks - 1500.0).abs() < 1e-9, "stocks {}", day.stocks);
+        // US$500 deposited − US$1,000 spent = −US$500, at 1.5
+        assert!((day.cash - -750.0).abs() < 1e-9, "cash {}", day.cash);
+        assert!((day.flow - 750.0).abs() < 1e-9, "the US$500 deposit in AUD");
+    }
+
+    /// An account marked out of the portfolio contributes neither value nor flow.
+    #[test]
+    fn history_excludes_accounts_not_in_the_portfolio() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        seed_cash_account(&db_path, 1, "Invested AUD", "AUD");
+        conn.execute(
+            "INSERT INTO cash_accounts (id, name, currency, include_in_portfolio, created_at)
+             VALUES (2, 'Everyday AUD', 'AUD', 0, 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO cash_transactions (account_id, date, amount, kind, created_at) VALUES (1, '2026-03-02', 1000.0, 'deposit', 'x');
+             INSERT INTO cash_transactions (account_id, date, amount, kind, created_at) VALUES (2, '2026-03-02', 9999.0, 'deposit', 'x');",
+        )
+        .unwrap();
+
+        let day = history_on(&build_portfolio_history(&conn, None, Some("2026-03-02")).unwrap(), "2026-03-02");
+        assert!((day.cash - 1000.0).abs() < 1e-9, "excluded account leaked in: {}", day.cash);
+        assert!((day.flow - 1000.0).abs() < 1e-9);
+    }
+
+    /// Transactions before `from` set the opening position rather than being
+    /// dropped, so a windowed request still values what is actually held.
+    #[test]
+    fn history_window_carries_the_opening_position() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let mut buy = trade_payload("BHP.AX", "purchase", 10.0, 40.0);
+        buy.date = "2026-03-01".to_string();
+        insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        seed_close(&conn, "BHP.AX", "2026-03-01", 40.0);
+        seed_close(&conn, "BHP.AX", "2026-03-05", 50.0);
+
+        // The anchor (4 Mar) plus the requested day (5 Mar)
+        let series = build_portfolio_history(&conn, Some("2026-03-05"), Some("2026-03-05")).unwrap();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].date, "2026-03-04", "element 0 is the anchor day");
+        assert!((series[1].stocks - 500.0).abs() < 1e-9, "shares bought before the window still count");
+        assert!(series[1].flow.abs() < 1e-9, "an earlier purchase is not a flow inside this window");
+    }
+
+    /// The books must balance: opening + contributions + gain = end value.
+    /// Before the anchor existed the first day's purchase was counted twice —
+    /// once in the opening value and again as a contribution.
+    #[test]
+    fn history_accounting_reconciles_from_an_empty_start() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let mut buy = trade_payload("BHP.AX", "purchase", 10.0, 40.0);
+        buy.date = "2026-03-02".to_string();
+        insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        seed_close(&conn, "BHP.AX", "2026-03-02", 40.0);
+        seed_close(&conn, "BHP.AX", "2026-03-03", 44.0);
+
+        let series = build_portfolio_history(&conn, None, Some("2026-03-03")).unwrap();
+        let opening = series[0].total();
+        let window = &series[1..];
+        let contributions = portfolio::net_contributions(window);
+        let end = window.last().unwrap().total();
+        let gain = end - opening - contributions;
+
+        assert!(opening.abs() < 1e-9, "nothing was held before the first trade");
+        assert!((contributions - 400.0).abs() < 1e-9);
+        assert!((gain - 40.0).abs() < 1e-9, "the 10% rise on $400");
+        assert!((opening + contributions + gain - end).abs() < 1e-9, "books must balance");
+    }
+
+    /// A delisted holding keeps its last close forever otherwise, quietly
+    /// misstating the portfolio from the day it stopped trading. The manual
+    /// price only applies once real bars run out — history stays real.
+    #[test]
+    fn history_uses_a_manual_price_once_the_bars_stop() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let mut buy = trade_payload("DEAD.AX", "purchase", 10.0, 100.0);
+        buy.date = "2026-03-01".to_string();
+        insert_holding_transaction(&db_path, "DEAD.AX", buy).unwrap();
+        seed_close(&conn, "DEAD.AX", "2026-03-01", 100.0);
+        seed_close(&conn, "DEAD.AX", "2026-03-02", 90.0); // last ever bar
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('manual_price_DEAD.AX', '120.5')",
+            [],
+        )
+        .unwrap();
+
+        let series = build_portfolio_history(&conn, None, Some("2026-03-04")).unwrap();
+        // Real bars are untouched
+        assert!((history_on(&series, "2026-03-01").stocks - 1000.0).abs() < 1e-9);
+        assert!((history_on(&series, "2026-03-02").stocks - 900.0).abs() < 1e-9);
+        // Past the last bar the manual valuation takes over
+        assert!((history_on(&series, "2026-03-03").stocks - 1205.0).abs() < 1e-9);
+        assert!((history_on(&series, "2026-03-04").stocks - 1205.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn history_is_empty_without_any_transactions() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        assert!(build_portfolio_history(&conn, None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_rejects_a_backwards_range() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let mut buy = trade_payload("BHP.AX", "purchase", 1.0, 1.0);
+        buy.date = "2026-03-01".to_string();
+        insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        assert!(build_portfolio_history(&conn, Some("2026-03-05"), Some("2026-03-01")).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Cash ledger write paths
+    // -------------------------------------------------------------------------
+
+    fn seed_cash_account(db_path: &PathBuf, id: i64, name: &str, currency: &str) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO cash_accounts (id, name, currency, include_in_portfolio, created_at)
+             VALUES (?1, ?2, ?3, 1, 'x')",
+            params![id, name, currency],
+        )
+        .unwrap();
+    }
+
+    fn trade_payload(symbol: &str, tx_type: &str, qty: f64, price: f64) -> NewHoldingTransaction {
+        NewHoldingTransaction {
+            symbol: symbol.to_string(),
+            transaction_type: tx_type.to_string(),
+            date: "2026-02-02".to_string(),
+            quantity: Some(qty),
+            price: Some(price),
+            amount: None,
+            brokerage: None,
+            notes: None,
+            currency: None,
+            original_price: None,
+            fx_rate: None,
+            custom_fields: None,
+            cash_account_id: None,
+            withholding_amount: None,
+            confirm: None,
+        }
+    }
+
+    fn cash_legs(db_path: &PathBuf, holding_tx_id: i64) -> Vec<(f64, String, i64)> {
+        let conn = open_db(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT amount, kind, account_id FROM cash_transactions WHERE holding_tx_id = ?1")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![holding_tx_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// A buy takes cash out including brokerage; a sale puts it back net of it.
+    #[test]
+    fn trade_writes_a_settlement_leg_in_the_right_direction() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement AUD", "AUD");
+
+        let mut buy = trade_payload("BHP.AX", "purchase", 100.0, 10.0);
+        buy.brokerage = Some(9.5);
+        buy.cash_account_id = Some(1);
+        let bought = insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        assert_eq!(cash_legs(&db_path, bought.id), vec![(-1009.5, "trade_buy".to_string(), 1)]);
+
+        let mut sell = trade_payload("BHP.AX", "sale", 50.0, 12.0);
+        sell.brokerage = Some(9.5);
+        sell.cash_account_id = Some(1);
+        let sold = insert_holding_transaction(&db_path, "BHP.AX", sell).unwrap();
+        assert_eq!(cash_legs(&db_path, sold.id), vec![(590.5, "trade_sell".to_string(), 1)]);
+
+        // Balance is derived, never stored
+        let conn = open_db(&db_path).unwrap();
+        assert!((cash_balance(&conn, 1, None) - (-419.0)).abs() < 1e-9);
+    }
+
+    /// A trade naming no account leaves the ledger alone — which is every one
+    /// of the transactions recorded before the ledger existed.
+    #[test]
+    fn trade_without_an_account_writes_no_leg() {
+        let (_file, db_path) = setup_test_db();
+        let record = insert_holding_transaction(&db_path, "BHP.AX", trade_payload("BHP.AX", "purchase", 10.0, 5.0)).unwrap();
+        assert!(cash_legs(&db_path, record.id).is_empty());
+    }
+
+    /// Editing a trade must move its cash with it, and clearing the account
+    /// must remove the leg rather than strand a stale one.
+    #[test]
+    fn editing_a_trade_rewrites_its_leg_and_clearing_the_account_removes_it() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement AUD", "AUD");
+        seed_cash_account(&db_path, 2, "Other AUD", "AUD");
+
+        let mut buy = trade_payload("BHP.AX", "purchase", 100.0, 10.0);
+        buy.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        assert_eq!(cash_legs(&db_path, record.id), vec![(-1000.0, "trade_buy".to_string(), 1)]);
+
+        // Re-price and move to the other account
+        let mut edit = trade_payload("BHP.AX", "purchase", 100.0, 11.0);
+        edit.cash_account_id = Some(2);
+        modify_holding_transaction(&db_path, record.id, "BHP.AX", edit).unwrap();
+        assert_eq!(cash_legs(&db_path, record.id), vec![(-1100.0, "trade_buy".to_string(), 2)]);
+
+        // Detaching the account withdraws the trade from the ledger entirely
+        let detach = trade_payload("BHP.AX", "purchase", 100.0, 11.0);
+        modify_holding_transaction(&db_path, record.id, "BHP.AX", detach).unwrap();
+        assert!(cash_legs(&db_path, record.id).is_empty());
+    }
+
+    /// Deleting the trade takes its cash movement with it; leaving one behind
+    /// would silently misstate every later balance.
+    #[test]
+    fn deleting_a_trade_removes_its_leg() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement AUD", "AUD");
+        let mut buy = trade_payload("BHP.AX", "purchase", 100.0, 10.0);
+        buy.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+
+        assert!(remove_holding_transaction(&db_path, record.id).unwrap());
+        assert!(cash_legs(&db_path, record.id).is_empty());
+        let conn = open_db(&db_path).unwrap();
+        assert_eq!(cash_balance(&conn, 1, None), 0.0);
+    }
+
+    /// Brokerage is stored in AUD, so a foreign settlement has to convert it
+    /// back or the leg would mix two currencies in one number.
+    #[test]
+    fn foreign_trade_settles_in_native_currency_including_brokerage() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement USD", "USD");
+
+        let mut buy = trade_payload("AAPL", "purchase", 10.0, 150.0);
+        buy.currency = Some("USD".to_string());
+        buy.original_price = Some(100.0); // USD
+        buy.fx_rate = Some(1.5); // 1 USD = 1.5 AUD
+        buy.brokerage = Some(15.0); // AUD
+        buy.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "AAPL", buy).unwrap();
+
+        // 10 × US$100 plus US$10 of brokerage (A$15 ÷ 1.5)
+        assert_eq!(cash_legs(&db_path, record.id), vec![(-1010.0, "trade_buy".to_string(), 1)]);
+    }
+
+    /// A dividend credits the account it is paid into, and does so on the
+    /// payment date rather than the ex-date it is filed under — crediting on
+    /// the ex-date would show the money weeks before it arrived.
+    #[test]
+    fn dividend_settles_on_its_payment_date() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO dividend_events (symbol, ex_date, payment_date, amount, fetched_at)
+                 VALUES ('SUL.AX', '2026-03-12', '2026-04-08', 0.64, 'x')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut div = trade_payload("SUL.AX", "dividend", 200.0, 0.64);
+        div.amount = Some(128.0);
+        div.date = "2026-03-12".to_string();
+        div.cash_account_id = Some(1);
+
+        let record = insert_holding_transaction(&db_path, "SUL.AX", div).expect("dividend is allowed");
+        assert_eq!(cash_legs(&db_path, record.id), vec![(128.0, "dividend".to_string(), 1)]);
+
+        let conn = open_db(&db_path).unwrap();
+        let date: String = conn
+            .query_row("SELECT date FROM cash_transactions WHERE holding_tx_id = ?1", params![record.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(date, "2026-04-08", "cash should land on the payment date, not the ex-date");
+    }
+
+    /// US-domiciled funds withhold tax before the cash arrives, and Yahoo
+    /// reports the gross distribution, so crediting Yahoo's figure banks money
+    /// that never landed. The tax is booked as its own leg rather than netted
+    /// away, because the amount withheld is needed at tax time.
+    #[test]
+    fn dividend_withholding_is_recorded_as_its_own_leg() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO symbol_info (symbol, dividend_withholding_pct, updated_at)
+                 VALUES ('VEU.AX', 30.0, 'x')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut div = trade_payload("VEU.AX", "dividend", 22.0, 0.5644);
+        div.amount = Some(12.42); // gross, as Yahoo reports it
+        div.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "VEU.AX", div).expect("dividend is allowed");
+
+        let mut legs = cash_legs(&db_path, record.id);
+        legs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        assert_eq!(
+            legs,
+            vec![(12.42, "dividend".to_string(), 1), (-3.73, "fee".to_string(), 1)],
+            "gross credited, withholding taken out separately"
+        );
+        // The bank credited 8.69 — the two legs must sum to exactly that.
+        assert!((legs.iter().map(|l| l.0).sum::<f64>() - 8.69).abs() < 0.005);
+    }
+
+    fn insert_dividend_event_for(db_path: &PathBuf, symbol: &str, ex_date: &str, amount: f64) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO dividend_events (symbol, ex_date, amount, fetched_at)
+             VALUES (?1, ?2, ?3, 'x')",
+            params![symbol, ex_date, amount],
+        )
+        .unwrap();
+    }
+
+    fn seed_dividend_setup(db_path: &PathBuf, currency: &str, account: i64) {
+        seed_cash_account(db_path, account, "Dividend Account", currency);
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES (?1, ?2)",
+            params![format!("dividend_account_{}", currency), account.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn seed_holding(db_path: &PathBuf, symbol: &str, date: &str, qty: f64, currency: &str) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, currency, created_at)
+             VALUES (?1, 'purchase', ?2, ?3, 10.0, ?4, 'x')",
+            params![symbol, date, qty, currency],
+        )
+        .unwrap();
+    }
+
+    fn dividend_rows(db_path: &PathBuf, symbol: &str) -> Vec<(String, f64)> {
+        let conn = open_db(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT date, amount FROM holdings_transactions WHERE symbol = ?1 AND transaction_type = 'dividend' ORDER BY date")
+            .unwrap();
+        let rows = stmt.query_map(params![symbol], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// A fetched event should reach the cash ledger by itself. Before this, it
+    /// sat in the Transactions screen as a derived row with no account until
+    /// someone remembered to run a script.
+    #[test]
+    fn a_fetched_dividend_is_recorded_and_settled_automatically() {
+        let (_file, db_path) = setup_test_db();
+        seed_dividend_setup(&db_path, "AUD", 1);
+        seed_holding(&db_path, "VAS.AX", "2026-01-05", 40.0, "AUD");
+        insert_dividend_event_for(&db_path, "VAS.AX", "2026-04-01", 0.65);
+
+        let result = record_new_dividends(&db_path).unwrap();
+        assert_eq!(result.recorded, 1);
+        assert_eq!(dividend_rows(&db_path, "VAS.AX"), vec![("2026-04-01".to_string(), 26.0)]);
+
+        let conn = open_db(&db_path).unwrap();
+        let leg: (f64, String) = conn
+            .query_row(
+                "SELECT c.amount, c.kind FROM cash_transactions c
+                   JOIN holdings_transactions h ON h.id = c.holding_tx_id
+                  WHERE h.symbol = 'VAS.AX'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(leg, (26.0, "dividend".to_string()));
+    }
+
+    /// Running twice must not pay the holder twice.
+    #[test]
+    fn recording_dividends_is_idempotent() {
+        let (_file, db_path) = setup_test_db();
+        seed_dividend_setup(&db_path, "AUD", 1);
+        seed_holding(&db_path, "VAS.AX", "2026-01-05", 40.0, "AUD");
+        insert_dividend_event_for(&db_path, "VAS.AX", "2026-04-01", 0.65);
+
+        assert_eq!(record_new_dividends(&db_path).unwrap().recorded, 1);
+        let second = record_new_dividends(&db_path).unwrap();
+        assert_eq!(second.recorded, 0);
+        assert_eq!(second.already_present, 0, "the query filters them out before counting");
+        assert_eq!(dividend_rows(&db_path, "VAS.AX").len(), 1);
+    }
+
+    /// Deleting a dividend means "not this one". Automatic recording would
+    /// otherwise reinstate it on the next refresh and the deletion would look
+    /// like it had silently failed.
+    #[test]
+    fn a_deleted_dividend_is_not_recreated_by_the_next_refresh() {
+        let (_file, db_path) = setup_test_db();
+        seed_dividend_setup(&db_path, "AUD", 1);
+        seed_holding(&db_path, "NDQ.AX", "2025-01-02", 60.0, "AUD");
+        insert_dividend_event_for(&db_path, "NDQ.AX", "2025-01-02", 0.028393);
+
+        record_new_dividends(&db_path).unwrap();
+        let id: i64 = {
+            let conn = open_db(&db_path).unwrap();
+            conn.query_row(
+                "SELECT id FROM holdings_transactions WHERE symbol = 'NDQ.AX' AND transaction_type = 'dividend'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(remove_holding_transaction(&db_path, id).unwrap());
+
+        let after = record_new_dividends(&db_path).unwrap();
+        assert_eq!(after.recorded, 0, "a declined dividend must stay declined");
+        assert_eq!(after.excluded, 1);
+        assert!(dividend_rows(&db_path, "NDQ.AX").is_empty());
+    }
+
+    /// Entitlement follows the shares held at the ex-date.
+    #[test]
+    fn dividends_before_the_holding_existed_are_not_recorded() {
+        let (_file, db_path) = setup_test_db();
+        seed_dividend_setup(&db_path, "AUD", 1);
+        seed_holding(&db_path, "VAS.AX", "2026-01-05", 40.0, "AUD");
+        insert_dividend_event_for(&db_path, "VAS.AX", "2025-06-01", 0.65);
+
+        assert_eq!(record_new_dividends(&db_path).unwrap().recorded, 0);
+        assert!(dividend_rows(&db_path, "VAS.AX").is_empty());
+    }
+
+    /// With no destination configured, guessing would move real money to the
+    /// wrong account — so nothing is recorded and the currency is reported.
+    #[test]
+    fn dividends_in_an_unconfigured_currency_are_left_alone() {
+        let (_file, db_path) = setup_test_db();
+        seed_dividend_setup(&db_path, "AUD", 1); // AUD configured, USD not
+        seed_holding(&db_path, "NSC", "2026-01-05", 4.0, "USD");
+        insert_dividend_event_for(&db_path, "NSC", "2026-04-01", 1.35);
+
+        let result = record_new_dividends(&db_path).unwrap();
+        assert_eq!(result.recorded, 0);
+        assert_eq!(result.unconfigured_currencies, vec!["USD".to_string()]);
+        assert!(dividend_rows(&db_path, "NSC").is_empty());
+    }
+
+    /// Yahoo reports a delisted symbol as `regularMarketPrice: 0.0`, not null,
+    /// so a presence check accepts it. Cached as a real quote it marks the
+    /// holding worthless, and written to history it overwrites a good close
+    /// with zero — losing the last price the symbol ever traded at.
+    #[test]
+    fn a_delisted_symbols_zero_quote_never_replaces_a_real_price() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('DEAD.AX', '2026-07-17', 355.89, 'x')",
+            [],
+        )
+        .unwrap();
+
+        let good = CurrentPrice {
+            symbol: "DEAD.AX".to_string(),
+            price: Some(355.89),
+            change: None,
+            change_percent: None,
+            volume: None,
+            day_open: None,
+            day_high: None,
+            day_low: None,
+            last_updated: "2026-07-17T00:00:00Z".to_string(),
+            price_date: Some("2026-07-17".to_string()),
+            error: None,
+        };
+        cache_current_price(&conn, &good).unwrap();
+        // The symbol stops trading; every later fetch answers zero.
+        let dead = CurrentPrice { price: Some(0.0), ..good };
+        cache_current_price(&conn, &dead).unwrap();
+        persist_price_to_history(&conn, "DEAD.AX", &dead, "y");
+
+        let cached: f64 = conn
+            .query_row("SELECT price FROM cached_current_prices WHERE symbol = 'DEAD.AX'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 355.89, "the last good quote must survive a zero");
+
+        let close: f64 = conn
+            .query_row("SELECT close FROM prices WHERE symbol = 'DEAD.AX' AND date = '2026-07-17'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(close, 355.89, "a zero must not overwrite a real close");
+
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE symbol = 'DEAD.AX' AND level = 'warn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(warnings >= 2, "both the cache and the history refusal must be logged, got {warnings}");
+    }
+
+    /// Only a positive, finite number is a price.
+    #[test]
+    fn usable_quotes_exclude_zero_negative_and_nan() {
+        assert!(is_usable_quote(Some(0.01)));
+        assert!(!is_usable_quote(Some(0.0)), "a delisted symbol's zero");
+        assert!(!is_usable_quote(Some(-1.0)));
+        assert!(!is_usable_quote(Some(f64::NAN)));
+        assert!(!is_usable_quote(None));
+    }
+
+    /// A table keyed by ticker that the rename does not know about strands its
+    /// rows under the old name — price history stops, dividends vanish, the
+    /// watchlist entry orphans. Nothing fails loudly when that happens, so the
+    /// schema is enumerated here and every symbol-keyed table must be either
+    /// migrated or deliberately excluded.
+    #[test]
+    fn every_symbol_keyed_table_is_either_migrated_or_excluded() {
+        // Rewriting a historical log would falsify what it recorded.
+        const EXCLUDED: &[&str] = &["event_log"];
+
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        for table in tables {
+            let has_symbol = {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table)).unwrap();
+                let cols = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+                cols.filter_map(|r| r.ok()).any(|c| c == "symbol")
+            };
+            if !has_symbol {
+                continue;
+            }
+            assert!(
+                SYMBOL_KEYED_TABLES.contains(&table.as_str()) || EXCLUDED.contains(&table.as_str()),
+                "`{}` has a symbol column but a rename neither moves it nor documents why not — \
+                 add it to SYMBOL_KEYED_TABLES, or to the exclusions with a reason",
+                table
+            );
+        }
+
+        // The reverse direction catches a typo'd or dropped table name. Legacy
+        // tables are exempt: `watchlist_prices` still exists in databases from
+        // older versions, holding rows that must follow a rename, but `init_db`
+        // no longer creates it — so it is absent here and skipped at runtime.
+        const LEGACY: &[&str] = &["watchlist_prices"];
+        for table in SYMBOL_KEYED_TABLES {
+            if LEGACY.contains(table) {
+                continue;
+            }
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "SYMBOL_KEYED_TABLES names `{}`, which does not exist", table);
+        }
+    }
+
+    /// The rename has to carry rows in every symbol-keyed table, not just the
+    /// holdings ones — a stranded price series or watchlist entry is invisible
+    /// until someone notices the chart is empty.
+    #[test]
+    fn renaming_a_symbol_moves_rows_in_every_table() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, currency, created_at)
+                     VALUES ('OLD.AX', 'purchase', '2026-01-05', 10.0, 5.0, 'AUD', 'x');
+                 INSERT INTO symbol_info (symbol, currency, dividend_withholding_pct, updated_at)
+                     VALUES ('OLD.AX', 'AUD', 30.0, 'x');
+                 INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('OLD.AX', '2026-01-05', 5.0, 'x');
+                 INSERT INTO dividend_events (symbol, ex_date, amount, fetched_at)
+                     VALUES ('OLD.AX', '2026-02-01', 0.25, 'x');
+                 INSERT INTO cached_current_prices (symbol, price, last_updated) VALUES ('OLD.AX', 6.0, 'x');
+                 INSERT INTO watchlist_symbols (symbol, updated_at) VALUES ('OLD.AX', 'x');
+                 INSERT INTO watchlist_memberships (symbol, list_name, added_at) VALUES ('OLD.AX', 'Main', 'x');",
+            )
+            .unwrap();
+        }
+
+        let moved = rename_holdings_symbol(&db_path, "OLD.AX", "NEW.AX").expect("rename succeeds");
+        assert_eq!(moved, 1, "should report the holdings transactions moved");
+
+        let conn = open_db(&db_path).unwrap();
+        for table in SYMBOL_KEYED_TABLES {
+            // Legacy tables are absent from a fresh schema — see the migration.
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if present == 0 {
+                continue;
+            }
+            let left: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {} WHERE symbol = 'OLD.AX'", table), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "`{}` still holds rows under the old symbol", table);
+        }
+        for (table, expected) in [
+            ("holdings_transactions", 1),
+            ("symbol_info", 1),
+            ("prices", 1),
+            ("dividend_events", 1),
+            ("cached_current_prices", 1),
+            ("watchlist_symbols", 1),
+            ("watchlist_memberships", 1),
+        ] {
+            let found: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {} WHERE symbol = 'NEW.AX'", table), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(found, expected, "`{}` did not receive the renamed rows", table);
+        }
+    }
+
+    /// Where the target symbol already holds a row under the same key, its own
+    /// row stands and the stale duplicate is dropped, rather than the rename
+    /// failing on a constraint violation halfway through.
+    #[test]
+    fn renaming_onto_an_existing_symbol_keeps_the_targets_rows() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('OLD.AX', '2026-01-05', 5.0, 'x');
+                 INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('OLD.AX', '2026-01-06', 5.5, 'x');
+                 INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('NEW.AX', '2026-01-05', 9.9, 'x');",
+            )
+            .unwrap();
+        }
+
+        rename_holdings_symbol(&db_path, "OLD.AX", "NEW.AX").expect("a clashing rename still succeeds");
+
+        let conn = open_db(&db_path).unwrap();
+        let kept: f64 = conn
+            .query_row("SELECT close FROM prices WHERE symbol = 'NEW.AX' AND date = '2026-01-05'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 9.9, "the target's own row wins on a clash");
+        let moved: f64 = conn
+            .query_row("SELECT close FROM prices WHERE symbol = 'NEW.AX' AND date = '2026-01-06'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, 5.5, "the non-clashing row still moves");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prices WHERE symbol = 'OLD.AX'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "nothing is stranded under the old symbol");
+    }
+
+    /// A rename copies `symbol_info` column by column, so a column added later
+    /// is silently left behind — no error, just a new symbol quietly missing
+    /// settings the old one had. Losing `dividend_withholding_pct` this way
+    /// would credit every later distribution gross again.
+    ///
+    /// Enumerated from the schema rather than listed, so the next column added
+    /// fails here instead of going missing in production.
+    #[test]
+    fn renaming_a_symbol_carries_every_symbol_info_column() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO symbol_info (symbol, instrument_type, long_name, currency, dividend_withholding_pct, updated_at)
+                 VALUES ('OLD.AX', 'EQUITY', 'Old Ltd', 'AUD', 30.0, 'x')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, currency, created_at)
+                 VALUES ('OLD.AX', 'purchase', '2026-01-05', 10.0, 5.0, 'AUD', 'x')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(&db_path).unwrap();
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(symbol_info)").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.filter_map(|r| r.ok()).filter(|c| c != "symbol").collect()
+        };
+        assert!(
+            columns.iter().any(|c| c == "dividend_withholding_pct"),
+            "the column under test should exist"
+        );
+        let read = |symbol: &str, col: &str| -> Option<String> {
+            conn.query_row(
+                &format!("SELECT CAST({} AS TEXT) FROM symbol_info WHERE symbol = ?1", col),
+                params![symbol],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Captured first: the rename moves the row rather than copying it, so
+        // afterwards there is no old row left to compare against.
+        let before: Vec<(String, Option<String>)> =
+            columns.iter().map(|c| (c.clone(), read("OLD.AX", c))).collect();
+
+        rename_holdings_symbol(&db_path, "OLD.AX", "NEW.AX").expect("rename succeeds");
+
+        for (col, was) in before {
+            assert_eq!(
+                was,
+                read("NEW.AX", &col),
+                "column `{}` did not survive the rename",
+                col
+            );
+        }
+    }
+
+    /// TFN withholding applies to the unfranked portion of one distribution, so
+    /// it varies per payment and stops once a TFN is quoted. A per-symbol rate
+    /// cannot express that — DMP was docked 43% on its first payment and
+    /// nothing on the next — so an amount recorded against the payment wins.
+    #[test]
+    fn a_payments_own_withholding_amount_overrides_the_symbol_rate() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+        {
+            // A standing rate that must NOT be used when the payment carries
+            // its own figure.
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO symbol_info (symbol, dividend_withholding_pct, updated_at) VALUES ('DMP.AX', 30.0, 'x')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut div = trade_payload("DMP.AX", "dividend", 50.0, 0.555);
+        div.amount = Some(27.75);
+        div.withholding_amount = Some(12.00);
+        div.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "DMP.AX", div).expect("dividend is allowed");
+
+        let mut legs = cash_legs(&db_path, record.id);
+        legs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        assert_eq!(
+            legs,
+            vec![(27.75, "dividend".to_string(), 1), (-12.00, "fee".to_string(), 1)],
+            "the payment's own amount is used, not 30% of the gross"
+        );
+        // The bank credited 15.75.
+        assert!((legs.iter().map(|l| l.0).sum::<f64>() - 15.75).abs() < 0.005);
+    }
+
+    /// A symbol with no withholding configured keeps a single leg, so the
+    /// ordinary Australian dividend is untouched.
+    #[test]
+    fn dividend_without_withholding_keeps_one_leg() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+
+        let mut div = trade_payload("VAS.AX", "dividend", 0.0, 0.0);
+        div.quantity = None;
+        div.price = None;
+        div.amount = Some(26.01);
+        div.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "VAS.AX", div).expect("dividend is allowed");
+        assert_eq!(cash_legs(&db_path, record.id), vec![(26.01, "dividend".to_string(), 1)]);
+    }
+
+    /// The dividend form only requires a total — share count and per-share rate
+    /// are optional — so the leg has to be derivable from the total alone.
+    /// Deriving it as `quantity * price`, the way a trade works, left a
+    /// hand-entered dividend with no cash movement at all.
+    #[test]
+    fn dividend_recorded_as_a_total_alone_still_settles() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+
+        let mut div = trade_payload("VAS.AX", "dividend", 0.0, 0.0);
+        div.quantity = None;
+        div.price = None;
+        div.amount = Some(185.22);
+        div.cash_account_id = Some(1);
+
+        let record = insert_holding_transaction(&db_path, "VAS.AX", div).expect("dividend is allowed");
+        assert_eq!(cash_legs(&db_path, record.id), vec![(185.22, "dividend".to_string(), 1)]);
+    }
+
+    /// A foreign dividend paid into an account of the same currency books
+    /// natively, converting the AUD total back when no per-share native figure
+    /// was recorded.
+    #[test]
+    fn foreign_dividend_settles_natively_from_the_recorded_total() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "IBKR", "USD");
+
+        let mut div = trade_payload("NSC", "dividend", 0.0, 0.0);
+        div.quantity = None;
+        div.price = None;
+        div.currency = Some("USD".to_string());
+        div.fx_rate = Some(1.42178702354431);
+        div.amount = Some(7.68); // AUD total
+        div.cash_account_id = Some(1);
+
+        let record = insert_holding_transaction(&db_path, "NSC", div).expect("dividend is allowed");
+        let legs = cash_legs(&db_path, record.id);
+        assert_eq!(legs.len(), 1);
+        assert!(
+            (legs[0].0 - 7.68 / 1.42178702354431).abs() < 0.01,
+            "USD account should be credited in USD, got {}",
+            legs[0].0
+        );
+    }
+
+    /// Without a fetched event there is no payment date to use, so the ex-date
+    /// stands rather than the leg being dropped.
+    #[test]
+    fn dividend_without_a_known_payment_date_settles_on_its_own_date() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+
+        let mut div = trade_payload("XRF.AX", "dividend", 100.0, 0.5);
+        div.amount = Some(50.0);
+        div.date = "2025-09-11".to_string();
+        div.cash_account_id = Some(1);
+
+        let record = insert_holding_transaction(&db_path, "XRF.AX", div).expect("dividend is allowed");
+        let conn = open_db(&db_path).unwrap();
+        let date: String = conn
+            .query_row("SELECT date FROM cash_transactions WHERE holding_tx_id = ?1", params![record.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(date, "2025-09-11");
+    }
+
+    /// A dividend leg shares its kind with a hand-entered dividend, so the
+    /// manual endpoints have to tell them apart by their link, not their kind,
+    /// or an edit would be silently undone the next time the transaction saves.
+    #[actix_web::test]
+    async fn a_dividend_leg_cannot_be_edited_as_a_manual_entry() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA Invest", "AUD");
+
+        let mut div = trade_payload("SUL.AX", "dividend", 200.0, 0.64);
+        div.amount = Some(128.0);
+        div.cash_account_id = Some(1);
+        let record = insert_holding_transaction(&db_path, "SUL.AX", div).expect("dividend is allowed");
+
+        let leg_id: i64 = {
+            let conn = open_db(&db_path).unwrap();
+            conn.query_row(
+                "SELECT id FROM cash_transactions WHERE holding_tx_id = ?1",
+                params![record.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(update_cash_transaction)
+                .service(delete_cash_transaction),
+        )
+        .await;
+
+        let req = actix_web::test::TestRequest::put()
+            .uri(&format!("/api/cash/transactions/{}", leg_id))
+            .set_json(serde_json::json!({
+                "account_id": 1, "date": "2026-03-12", "amount": 999.0, "kind": "dividend"
+            }))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400, "editing a linked dividend leg must be refused");
+
+        let req = actix_web::test::TestRequest::delete()
+            .uri(&format!("/api/cash/transactions/{}", leg_id))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400, "deleting a linked dividend leg must be refused");
+    }
+
+    /// A USD trade settling from an AUD account is not a modelling error — it
+    /// is what CommSec International does, converting per trade because the
+    /// account never holds USD. The leg is the AUD that actually left, and the
+    /// rate is preserved on the trade rather than lost in the conversion.
+    #[test]
+    fn foreign_trade_settles_from_an_aud_account_by_converting() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CommSec International", "AUD");
+
+        let mut buy = trade_payload("AAPL", "purchase", 10.0, 150.0);
+        buy.currency = Some("USD".to_string());
+        buy.original_price = Some(100.0);
+        buy.fx_rate = Some(1.5);
+        buy.brokerage = Some(11.95);
+        buy.cash_account_id = Some(1);
+
+        let record = insert_holding_transaction(&db_path, "AAPL", buy).expect("converted settlement is allowed");
+        // 10 x 150.00 AUD plus 11.95 AUD brokerage. Both are already AUD, so
+        // neither is converted a second time.
+        assert_eq!(cash_legs(&db_path, record.id), vec![(-1511.95, "trade_buy".to_string(), 1)]);
+
+        let conn = open_db(&db_path).unwrap();
+        let notes: String = conn
+            .query_row("SELECT notes FROM cash_transactions WHERE holding_tx_id = ?1", params![record.id], |r| r.get(0))
+            .unwrap();
+        assert!(notes.contains("USD 1000.00"), "note should state the foreign amount: {notes}");
+        assert!(notes.contains("1.5000"), "note should state the rate used: {notes}");
+    }
+
+    /// The matching-currency path must keep booking natively — an IBKR USD
+    /// account holds a real USD balance and must not be handed AUD.
+    #[test]
+    fn foreign_trade_settles_natively_from_a_matching_account() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "IBKR", "USD");
+
+        let mut buy = trade_payload("AAPL", "purchase", 10.0, 150.0);
+        buy.currency = Some("USD".to_string());
+        buy.original_price = Some(100.0);
+        buy.fx_rate = Some(1.5);
+        buy.brokerage = Some(15.0);
+        buy.cash_account_id = Some(1);
+
+        let record = insert_holding_transaction(&db_path, "AAPL", buy).expect("native settlement is allowed");
+        // 10 x 100.00 USD plus 15.00 AUD brokerage expressed as 10.00 USD.
+        assert_eq!(cash_legs(&db_path, record.id), vec![(-1010.0, "trade_buy".to_string(), 1)]);
+    }
+
+    /// Converting is only defined toward AUD, where the trade already carries
+    /// the rate. Any other mismatch must still be refused rather than silently
+    /// inventing a rate.
+    #[test]
+    fn cross_currency_without_an_aud_leg_is_still_refused() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement USD", "USD");
+
+        let mut buy = trade_payload("BHP.AX", "purchase", 10.0, 40.0);
+        buy.currency = Some("AUD".to_string());
+        buy.cash_account_id = Some(1);
+
+        let err = match insert_holding_transaction(&db_path, "BHP.AX", buy) {
+            Err(e) => e,
+            Ok(_) => panic!("an AUD trade must not draw on a USD account"),
+        };
+        assert!(err.contains("settles in AUD"), "unhelpful error: {err}");
+        assert!(err.contains("USD"), "error should name the account currency: {err}");
+    }
+
+    /// Balances are as-at a date, which is what the value graph will walk.
+    #[test]
+    fn cash_balance_is_derived_as_at_a_date() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Savings AUD", "AUD");
+        let conn = open_db(&db_path).unwrap();
+        for (date, amount, kind) in [
+            ("2026-01-01", 1000.0, "opening_balance"),
+            ("2026-02-01", 1000.0, "deposit"),
+            ("2026-03-01", 4.10, "interest"),
+        ] {
+            conn.execute(
+                "INSERT INTO cash_transactions (account_id, date, amount, kind, created_at) VALUES (1, ?1, ?2, ?3, 'x')",
+                params![date, amount, kind],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(cash_balance(&conn, 1, Some("2026-01-15")), 1000.0);
+        assert_eq!(cash_balance(&conn, 1, Some("2026-02-01")), 2000.0);
+        assert!((cash_balance(&conn, 1, None) - 2004.10).abs() < 1e-9);
+    }
+
+    /// Editing is allowed for hand-entered rows, but not for the two kinds the
+    /// ledger owns rather than the user: a trade's settlement leg, and either
+    /// side of a conversion — changing one leg alone would invent money in one
+    /// currency and destroy it in the other.
+    #[actix_web::test]
+    async fn editing_a_cash_transaction_is_blocked_for_trade_and_transfer_legs() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement AUD", "AUD");
+        seed_cash_account(&db_path, 2, "Settlement USD", "USD");
+
+        // A plain deposit, a trade leg and a transfer pair
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO cash_transactions (id, account_id, date, amount, kind, created_at)
+             VALUES (10, 1, '2026-01-01', 1000.0, 'deposit', 'x')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cash_transactions (id, account_id, date, amount, kind, transfer_group_id, created_at)
+             VALUES (11, 1, '2026-01-02', -500.0, 'fx_out', 'g1', 'x')",
+            [],
+        )
+        .unwrap();
+        let mut buy = trade_payload("BHP.AX", "purchase", 10.0, 40.0);
+        buy.cash_account_id = Some(1);
+        let trade = insert_holding_transaction(&db_path, "BHP.AX", buy).unwrap();
+        let leg_id: i64 = conn
+            .query_row("SELECT id FROM cash_transactions WHERE holding_tx_id = ?1", params![trade.id], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(update_cash_transaction),
+        )
+        .await;
+        let edit = |id: i64| {
+            actix_web::test::TestRequest::put()
+                .uri(&format!("/api/cash/transactions/{}", id))
+                .set_json(serde_json::json!({
+                    "account_id": 1, "date": "2026-01-05", "amount": 1234.0, "kind": "deposit"
+                }))
+                .to_request()
+        };
+
+        // A hand-entered row edits fine
+        let resp = actix_web::test::call_service(&app, edit(10)).await;
+        assert!(resp.status().is_success(), "deposit should be editable");
+
+        let resp = actix_web::test::call_service(&app, edit(11)).await;
+        assert_eq!(resp.status(), 400, "a transfer leg must not be editable alone");
+
+        let resp = actix_web::test::call_service(&app, edit(leg_id)).await;
+        assert_eq!(resp.status(), 400, "a trade's settlement leg must not be editable");
+
+        // Only the deposit actually changed
+        let conn = open_db(&db_path).unwrap();
+        let (amount, date): (f64, String) = conn
+            .query_row("SELECT amount, date FROM cash_transactions WHERE id = 10", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((amount, date.as_str()), (1234.0, "2026-01-05"));
+        let leg: f64 = conn
+            .query_row("SELECT amount FROM cash_transactions WHERE id = 11", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leg, -500.0, "the transfer leg is untouched");
+    }
+
+    #[test]
+    fn cash_tx_validation_rejects_bad_input_and_trade_owned_kinds() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Settlement AUD", "AUD");
+        let conn = open_db(&db_path).unwrap();
+        let payload = |kind: &str, date: &str, amount: f64, account: i64| CashTxPayload {
+            account_id: account,
+            date: date.to_string(),
+            amount,
+            kind: kind.to_string(),
+            notes: None,
+        };
+
+        assert!(validate_cash_tx(&conn, &payload("deposit", "2026-01-01", 100.0, 1)).is_ok());
+        // A trade's leg is owned by the trade
+        assert!(validate_cash_tx(&conn, &payload("trade_buy", "2026-01-01", -100.0, 1))
+            .unwrap_err()
+            .contains("created from the trade"));
+        assert!(validate_cash_tx(&conn, &payload("nonsense", "2026-01-01", 100.0, 1)).is_err());
+        assert!(validate_cash_tx(&conn, &payload("deposit", "01/01/2026", 100.0, 1)).is_err());
+        assert!(validate_cash_tx(&conn, &payload("deposit", "2026-01-01", 0.0, 1)).is_err());
+        assert!(validate_cash_tx(&conn, &payload("deposit", "2026-01-01", 100.0, 99))
+            .unwrap_err()
+            .contains("not found"));
+    }
+
+    /// The cash ledger is hand-entered money data, so every field has to reach
+    /// audit_log — the static coverage check proves the trigger *names* the
+    /// columns; this proves the values actually land, including across a
+    /// re-init, which is where the `IF NOT EXISTS` trap used to bite.
+    #[test]
+    fn cash_ledger_changes_are_audited() {
+        let (_file, db_path) = setup_test_db();
+        init_db(&db_path).unwrap(); // a restart must not leave a stale trigger
+        let conn = open_db(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO cash_accounts (id, name, currency, interest_rate, include_in_portfolio, notes, created_at)
+             VALUES (1, 'CommSec AUD', 'AUD', 4.35, 1, 'settlement', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cash_transactions (id, account_id, date, amount, kind, notes, created_at)
+             VALUES (7, 1, '2026-01-02', 1000.0, 'deposit', 'monthly', '2026-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE cash_transactions SET amount = 1500.0 WHERE id = 7", []).unwrap();
+
+        let account_new: String = conn
+            .query_row(
+                "SELECT new_values FROM audit_log WHERE table_name='cash_accounts' AND action='INSERT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(account_new.contains("\"currency\":\"AUD\""));
+        assert!(account_new.contains("\"interest_rate\":4.35"));
+        assert!(account_new.contains("\"include_in_portfolio\":1"));
+
+        let (old_values, new_values): (String, String) = conn
+            .query_row(
+                "SELECT old_values, new_values FROM audit_log
+                  WHERE table_name='cash_transactions' AND action='UPDATE'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(old_values.contains("\"amount\":1000.0"), "pre-change amount: {old_values}");
+        assert!(new_values.contains("\"amount\":1500.0"), "post-change amount: {new_values}");
+        assert!(new_values.contains("\"kind\":\"deposit\""));
+    }
+
+    /// A trade records which account funded it, and that link is auditable.
+    #[test]
+    fn holdings_transactions_record_their_cash_account() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, cash_account_id, created_at)
+             VALUES (3, 'BHP.AX', 'purchase', '2026-01-05', 42, 'x')",
+            [],
+        )
+        .unwrap();
+
+        let new_values: String = conn
+            .query_row(
+                "SELECT new_values FROM audit_log WHERE table_name='holdings_transactions' AND action='INSERT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(new_values.contains("\"cash_account_id\":42"), "got {new_values}");
+    }
+
+    #[test]
+    fn fx_pair_symbol_builds_yahoo_pairs() {
+        assert_eq!(fx_pair_symbol("usd"), "USDAUD=X");
+        assert_eq!(fx_pair_symbol(" GBP "), "GBPAUD=X");
+    }
+
+    /// Pairs are derived from the data, so a new foreign holding starts its
+    /// rate history without anyone editing a config list.
+    #[test]
+    fn fx_currencies_come_from_holdings_and_symbol_info() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('AAPL', 'USD', 'x');
+             INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('BHP.AX', 'AUD', 'x');
+             INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('NONE.AX', NULL, 'x');
+             INSERT INTO holdings_transactions (symbol, transaction_type, date, currency, created_at)
+                 VALUES ('SHEL.L', 'purchase', '2026-01-01', 'gbp', 'x');",
+        )
+        .unwrap();
+
+        // AUD is the base and needs no pair; case and blanks are normalised away
+        assert_eq!(fx_currencies_in_use(&conn), vec!["GBP".to_string(), "USD".to_string()]);
+    }
+
+    /// FX does not trade at weekends, but holdings still need valuing then, so
+    /// the lookup takes the most recent rate on or before the date.
+    #[test]
+    fn fx_rate_on_reads_stored_rates_as_of_a_date() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        for (date, close) in [("2026-08-06", 1.50), ("2026-08-07", 1.55)] {
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('USDAUD=X', ?1, ?2, 'x')",
+                params![date, close],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(fx_rate_on(&conn, "USD", "2026-08-07"), Some(1.55));
+        // Saturday and Sunday fall back to Friday's rate
+        assert_eq!(fx_rate_on(&conn, "USD", "2026-08-09"), Some(1.55));
+        assert_eq!(fx_rate_on(&conn, "USD", "2026-08-06"), Some(1.50));
+        // Before any stored rate there is nothing to report
+        assert_eq!(fx_rate_on(&conn, "USD", "2026-08-05"), None);
+        // AUD is the base
+        assert_eq!(fx_rate_on(&conn, "AUD", "2026-08-05"), Some(1.0));
+        assert_eq!(fx_rate_on(&conn, "GBP", "2026-08-07"), None);
+    }
+
+    /// The EMA must match `calculateEMA` in the web client, or the Analysis
+    /// table and the chart's overlay would disagree for the same symbol.
+    #[test]
+    /// A 40-week EMA is not a 200-day EMA. The weekly figure steps once a week
+    /// from one close per week, so it is far less sensitive to a single day's
+    /// move — using daily bars would quietly report a different indicator.
+    #[test]
+    fn weekly_ema_collapses_to_one_close_per_week() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            // Two full weeks. Each week's *last* close is the one that counts,
+            // so the EMA(2) seed is the mean of 105 and 205 — not of any
+            // mid-week value.
+            for (date, close) in [
+                ("2026-01-05", 100.0), // Mon
+                ("2026-01-07", 101.0),
+                ("2026-01-09", 105.0), // Fri — week 1 close
+                ("2026-01-12", 200.0), // Mon
+                ("2026-01-16", 205.0), // Fri — week 2 close
+            ] {
+                conn.execute(
+                    "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TST.AX', ?1, ?2, 'x')",
+                    params![date, close],
+                )
+                .unwrap();
+            }
+        }
+        let conn = open_db(&db_path).unwrap();
+        let ema = stored_weekly_ema(&conn, "TST.AX", 2).expect("two weeks is enough for period 2");
+        assert!((ema - 155.0).abs() < 1e-9, "expected the mean of 105 and 205, got {ema}");
+
+        // A daily EMA over the same rows sees five bars, not two, and lands
+        // somewhere else entirely — the two must not be confused.
+        let daily = stored_ema(&conn, "TST.AX", 2).unwrap();
+        assert!((daily - ema).abs() > 1.0, "daily and weekly should differ, got {daily} vs {ema}");
+    }
+
+    /// A week with only one trading day is still a week.
+    #[test]
+    fn weekly_ema_handles_short_weeks_and_insufficient_history() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            for (date, close) in [
+                ("2026-01-09", 10.0), // a lone Friday
+                ("2026-01-12", 20.0), // Mon
+                ("2026-01-13", 30.0), // Tue — week 2 close
+            ] {
+                conn.execute(
+                    "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TST.AX', ?1, ?2, 'x')",
+                    params![date, close],
+                )
+                .unwrap();
+            }
+        }
+        let conn = open_db(&db_path).unwrap();
+        assert!((stored_weekly_ema(&conn, "TST.AX", 2).unwrap() - 20.0).abs() < 1e-9);
+        // Only two weeks exist, so a 40-week average has nothing to report.
+        assert_eq!(stored_weekly_ema(&conn, "TST.AX", 40), None);
+    }
+
+    #[test]
+    fn stored_ema_seeds_from_the_first_window_then_weights_forward() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        // Closes 1..5 on consecutive days
+        for (i, close) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TST.AX', ?1, ?2, 'x')",
+                params![format!("2026-01-0{}", i + 1), close],
+            )
+            .unwrap();
+        }
+
+        // period 3: seed = (1+2+3)/3 = 2, k = 0.5
+        // then 4 × 0.5 + 2 × 0.5 = 3, then 5 × 0.5 + 3 × 0.5 = 4
+        let ema = stored_ema(&conn, "TST.AX", 3).unwrap();
+        assert!((ema - 4.0).abs() < 1e-9, "expected 4.0, got {ema}");
+
+        // Shorter history than the period yields nothing rather than a partial average
+        assert_eq!(stored_ema(&conn, "TST.AX", 50), None);
+        assert_eq!(stored_ema(&conn, "MISSING.AX", 3), None);
+    }
+
+    /// Bars the OHLC backfill could not reach have a NULL high; those must fall
+    /// back to their close rather than dropping out of the window.
+    #[actix_web::test]
+    async fn high30d_falls_back_to_close_when_high_is_missing() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        {
+            let conn = open_db(&db_path).unwrap();
+            // Close-only bar (no high) above every other close in the window
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at)
+                 VALUES ('MAN.AX', '2026-07-03', 14.25, '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let body = get_json(&db_path, "/api/portfolio/risk").await;
+        let man = find(&body["rows"], "MAN.AX");
+        assert!(
+            close_to(&man["high30d"], 14.25),
+            "close-only bar should still set the high, got {:?}",
+            man["high30d"]
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -6671,5 +10987,172 @@ mod tests {
         assert!(close_to(&record["quantity"], 12.0));
         assert!(close_to(&record["price"], 5.5));
         assert_eq!(tx_count(&db_path, "TST.AX"), 1, "update must not duplicate the row");
+    }
+
+    /// The export carries a running balance, so the order and the arithmetic
+    /// have to be settled server-side — a client that re-sorted the rows would
+    /// otherwise render a balance column that means nothing.
+    #[actix_web::test]
+    async fn the_cash_export_runs_a_balance_and_escapes_its_fields() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "CBA CDIA", "AUD");
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO cash_transactions (account_id, date, amount, kind, notes, created_at)
+                     VALUES (1, '2026-06-05', 10000.0, 'deposit', 'Opening funds', 'x');
+                 INSERT INTO cash_transactions (account_id, date, amount, kind, notes, created_at)
+                     VALUES (1, '2026-06-25', -1509.0, 'trade_buy', 'purchase SPCX, at 1.4189', 'x');
+                 INSERT INTO cash_transactions (account_id, date, amount, kind, notes, created_at)
+                     VALUES (1, '2026-07-01', 11.37, 'interest', NULL, 'x');",
+            )
+            .unwrap();
+        }
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(export_cash_account_csv),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get()
+            .uri("/api/cash/accounts/1/transactions.csv")
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let disposition = resp
+            .headers()
+            .get("Content-Disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disposition.contains("cash-cba-cdia.csv"), "unhelpful filename: {disposition}");
+
+        let body = actix_web::test::read_body(resp).await;
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert_eq!(lines[0], "Date,Transaction,Description,Amount (AUD),Balance (AUD)");
+        assert_eq!(lines[1], "2026-06-05,deposit,Opening funds,10000.00,10000.00");
+        // The comma inside the note must not split the row into extra columns.
+        assert_eq!(lines[2], "2026-06-25,trade_buy,\"purchase SPCX, at 1.4189\",-1509.00,8491.00");
+        assert_eq!(lines[2].matches(',').count() - 1, 4, "the quoted comma is not a delimiter");
+        // Balance keeps running across a row with no description.
+        assert_eq!(lines[3], "2026-07-01,interest,,11.37,8502.37");
+    }
+
+    /// An account that does not exist is a 404, not an empty file that looks
+    /// like an account with no transactions.
+    #[actix_web::test]
+    async fn exporting_an_unknown_cash_account_is_not_found() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(export_cash_account_csv),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get()
+            .uri("/api/cash/accounts/99/transactions.csv")
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// A dividend declared after the holding was sold is not the holder's. The
+    /// ledger used to test only "on or after the first purchase", which guarded
+    /// the wrong end: those events appeared as rows that could never be
+    /// recorded, because there was no entitlement to record.
+    #[actix_web::test]
+    async fn the_ledger_hides_dividends_from_outside_the_holding_period() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, currency, created_at)
+                     VALUES ('VSO.AX', 'purchase', '2025-01-09', 15.0, 60.0, 'AUD', 'x');
+                 INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, currency, created_at)
+                     VALUES ('VSO.AX', 'sale', '2026-06-24', 15.0, 70.0, 'AUD', 'x');
+                 -- before the purchase, while held, and after the sale
+                 INSERT INTO dividend_events (symbol, ex_date, amount, fetched_at) VALUES ('VSO.AX', '2024-07-01', 0.76, 'x');
+                 INSERT INTO dividend_events (symbol, ex_date, amount, fetched_at) VALUES ('VSO.AX', '2026-01-02', 1.38, 'x');
+                 INSERT INTO dividend_events (symbol, ex_date, amount, fetched_at) VALUES ('VSO.AX', '2026-07-01', 2.19, 'x');",
+            )
+            .unwrap();
+        }
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(get_transactions_ledger),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get().uri("/api/transactions/ledger").to_request();
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+
+        let derived: Vec<String> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["symbol"] == "VSO.AX" && r["transaction_type"] == "dividend" && r["id"].is_null())
+            .map(|r| r["date"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            derived,
+            vec!["2026-01-02".to_string()],
+            "only the dividend declared while the shares were held belongs on the ledger"
+        );
+    }
+
+    /// The ledger builds its rows as hand-written `json!` objects rather than
+    /// serialising `HoldingTransaction`, so a field added to the struct reaches
+    /// `/api/holdings` and silently skips this endpoint. That is how the
+    /// Transactions screen's "Settles from" picker read empty on trades that
+    /// were correctly linked in the database.
+    #[actix_web::test]
+    async fn ledger_rows_carry_the_settlement_account() {
+        let (_file, db_path) = setup_test_db();
+        {
+            let conn = open_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO cash_accounts (name, currency, include_in_portfolio, created_at)
+                 VALUES ('Test Loan', 'AUD', 1, '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let (_, linked) = call_write(&db_path, "POST", "/api/holdings", Some(serde_json::json!({
+            "symbol": "TST.AX", "transaction_type": "purchase",
+            "date": "2026-01-05", "quantity": 10.0, "price": 5.0,
+            "cash_account_id": 1
+        }))).await;
+        let (_, unlinked) = call_write(&db_path, "POST", "/api/holdings", Some(purchase_json("OTH.AX", 3.0, 2.0))).await;
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(get_transactions_ledger),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get().uri("/api/transactions/ledger").to_request();
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        let rows = body["rows"].as_array().expect("ledger returns rows");
+
+        let find = |id: &serde_json::Value| {
+            rows.iter().find(|r| r["id"] == *id).unwrap_or_else(|| panic!("row {} missing from ledger", id))
+        };
+        assert_eq!(
+            find(&linked["id"])["cash_account_id"], 1,
+            "a linked trade must expose its settlement account to the ledger"
+        );
+        assert!(
+            find(&unlinked["id"])["cash_account_id"].is_null(),
+            "an unlinked trade reports null, not a missing key"
+        );
+        assert!(
+            rows.iter().all(|r| r.get("cash_account_id").is_some()),
+            "every ledger row must carry the key so the UI can distinguish absent from unset"
+        );
     }
 }

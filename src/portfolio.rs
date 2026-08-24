@@ -61,6 +61,61 @@ pub struct Lot {
     pub price: f64,
 }
 
+/// One day of the portfolio's value, all figures in AUD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyValue {
+    pub date: String,
+    /// Market value of shares held at the close.
+    pub stocks: f64,
+    /// Cash across every account counted toward the portfolio.
+    pub cash: f64,
+    /// Net money that entered (+) or left (−) the portfolio that day.
+    ///
+    /// Contributions and withdrawals only. Dividends, interest, fees, trades
+    /// and currency conversions are *not* flows — they are the portfolio
+    /// earning, spending or rearranging its own money, which is exactly what
+    /// the return is meant to measure.
+    pub flow: f64,
+}
+
+impl DailyValue {
+    pub fn total(&self) -> f64 {
+        self.stocks + self.cash
+    }
+}
+
+/// Time-weighted return over the series, as a fraction (0.07 = +7%).
+///
+/// Each day contributes `(V_d − F_d) / V_{d−1} − 1`, and the daily factors are
+/// chained. Removing the day's flow before the comparison is what stops a
+/// deposit registering as a gain: adding $1,000 raises `V_d` and `F_d` equally,
+/// so the ratio is unchanged.
+///
+/// Days where the previous value was zero or negative contribute nothing —
+/// there is no capital to earn a return on, which is the normal state before
+/// the first contribution lands.
+pub fn time_weighted_return(series: &[DailyValue]) -> Option<f64> {
+    let mut factor = 1.0f64;
+    let mut counted = 0usize;
+
+    for pair in series.windows(2) {
+        let previous = pair[0].total();
+        let current = &pair[1];
+        if previous <= 0.0 {
+            continue;
+        }
+        factor *= (current.total() - current.flow) / previous;
+        counted += 1;
+    }
+
+    if counted == 0 { None } else { Some(factor - 1.0) }
+}
+
+/// Total contributed (+) or withdrawn (−) across the series.
+pub fn net_contributions(series: &[DailyValue]) -> f64 {
+    series.iter().map(|p| p.flow).sum()
+}
+
 /// Sort transactions chronologically, then by id for same-day stability.
 pub fn sort_transactions(txs: &[PortfolioTx]) -> Vec<PortfolioTx> {
     let mut sorted = txs.to_vec();
@@ -502,6 +557,84 @@ pub fn calc_sold_entries(txs: &[PortfolioTx]) -> Vec<SoldEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn day(date: &str, stocks: f64, cash: f64, flow: f64) -> DailyValue {
+        DailyValue { date: date.to_string(), stocks, cash, flow }
+    }
+
+    #[test]
+    fn twr_measures_pure_market_movement() {
+        // 1000 → 1100 with no flows is +10%
+        let series = vec![day("2026-01-01", 1000.0, 0.0, 0.0), day("2026-01-02", 1100.0, 0.0, 0.0)];
+        assert!((time_weighted_return(&series).unwrap() - 0.10).abs() < 1e-12);
+    }
+
+    /// The requirement this whole design exists for: a contribution raises the
+    /// balance without registering as growth.
+    #[test]
+    fn twr_ignores_contributions() {
+        let series = vec![
+            day("2026-01-01", 0.0, 1000.0, 0.0),
+            day("2026-01-02", 0.0, 2000.0, 1000.0), // deposit only
+        ];
+        assert!(time_weighted_return(&series).unwrap().abs() < 1e-12, "a deposit is not a gain");
+
+        // A deposit landing the same day as a real gain leaves only the gain
+        let mixed = vec![
+            day("2026-01-01", 0.0, 1000.0, 0.0),
+            day("2026-01-02", 0.0, 2100.0, 1000.0), // +100 earned, +1000 added
+        ];
+        assert!((time_weighted_return(&mixed).unwrap() - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn twr_ignores_withdrawals() {
+        let series = vec![
+            day("2026-01-01", 0.0, 1000.0, 0.0),
+            day("2026-01-02", 0.0, 400.0, -600.0),
+        ];
+        assert!(time_weighted_return(&series).unwrap().abs() < 1e-12);
+    }
+
+    /// Chaining is what makes the result independent of when money arrived:
+    /// the same market moves give the same answer whatever the deposits.
+    #[test]
+    fn twr_chains_daily_and_is_unaffected_by_contribution_timing() {
+        let quiet = vec![
+            day("2026-01-01", 1000.0, 0.0, 0.0),
+            day("2026-01-02", 1100.0, 0.0, 0.0), // +10%
+            day("2026-01-03", 990.0, 0.0, 0.0),  // −10%
+        ];
+        let expected = 1.10 * 0.90 - 1.0; // −1%
+        assert!((time_weighted_return(&quiet).unwrap() - expected).abs() < 1e-12);
+
+        // Same moves, but $5,000 arrives before the down day
+        let with_deposit = vec![
+            day("2026-01-01", 1000.0, 0.0, 0.0),
+            day("2026-01-02", 1100.0, 5000.0, 5000.0),
+            day("2026-01-03", 990.0, 4500.0, 0.0), // both fall 10%
+        ];
+        assert!((time_weighted_return(&with_deposit).unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn twr_is_none_until_there_is_capital_to_measure() {
+        assert_eq!(time_weighted_return(&[]), None);
+        assert_eq!(time_weighted_return(&[day("2026-01-01", 0.0, 100.0, 100.0)]), None);
+        // The funding day itself has no prior capital, so nothing is chained
+        let opening = vec![day("2026-01-01", 0.0, 0.0, 0.0), day("2026-01-02", 0.0, 1000.0, 1000.0)];
+        assert_eq!(time_weighted_return(&opening), None);
+    }
+
+    #[test]
+    fn net_contributions_sums_flows_both_ways() {
+        let series = vec![
+            day("2026-01-01", 0.0, 1000.0, 1000.0),
+            day("2026-02-01", 0.0, 2000.0, 1000.0),
+            day("2026-03-01", 0.0, 1500.0, -500.0),
+        ];
+        assert!((net_contributions(&series) - 1500.0).abs() < 1e-12);
+    }
 
     fn make_tx(id: i64, tx_type: &str, date: &str, quantity: Option<f64>, price: Option<f64>) -> PortfolioTx {
         PortfolioTx {

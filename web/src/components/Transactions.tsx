@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { apiClient, type HoldingTransactionPayload, type LedgerRow } from '../services/api'
+import { apiClient, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
+import { settlementAccountsFor, settlesByConversion } from '../utils/cash'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
+
+type SortColumn = 'date' | 'symbol' | 'amount' | 'brokerage' | 'cashAccount' | 'notes'
 
 interface TransactionRow {
   key: string
@@ -16,6 +19,8 @@ interface TransactionRow {
   amount: number | null
   brokerage: number | null
   notes: string | null
+  /** Settlement account, or null when the row settles against no account */
+  cash_account_id: number | null
   /** true for dividend_events rows (per-share amount); false for manual dividend transactions (total dollars) */
   perShare: boolean
 }
@@ -31,6 +36,8 @@ interface EditState {
   amount: string
   brokerage: string
   notes: string
+  /** Empty string means the trade settles against no account. */
+  cash_account_id: string
   custom_fields: Record<string, string>
 }
 
@@ -55,6 +62,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const [filter, setFilter] = useState<FilterType>('all')
   const [symbolFilter, setSymbolFilter] = useState('')
   const [editing, setEditing] = useState<EditState | null>(null)
+  const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
   const [editFxRate, setEditFxRate] = useState<number | null>(null)
   const [editFxDate, setEditFxDate] = useState<string | null>(null)
   const [editFxLoading, setEditFxLoading] = useState(false)
@@ -69,6 +77,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const loadLedger = async () => {
     const data = await apiClient.getTransactionsLedger()
     setLedger(data.rows)
+    // Settlement accounts for the edit modal's picker. Failure just hides it,
+    // so an older API keeps the rest of the screen working.
+    apiClient.getCashAccounts?.().then(setCashAccounts).catch(() => setCashAccounts([]))
   }
 
   useEffect(() => {
@@ -117,6 +128,23 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     }).finally(() => setEditFxLoading(false))
   }, [editing?.currency, editing?.date, editing?.type])
 
+  const [sortColumn, setSortColumn] = useState<SortColumn | null>(null)
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc')
+
+  const handleSort = (column: SortColumn) => {
+    if (sortColumn === column) {
+      setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortColumn(column)
+      setSortDirection('asc')
+    }
+  }
+
+  const sortIndicator = (column: SortColumn) => {
+    if (sortColumn !== column) return ' ↕'
+    return sortDirection === 'asc' ? ' ↑' : ' ↓'
+  }
+
   const rows = useMemo((): TransactionRow[] => {
     return ledger
       .filter((r) => filter === 'all' || r.transaction_type === filter)
@@ -134,9 +162,52 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         amount: r.amount,
         brokerage: r.brokerage,
         notes: r.per_share && r.payment_date ? `Payment: ${new Date(r.payment_date).toLocaleDateString()}` : r.notes,
+        cash_account_id: r.cash_account_id,
         perShare: r.per_share,
       }))
   }, [ledger, filter, symbolFilter])
+
+  /**
+   * Sorted client-side: the ledger arrives whole, so there is nothing hidden
+   * below a row limit for a re-query to reveal. (The Dashboard's stop-loss
+   * table sorts on the server precisely because it *is* truncated.)
+   */
+  const sortedRows = useMemo((): TransactionRow[] => {
+    if (!sortColumn) return rows
+    const dir = sortDirection === 'asc' ? 1 : -1
+
+    // The Amount column shows a dividend's own total but a trade's quantity x
+    // price, so sorting has to read the same figure the eye does.
+    const amountOf = (r: TransactionRow): number | null => {
+      if (r.type === 'dividend') return r.amount
+      return r.quantity !== null && r.price !== null ? r.quantity * r.price : null
+    }
+    const accountOf = (r: TransactionRow): string =>
+      r.id === null ? 'not recorded' : (cashAccounts.find((a) => a.id === r.cash_account_id)?.name ?? '')
+
+    const value = (r: TransactionRow): string | number | null => {
+      switch (sortColumn) {
+        case 'date': return r.date
+        case 'symbol': return r.symbol
+        case 'amount': return amountOf(r)
+        case 'brokerage': return r.brokerage
+        case 'cashAccount': return accountOf(r)
+        case 'notes': return r.notes ?? ''
+      }
+    }
+
+    return [...rows].sort((a, b) => {
+      const av = value(a)
+      const bv = value(b)
+      // Empty cells sort last in both directions — a blank is absence, not a
+      // low value, and burying rows under a run of them helps nobody.
+      const aEmpty = av === null || av === ''
+      const bEmpty = bv === null || bv === ''
+      if (aEmpty || bEmpty) return aEmpty && bEmpty ? 0 : aEmpty ? 1 : -1
+      if (typeof av === 'string' && typeof bv === 'string') return av.localeCompare(bv) * dir
+      return ((av as number) - (bv as number)) * dir
+    })
+  }, [rows, sortColumn, sortDirection, cashAccounts])
 
   const startEdit = (row: TransactionRow) => {
     if (row.id === null) return
@@ -159,6 +230,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       amount: row.amount !== null ? row.amount.toString() : '',
       brokerage: row.brokerage !== null ? row.brokerage.toString() : '',
       notes: row.notes ?? '',
+      cash_account_id: tx?.cash_account_id != null ? String(tx.cash_account_id) : '',
       custom_fields: tx?.custom_fields ?? {},
     })
   }
@@ -193,6 +265,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         amount: editing.amount ? parseFloat(editing.amount) : undefined,
         brokerage: editing.brokerage ? parseFloat(editing.brokerage) : undefined,
         notes: editing.notes || undefined,
+        // null, not undefined: clearing the picker must detach the trade from
+        // the ledger rather than leave its old settlement leg in place.
+        cash_account_id: editing.cash_account_id ? Number(editing.cash_account_id) : null,
       }
       if (editing.type === 'purchase' || editing.type === 'sale') {
         payload.quantity = editing.quantity ? parseFloat(editing.quantity) : undefined
@@ -230,6 +305,33 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     if (type === 'purchase') return '#2196f3'
     if (type === 'sale') return '#f44336'
     return '#4caf50'
+  }
+
+  /**
+   * Three states, not two — the distinction matters.
+   *
+   * A row with no `id` is not a stored transaction at all: it is a dividend the
+   * app derived from a fetched event, so it can never have an account until it
+   * is recorded. Showing a bare dash there reads as "unlinked, go and link it",
+   * which is not a thing the user can do.
+   */
+  const renderCashAccount = (row: TransactionRow) => {
+    if (row.id === null) {
+      return (
+        <span style={{ color: '#b0741c', fontSize: 12 }} title="Derived from a fetched dividend event — record it as a transaction to settle it to an account">
+          not recorded
+        </span>
+      )
+    }
+    const account = cashAccounts.find((a) => a.id === row.cash_account_id)
+    if (!account) {
+      return <span style={{ color: '#999' }} title="This transaction does not move cash">—</span>
+    }
+    return (
+      <span title={`${account.name} (${account.currency})`}>
+        {account.name}
+      </span>
+    )
   }
 
   return (
@@ -271,19 +373,20 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
             <table className="holdings-table">
               <thead>
                 <tr>
-                  <th>Date</th>
-                  <th>Symbol</th>
+                  <th className="sortable-header" onClick={() => handleSort('date')}>Date{sortIndicator('date')}</th>
+                  <th className="sortable-header" onClick={() => handleSort('symbol')}>Symbol{sortIndicator('symbol')}</th>
                   <th>Type</th>
                   <th>Quantity</th>
                   <th>Price</th>
-                  <th>Amount</th>
-                  <th>Brokerage</th>
-                  <th>Notes</th>
+                  <th className="sortable-header" onClick={() => handleSort('amount')}>Amount{sortIndicator('amount')}</th>
+                  <th className="sortable-header" onClick={() => handleSort('brokerage')}>Brokerage{sortIndicator('brokerage')}</th>
+                  <th className="sortable-header" onClick={() => handleSort('cashAccount')}>Cash Account{sortIndicator('cashAccount')}</th>
+                  <th className="sortable-header" onClick={() => handleSort('notes')}>Notes{sortIndicator('notes')}</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => (
+                {sortedRows.map((row) => (
                   <tr key={row.key}>
                     <td>{new Date(row.date).toLocaleDateString()}</td>
                     <td>
@@ -320,6 +423,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                         : '—'}
                     </td>
                     <td>{row.brokerage !== null ? `$${row.brokerage.toFixed(2)}` : '—'}</td>
+                    <td>{renderCashAccount(row)}</td>
                     <td style={{ color: '#888' }}>{row.notes || '—'}</td>
                     <td style={{ display: 'flex', gap: 6 }}>
                       {row.id !== null && (
@@ -361,6 +465,38 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                 <label style={{ fontSize: 13, color: '#666' }}>Date</label>
                 <input type="date" className="config-input" value={editing.date} onChange={(e) => setEditing({ ...editing, date: e.target.value })} />
               </div>
+              {cashAccounts.length > 0 && (() => {
+                const matching = settlementAccountsFor(cashAccounts, editing.currency)
+                const selected = matching.some((a) => String(a.id) === editing.cash_account_id) ? editing.cash_account_id : ''
+                const converts = settlesByConversion(matching.find((a) => String(a.id) === selected), editing.currency)
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: 13, color: '#666' }}>Settles from</label>
+                    <select
+                      className="config-input"
+                      value={selected}
+                      disabled={matching.length === 0}
+                      onChange={(e) => setEditing({ ...editing, cash_account_id: e.target.value })}
+                    >
+                      <option value="">
+                        {matching.length === 0
+                          ? `No ${editing.currency} cash account`
+                          : 'No account — leaves cash untouched'}
+                      </option>
+                      {matching.map((a) => (
+                        <option key={a.id} value={a.id}>{a.name} — {a.currency} {a.balance.toLocaleString('en-AU', { maximumFractionDigits: 2 })}</option>
+                      ))}
+                    </select>
+                    <span style={{ fontSize: 12, color: '#888' }}>
+                      {converts
+                        ? `AUD leaves this account, converted from ${editing.currency} at the trade\u2019s rate.`
+                        : selected
+                          ? 'Saving rewrites this trade\u2019s cash movement.'
+                          : 'Attaching an account makes this trade draw on cash instead of counting as a contribution.'}
+                    </span>
+                  </div>
+                )
+              })()}
               {(editing.type === 'purchase' || editing.type === 'sale') && (
                 <>
                   <div style={{ display: 'flex', gap: 10 }}>

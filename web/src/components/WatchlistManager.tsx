@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { apiClient, type EnrichedWatchlistItem } from '../services/api'
 import { SECTORS } from '../utils/sectors'
-import PriceChart from './PriceChart'
+import PriceChart, { BREAKTHROUGH_COLOR, STOP_LOSS_COLOR } from './PriceChart'
 import StockAnalysis from './StockAnalysis'
 
 // Thin client: SMA/crossover/volume indicators are computed by the API server
@@ -730,7 +730,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       {chartSymbols.length > 0 && (
         <div className="manager-card chart-card">
           <div className="card-header">
-            <h2>Simple Moving Average Chart</h2>
+            <h2>Stock Chart</h2>
             <div className="chart-select">
               <label htmlFor="chart-symbol">Symbol</label>
               <select
@@ -756,8 +756,8 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
               const sym = selectedSymbol || chartSymbols[0]?.symbol
               const entry = symbols.find((s) => s.symbol === sym)
               const result: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }> = []
-              if (entry?.breakthrough_price) result.push({ price: entry.breakthrough_price, label: 'Breakthrough', mode: 'breakthrough', color: '#4caf50' })
-              if (entry?.stop_loss_price) result.push({ price: entry.stop_loss_price, label: 'Stop Loss', mode: 'stoploss', color: '#e91e63' })
+              if (entry?.breakthrough_price) result.push({ price: entry.breakthrough_price, label: 'Breakthrough', mode: 'breakthrough', color: BREAKTHROUGH_COLOR })
+              if (entry?.stop_loss_price) result.push({ price: entry.stop_loss_price, label: 'Stop Loss', mode: 'stoploss', color: STOP_LOSS_COLOR })
               return result.length > 0 ? result : undefined
             })()}
           />

@@ -8,3 +8,14 @@ web/.vite/
 web/coverage/
 web/dist/
 .claude/settings.local.json
+
+# Point-in-time database backups taken before migrations — 750 MB and growing,
+# and reproducible only in the sense that they are snapshots of local state.
+stocks-backup-*.db
+stocks-backup-*.db-wal
+stocks-backup-*.db-shm
+
+# Generated CSV exports and one-off HTML analysis reports.
+exports/
+*-report.html
+*-report-v2.html
