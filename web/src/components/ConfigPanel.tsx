@@ -1,5 +1,11 @@
 import { useState, useEffect } from 'react'
 import { apiClient } from '../services/api'
+import { OVERLAYS } from './PriceChart'
+import {
+  CHART_DEFAULTS_KEY, FALLBACK_CHART_DEFAULTS, TIMEFRAMES,
+  parseChartDefaults, invalidateChartDefaults,
+  type ChartDefaults, type ChartTimeframe,
+} from '../utils/chartDefaults'
 
 interface ConfigPanelProps {
   onLoading: (loading: boolean) => void
@@ -36,6 +42,28 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [newDashListLimit, setNewDashListLimit] = useState('15')
   const [newDashListSort, setNewDashListSort] = useState<'asc' | 'desc'>('asc')
   const [editingDashListIndex, setEditingDashListIndex] = useState<number | null>(null)
+  const [chartDefaults, setChartDefaults] = useState<ChartDefaults>(FALLBACK_CHART_DEFAULTS)
+
+  /**
+   * Written as one JSON value so a change is atomic — four separate keys could
+   * be half-saved, leaving the chart opening in a state nobody chose.
+   */
+  const saveChartDefaults = async (patch: Partial<ChartDefaults>) => {
+    const next = { ...chartDefaults, ...patch }
+    setChartDefaults(next)
+    try {
+      await apiClient.updateConfig(CHART_DEFAULTS_KEY, JSON.stringify(next))
+      // Charts cache the config; drop it so the next one to mount reads this.
+      invalidateChartDefaults()
+      setConfig((c) => ({ ...c, [CHART_DEFAULTS_KEY]: JSON.stringify(next) }))
+      onConfigChanged?.()
+      setSuccess('Chart defaults saved')
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save chart defaults')
+      setChartDefaults(chartDefaults)
+    }
+  }
 
   useEffect(() => {
     loadConfig()
@@ -56,6 +84,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       try {
         setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
       } catch { setDashboardLists([]) }
+      setChartDefaults(parseChartDefaults(data[CHART_DEFAULTS_KEY], OVERLAYS.map((o) => o.id)))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load configuration')
     } finally {
@@ -779,6 +808,74 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                   Cancel
                 </button>
               )}
+            </div>
+          </div>
+
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>Stock Chart Defaults</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              How the Stock Chart opens, wherever it appears. Changing it here does not
+              disturb a chart already on screen — the settings apply the next time one loads.
+            </p>
+            <div className="config-list" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>Period</label>
+                  <select
+                    className="config-input"
+                    value={chartDefaults.timeframe}
+                    onChange={(e) => void saveChartDefaults({ timeframe: e.target.value as ChartTimeframe })}
+                  >
+                    {TIMEFRAMES.map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>Style</label>
+                  <select
+                    className="config-input"
+                    value={chartDefaults.chartType}
+                    onChange={(e) => void saveChartDefaults({ chartType: e.target.value as 'line' | 'candle' })}
+                  >
+                    <option value="line">Line</option>
+                    <option value="candle">Candles</option>
+                  </select>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>Bars</label>
+                  <select
+                    className="config-input"
+                    value={chartDefaults.barInterval}
+                    onChange={(e) => void saveChartDefaults({ barInterval: e.target.value as 'day' | 'week' })}
+                  >
+                    <option value="day">Day</option>
+                    <option value="week">Week</option>
+                  </select>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Moving averages shown on open</label>
+                <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap' }}>
+                  {OVERLAYS.map((o) => (
+                    <label key={o.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                      <input
+                        type="checkbox"
+                        checked={chartDefaults.overlays.includes(o.id)}
+                        onChange={(e) => void saveChartDefaults({
+                          overlays: e.target.checked
+                            ? [...chartDefaults.overlays, o.id]
+                            : chartDefaults.overlays.filter((id) => id !== o.id),
+                        })}
+                      />
+                      {/* The swatch is the same colour the chart draws, so the
+                          choice here is recognisable on the chart itself. */}
+                      <span style={{ width: 10, height: 10, borderRadius: 2, background: o.color, display: 'inline-block' }} />
+                      {o.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
 

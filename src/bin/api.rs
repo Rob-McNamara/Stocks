@@ -981,6 +981,7 @@ const SYMBOL_KEYED_TABLES: &[&str] = &[
     "prices",
     "dividend_events",
     "dividend_exclusions",
+    "chart_drawings",
     "cached_current_prices",
     "watchlist_symbols",
     "watchlist_memberships",
@@ -2542,6 +2543,9 @@ async fn main() -> std::io::Result<()> {
             .service(post_fx_sync)
             .service(get_cash_accounts)
             .service(export_cash_account_csv)
+            .service(get_chart_drawings)
+            .service(add_chart_drawing)
+            .service(delete_chart_drawing)
             .service(add_cash_account)
             .service(update_cash_account)
             .service(delete_cash_account)
@@ -2640,6 +2644,27 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
             [],
         )
         .map_err(|err| err.to_string())?;
+
+    // User-drawn price levels on a symbol's chart.
+    //
+    // Anchored by price, never by pixel: the chart re-maps for six timeframes,
+    // a Day/Week interval and a native/AUD toggle, so a stored screen position
+    // would be wrong the moment any of those changed. The price is in the
+    // symbol's own currency for the same reason the purchase markers are —
+    // the chart applies the FX rate itself at render.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chart_drawings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            price REAL NOT NULL,
+            label TEXT,
+            colour TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chart_drawings_symbol ON chart_drawings(symbol);",
+    )
+    .map_err(|err| err.to_string())?;
 
     // Dividend events the user has deliberately declined to record. Without
     // this, automatic recording resurrects them on the next refresh — deleting
@@ -2802,6 +2827,12 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
     // a single distribution, which varies with each payment's franking and
     // stops once a TFN is quoted.
     add_column_if_missing(&conn, "holdings_transactions", "withholding_amount", "REAL")?;
+    // A trendline's two anchors. `price` above is the first anchor's price, so
+    // an existing horizontal level needs no migration: its extra columns are
+    // simply null.
+    add_column_if_missing(&conn, "chart_drawings", "start_date", "TEXT")?;
+    add_column_if_missing(&conn, "chart_drawings", "end_date", "TEXT")?;
+    add_column_if_missing(&conn, "chart_drawings", "end_price", "REAL")?;
     add_column_if_missing(&conn, "holdings_transactions", "currency", "TEXT NOT NULL DEFAULT 'AUD'")?;
     add_column_if_missing(&conn, "holdings_transactions", "original_price", "REAL")?;
     add_column_if_missing(&conn, "holdings_transactions", "fx_rate", "REAL")?;
@@ -2980,6 +3011,9 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
         DROP TRIGGER IF EXISTS audit_app_config_insert;
         DROP TRIGGER IF EXISTS audit_app_config_update;
         DROP TRIGGER IF EXISTS audit_app_config_delete;
+        DROP TRIGGER IF EXISTS audit_chart_drawings_insert;
+        DROP TRIGGER IF EXISTS audit_chart_drawings_update;
+        DROP TRIGGER IF EXISTS audit_chart_drawings_delete;
         DROP TRIGGER IF EXISTS audit_dividend_exclusions_insert;
         DROP TRIGGER IF EXISTS audit_dividend_exclusions_update;
         DROP TRIGGER IF EXISTS audit_dividend_exclusions_delete;
@@ -3246,6 +3280,31 @@ fn init_db(path: &PathBuf) -> Result<(), String> {
                 json_object('id', OLD.id, 'account_id', OLD.account_id, 'date', OLD.date,
                     'amount', OLD.amount, 'kind', OLD.kind, 'holding_tx_id', OLD.holding_tx_id,
                     'transfer_group_id', OLD.transfer_group_id, 'notes', OLD.notes, 'created_at', OLD.created_at), NULL);
+        END;
+
+        -- chart_drawings
+        CREATE TRIGGER IF NOT EXISTS audit_chart_drawings_insert AFTER INSERT ON chart_drawings
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'chart_drawings', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'kind', NEW.kind, 'price', NEW.price,
+                    'label', NEW.label, 'colour', NEW.colour, 'start_date', NEW.start_date, 'end_date', NEW.end_date, 'end_price', NEW.end_price, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_chart_drawings_update AFTER UPDATE ON chart_drawings
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'chart_drawings', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'kind', OLD.kind, 'price', OLD.price,
+                    'label', OLD.label, 'colour', OLD.colour, 'start_date', OLD.start_date, 'end_date', OLD.end_date, 'end_price', OLD.end_price, 'created_at', OLD.created_at),
+                json_object('id', NEW.id, 'symbol', NEW.symbol, 'kind', NEW.kind, 'price', NEW.price,
+                    'label', NEW.label, 'colour', NEW.colour, 'start_date', NEW.start_date, 'end_date', NEW.end_date, 'end_price', NEW.end_price, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_chart_drawings_delete AFTER DELETE ON chart_drawings
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'chart_drawings', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'symbol', OLD.symbol, 'kind', OLD.kind, 'price', OLD.price,
+                    'label', OLD.label, 'colour', OLD.colour, 'start_date', OLD.start_date, 'end_date', OLD.end_date, 'end_price', OLD.end_price, 'created_at', OLD.created_at), NULL);
         END;
 
         -- dividend_exclusions
@@ -4707,6 +4766,159 @@ fn csv_field(value: &str) -> String {
 /// running total that only means anything in a fixed order, so the order and
 /// the arithmetic are settled here rather than depending on however the client
 /// happens to sort.
+#[derive(Serialize)]
+struct ChartDrawing {
+    id: i64,
+    symbol: String,
+    kind: String,
+    /// In the symbol's own currency — the chart applies the FX rate at render.
+    price: f64,
+    label: Option<String>,
+    colour: Option<String>,
+    /// Trendlines only: the two anchors are (start_date, price) and
+    /// (end_date, end_price). Null on a horizontal level.
+    start_date: Option<String>,
+    end_date: Option<String>,
+    end_price: Option<f64>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct NewChartDrawing {
+    /// Omitted for a horizontal level, which is the default.
+    kind: Option<String>,
+    price: f64,
+    label: Option<String>,
+    colour: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    end_price: Option<f64>,
+}
+
+fn load_chart_drawings(conn: &Connection, symbol: &str) -> Result<Vec<ChartDrawing>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, symbol, kind, price, label, colour, start_date, end_date, end_price, created_at
+               FROM chart_drawings WHERE symbol = ?1 ORDER BY price DESC, id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![symbol], |r| {
+            Ok(ChartDrawing {
+                id: r.get(0)?,
+                symbol: r.get(1)?,
+                kind: r.get(2)?,
+                price: r.get(3)?,
+                label: r.get(4)?,
+                colour: r.get(5)?,
+                start_date: r.get(6)?,
+                end_date: r.get(7)?,
+                end_price: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[utoipa::path(get, path = "/api/v1/chart-drawings/{symbol}", tag = "charts",
+    params(("symbol" = String, Path, description = "symbol")),
+    responses((status = 200, description = "Price levels drawn on this symbol's chart")))]
+#[get("/api/chart-drawings/{symbol}")]
+async fn get_chart_drawings(db_path: web::Data<PathBuf>, path: web::Path<String>) -> impl Responder {
+    let symbol = path.into_inner().to_uppercase();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    match load_chart_drawings(&conn, &symbol) {
+        Ok(rows) => HttpResponse::Ok().json(serde_json::json!({ "drawings": rows })),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "chart_drawings", "api", Some(&symbol), &err);
+            err_internal(err)
+        }
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/chart-drawings/{symbol}", tag = "charts",
+    params(("symbol" = String, Path, description = "symbol")),
+    responses((status = 200, description = "Draw a horizontal price level")))]
+#[post("/api/chart-drawings/{symbol}")]
+async fn add_chart_drawing(
+    db_path: web::Data<PathBuf>,
+    path: web::Path<String>,
+    payload: web::Json<NewChartDrawing>,
+) -> impl Responder {
+    let symbol = path.into_inner().to_uppercase();
+    let payload = payload.into_inner();
+    // A level at or below zero is not a price. Rejecting it here keeps a
+    // mis-drag from writing a line that can never be seen on the chart.
+    if !payload.price.is_finite() || payload.price <= 0.0 {
+        return err_bad_request("Price level must be a positive number".to_string());
+    }
+    let kind = payload.kind.as_deref().unwrap_or("horizontal");
+    if kind == "trend" {
+        // A trendline is defined by two anchors. Storing one with a missing or
+        // non-positive second anchor would leave a row that can be read but
+        // never drawn — a line with no slope and no end.
+        let ok = payload.start_date.is_some()
+            && payload.end_date.is_some()
+            && payload.end_price.is_some_and(|p| p.is_finite() && p > 0.0);
+        if !ok {
+            return err_bad_request(
+                "A trendline needs both anchors: start_date, end_date and a positive end_price".to_string(),
+            );
+        }
+        if payload.start_date == payload.end_date {
+            return err_bad_request("A trendline's two anchors must be on different dates".to_string());
+        }
+    } else if kind != "horizontal" {
+        return err_bad_request(format!("Unknown drawing kind '{}'", kind));
+    }
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let result = conn.execute(
+        "INSERT INTO chart_drawings (symbol, kind, price, label, colour, start_date, end_date, end_price, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![symbol, kind, payload.price, payload.label, payload.colour,
+                payload.start_date, payload.end_date, payload.end_price, Utc::now().to_rfc3339()],
+    );
+    match result {
+        Ok(_) => {
+            let id = conn.last_insert_rowid();
+            let _ = insert_event_log(&db_path, "info", "chart_drawings", "api", Some(&symbol),
+                &format!("Drew level {} at {}", id, payload.price));
+            match load_chart_drawings(&conn, &symbol) {
+                Ok(rows) => HttpResponse::Ok().json(serde_json::json!({ "drawings": rows })),
+                Err(err) => err_internal(err),
+            }
+        }
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
+#[utoipa::path(delete, path = "/api/v1/chart-drawings/id/{id}", tag = "charts",
+    params(("id" = i64, Path, description = "id")),
+    responses((status = 204, description = "Remove a drawn level")))]
+#[delete("/api/chart-drawings/id/{id}")]
+async fn delete_chart_drawing(db_path: web::Data<PathBuf>, path: web::Path<i64>) -> impl Responder {
+    let id = path.into_inner();
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    match conn.execute("DELETE FROM chart_drawings WHERE id = ?1", params![id]) {
+        Ok(0) => err_not_found(format!("Drawing {} not found", id)),
+        Ok(_) => {
+            let _ = insert_event_log(&db_path, "info", "chart_drawings", "api", None, &format!("Removed level {}", id));
+            HttpResponse::NoContent().finish()
+        }
+        Err(err) => err_internal(err.to_string()),
+    }
+}
+
 #[utoipa::path(get, path = "/api/v1/cash/accounts/{id}/transactions.csv", tag = "cash",
     params(("id" = i64, Path, description = "id")),
     responses((status = 200, description = "Cash account ledger as CSV")))]
@@ -10987,6 +11199,129 @@ mod tests {
         assert!(close_to(&record["quantity"], 12.0));
         assert!(close_to(&record["price"], 5.5));
         assert_eq!(tx_count(&db_path, "TST.AX"), 1, "update must not duplicate the row");
+    }
+
+    /// Levels are stored per symbol in that symbol's own currency, and come
+    /// back highest first so the chart draws them top to bottom.
+    #[actix_web::test]
+    async fn chart_levels_round_trip_and_delete() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(get_chart_drawings)
+                .service(add_chart_drawing)
+                .service(delete_chart_drawing),
+        )
+        .await;
+
+        let post = |price: f64, label: &str| {
+            actix_web::test::TestRequest::post()
+                .uri("/api/chart-drawings/BHP.AX")
+                .set_json(serde_json::json!({ "price": price, "label": label }))
+                .to_request()
+        };
+        let _ = actix_web::test::call_service(&app, post(38.5, "support")).await;
+        let body: serde_json::Value =
+            actix_web::test::call_and_read_body_json(&app, post(45.0, "resistance")).await;
+        let drawings = body["drawings"].as_array().unwrap();
+        assert_eq!(drawings.len(), 2);
+        assert_eq!(drawings[0]["price"], 45.0, "highest level first");
+        assert_eq!(drawings[1]["label"], "support");
+        assert_eq!(drawings[0]["kind"], "horizontal");
+
+        // Another symbol's chart must not inherit them.
+        let req = actix_web::test::TestRequest::get().uri("/api/chart-drawings/RIO.AX").to_request();
+        let other: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        assert_eq!(other["drawings"].as_array().unwrap().len(), 0);
+
+        let id = drawings[0]["id"].as_i64().unwrap();
+        let req = actix_web::test::TestRequest::delete()
+            .uri(&format!("/api/chart-drawings/id/{}", id))
+            .to_request();
+        assert_eq!(actix_web::test::call_service(&app, req).await.status(), 204);
+
+        let req = actix_web::test::TestRequest::get().uri("/api/chart-drawings/BHP.AX").to_request();
+        let left: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        assert_eq!(left["drawings"].as_array().unwrap().len(), 1);
+    }
+
+    /// A trendline is defined by two anchors. A row missing one can be read
+    /// back but never drawn — a line with no slope and no end.
+    #[actix_web::test]
+    async fn a_trendline_needs_both_of_its_anchors() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(add_chart_drawing)
+                .service(get_chart_drawings),
+        )
+        .await;
+        let post = |body: serde_json::Value| {
+            actix_web::test::TestRequest::post()
+                .uri("/api/chart-drawings/BHP.AX")
+                .set_json(body)
+                .to_request()
+        };
+
+        for (case, body) in [
+            ("no end anchor", serde_json::json!({ "kind": "trend", "price": 30.0, "start_date": "2026-01-05" })),
+            ("no end price", serde_json::json!({ "kind": "trend", "price": 30.0, "start_date": "2026-01-05", "end_date": "2026-03-05" })),
+            ("zero end price", serde_json::json!({ "kind": "trend", "price": 30.0, "start_date": "2026-01-05", "end_date": "2026-03-05", "end_price": 0.0 })),
+            ("same date twice", serde_json::json!({ "kind": "trend", "price": 30.0, "start_date": "2026-01-05", "end_date": "2026-01-05", "end_price": 40.0 })),
+            ("unknown kind", serde_json::json!({ "kind": "squiggle", "price": 30.0 })),
+        ] {
+            let status = actix_web::test::call_service(&app, post(body)).await.status();
+            assert_eq!(status, 400, "{case} should be refused");
+        }
+
+        let good = serde_json::json!({
+            "kind": "trend", "price": 30.0, "label": "uptrend",
+            "start_date": "2026-01-05", "end_date": "2026-03-05", "end_price": 42.5
+        });
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, post(good)).await;
+        let d = &body["drawings"][0];
+        assert_eq!(d["kind"], "trend");
+        assert_eq!(d["start_date"], "2026-01-05");
+        assert_eq!(d["end_price"], 42.5);
+    }
+
+    /// Horizontal levels predate the anchor columns, so they must still store
+    /// and read back with those columns simply absent.
+    #[actix_web::test]
+    async fn a_horizontal_level_leaves_the_trend_anchors_empty() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(add_chart_drawing),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/api/chart-drawings/BHP.AX")
+            .set_json(serde_json::json!({ "price": 38.5 }))
+            .to_request();
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        let d = &body["drawings"][0];
+        assert_eq!(d["kind"], "horizontal");
+        assert!(d["start_date"].is_null());
+        assert!(d["end_price"].is_null());
+    }
+
+    /// A stray drag must not write a level that can never be seen.
+    #[actix_web::test]
+    async fn a_chart_level_must_be_a_positive_price() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(add_chart_drawing),
+        )
+        .await;
+        for bad in [0.0, -5.0] {
+            let req = actix_web::test::TestRequest::post()
+                .uri("/api/chart-drawings/BHP.AX")
+                .set_json(serde_json::json!({ "price": bad }))
+                .to_request();
+            assert_eq!(actix_web::test::call_service(&app, req).await.status(), 400, "price {bad}");
+        }
     }
 
     /// The export carries a running balance, so the order and the arithmetic

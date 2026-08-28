@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { apiClient } from '../services/api'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { apiClient, type ChartDrawing } from '../services/api'
 import { calculateSMA, calculateEMA } from '../utils/sma'
 import { toWeeklyBars } from '../utils/bars'
+import { loadChartDefaults, FALLBACK_CHART_DEFAULTS, type ChartTimeframe } from '../utils/chartDefaults'
 
 interface PriceHistoryPoint {
   date: string
@@ -26,6 +27,17 @@ export const BREAKTHROUGH_COLOR = '#1565c0'
 export const STOP_LOSS_COLOR = '#e91e63'
 /** Purchase predates the chart range — pinned to the Y axis instead. */
 const PURCHASE_AXIS_COLOR = '#ff9800'
+/** User-drawn support/resistance levels. */
+/** Recessive grey: an annotation, deliberately outside the series hue space. */
+export const DRAWING_COLOR = '#5f6368'
+/**
+ * Tooltip text sits on a near-black panel, so it wears an ink colour and a
+ * coloured swatch carries the series identity. Painting the text itself in the
+ * series colour put brown (#795548) and purple (#9c27b0) on #1e2a3a, which is
+ * close to unreadable — the darker a series reads on the white chart, the worse
+ * it reads in the tooltip.
+ */
+const TOOLTIP_INK = '#e8ecf3'
 
 interface PriceChartProps {
   symbol: string
@@ -66,13 +78,28 @@ interface OverlayDef {
   dash: string
 }
 
-const OVERLAYS: readonly OverlayDef[] = [
-  { id: 'sma20',  label: 'SMA 20',  period: 20,  kind: 'sma', color: '#9c27b0', dash: '8 6' },
-  { id: 'ema40',  label: 'EMA 40',  period: 40,  kind: 'ema', color: '#795548', dash: '3 4' },
-  { id: 'sma50',  label: 'SMA 50',  period: 50,  kind: 'sma', color: '#ff9800', dash: '8 6' },
-  { id: 'sma100', label: 'SMA 100', period: 100, kind: 'sma', color: '#00bcd4', dash: '8 6' },
-  { id: 'sma150', label: 'SMA 150', period: 150, kind: 'sma', color: '#f44336', dash: '8 6' },
-  { id: 'sma200', label: 'SMA 200', period: 200, kind: 'sma', color: '#4caf50', dash: '8 6' },
+/**
+ * Overlay colours, validated rather than chosen by eye.
+ *
+ * Constrained by what the chart already paints: the price line (#2f5ce4), the
+ * candles (#4caf50 up, #f44336 down) and the purchase markers own blue, green,
+ * red and bright orange, so no overlay may use them. The previous palette
+ * matched three of those *exactly* — SMA 150 was the up-candle green and SMA
+ * 200 the down-candle red, so in candle mode those lines vanished into the
+ * bars — and its brown fell below the chroma floor, reading as grey.
+ *
+ * Checked with the data-viz validator on a white surface: the full six pass
+ * the lightness band, chroma floor, adjacent-pair CVD separation and contrast;
+ * the three in heaviest use (EMA 40, SMA 50, SMA 150) also pass as their own
+ * set, since they are typically shown together.
+ */
+export const OVERLAYS: readonly OverlayDef[] = [
+  { id: 'sma20',  label: 'SMA 20',  period: 20,  kind: 'sma', color: '#827717', dash: '8 6' },
+  { id: 'ema40',  label: 'EMA 40',  period: 40,  kind: 'ema', color: '#0097a7', dash: '3 4' },
+  { id: 'sma50',  label: 'SMA 50',  period: 50,  kind: 'sma', color: '#7b1fa2', dash: '8 6' },
+  { id: 'sma100', label: 'SMA 100', period: 100, kind: 'sma', color: '#c2185b', dash: '8 6' },
+  { id: 'sma150', label: 'SMA 150', period: 150, kind: 'sma', color: '#a15c00', dash: '8 6' },
+  { id: 'sma200', label: 'SMA 200', period: 200, kind: 'sma', color: '#3949ab', dash: '8 6' },
 ]
 
 function buildPath(points: Array<{ x: number; y: number | null }>) {
@@ -87,10 +114,15 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const [history, setHistory] = useState<PriceHistoryPoint[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [activeOverlays, setActiveOverlays] = useState<Set<string>>(new Set(['sma50', 'sma150']))
-  const [timeframe, setTimeframe] = useState<'2y' | '12m' | '6m' | '3m' | '1m' | '1w'>('6m')
-  const [chartType, setChartType] = useState<'line' | 'candle'>('line')
-  const [barInterval, setBarInterval] = useState<'day' | 'week'>('day')
+  const [activeOverlays, setActiveOverlays] = useState<Set<string>>(new Set(FALLBACK_CHART_DEFAULTS.overlays))
+  const [drawings, setDrawings] = useState<ChartDrawing[]>([])
+  const [drawMode, setDrawMode] = useState<null | 'level' | 'trend'>(null)
+  /** First anchor of a trendline, waiting for its second click. */
+  const [pendingAnchor, setPendingAnchor] = useState<{ date: string; price: number } | null>(null)
+  const [drawError, setDrawError] = useState<string | null>(null)
+  const [timeframe, setTimeframe] = useState<ChartTimeframe>(FALLBACK_CHART_DEFAULTS.timeframe)
+  const [chartType, setChartType] = useState<'line' | 'candle'>(FALLBACK_CHART_DEFAULTS.chartType)
+  const [barInterval, setBarInterval] = useState<'day' | 'week'>(FALLBACK_CHART_DEFAULTS.barInterval)
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
   const [showInAud, setShowInAud] = useState(false)
   const [fxRate, setFxRate] = useState<number | null>(null)
@@ -99,6 +131,8 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   // the parent's symbolInfo cache hasn't been populated yet for this symbol.
   const [detectedCurrency, setDetectedCurrency] = useState<string>('AUD')
   const svgRef = useRef<SVGSVGElement>(null)
+  // Unique per chart: several can share a page (Holdings list, Analysis).
+  const clipId = useId().replace(/:/g, '')
 
   const isInternational = detectedCurrency !== 'AUD'
 
@@ -207,6 +241,47 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     () => (barInterval === 'week' ? toWeeklyBars(effectiveHistory) : effectiveHistory),
     [effectiveHistory, barInterval],
   )
+
+  /**
+   * Apply the configured opening state, once.
+   *
+   * The config arrives after the first render, so this must not overwrite a
+   * control the user has already touched — changing the timeframe and watching
+   * it snap back a moment later would look like the chart ignoring the click.
+   * Applying only on the first load also means it does not re-seed when the
+   * symbol changes, so a chosen timeframe survives switching stocks.
+   */
+  const defaultsApplied = useRef(false)
+  /**
+   * Set the moment any toolbar control is used. The config resolves after the
+   * first render, so without this a click made while the request is in flight
+   * would be silently undone when it lands.
+   */
+  const userAdjusted = useRef(false)
+  useEffect(() => {
+    if (defaultsApplied.current) return
+    let cancelled = false
+    loadChartDefaults(OVERLAYS.map((o) => o.id)).then((d) => {
+      if (cancelled || defaultsApplied.current || userAdjusted.current) return
+      defaultsApplied.current = true
+      setTimeframe(d.timeframe)
+      setChartType(d.chartType)
+      setBarInterval(d.barInterval)
+      setActiveOverlays(new Set(d.overlays))
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  // Levels belong to the symbol, so they follow it onto whichever screen is
+  // charting it. A failure just means no levels — never a broken chart.
+  useEffect(() => {
+    let cancelled = false
+    setPendingAnchor(null)
+    apiClient.getChartDrawings?.(symbol)
+      .then((rows) => { if (!cancelled) setDrawings(rows) })
+      .catch(() => { if (!cancelled) setDrawings([]) })
+    return () => { cancelled = true }
+  }, [symbol])
 
   const trimmedHistory = useMemo(() => {
     if (seriesHistory.length === 0) return seriesHistory
@@ -477,6 +552,123 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   // representative purchase.
   const purchaseDot = purchaseDots[0] ?? null
 
+  /**
+   * Price at a given y pixel — the inverse of `chartData.toY`, divided back
+   * out of the display currency.
+   *
+   * The stored level must be native: the chart multiplies by `fxMultiplier` at
+   * render, so saving the AUD figure while viewing AUD would draw the line in
+   * the wrong place the moment the toggle flipped, and doubly wrong on a
+   * native view.
+   */
+  /**
+   * X pixel for a calendar date, extrapolating outside the visible window.
+   *
+   * X is bar-index based, so this interpolates between the two bars either
+   * side of the date. Crucially it does *not* clamp: an anchor before the
+   * first bar or after the last returns an x outside the plot, and the line is
+   * clipped instead. Clamping would move the anchor and silently change the
+   * line's slope — the one thing a trendline must never do.
+   */
+  const dateToX = (date: string): number => {
+    const n = trimmedHistory.length
+    if (n === 0) return chartData.left
+    const xAt = (i: number) => chartData.left + (chartData.plotWidth * i) / Math.max(n - 1, 1)
+    const first = trimmedHistory[0].date
+    const last = trimmedHistory[n - 1].date
+    const day = 86400000
+    const spanDays = Math.max((Date.parse(last) - Date.parse(first)) / day, 1)
+    // Pixels per calendar day, used only to extrapolate beyond the data.
+    const pxPerDay = chartData.plotWidth / spanDays
+
+    if (date <= first) return xAt(0) - ((Date.parse(first) - Date.parse(date)) / day) * pxPerDay
+    if (date >= last) return xAt(n - 1) + ((Date.parse(date) - Date.parse(last)) / day) * pxPerDay
+
+    const hi = trimmedHistory.findIndex((h) => h.date >= date)
+    const lo = Math.max(hi - 1, 0)
+    const t0 = Date.parse(trimmedHistory[lo].date)
+    const t1 = Date.parse(trimmedHistory[hi].date)
+    const frac = t1 === t0 ? 0 : (Date.parse(date) - t0) / (t1 - t0)
+    return xAt(lo) + (xAt(hi) - xAt(lo)) * frac
+  }
+
+  /** Nearest bar's date to an x pixel — anchors snap to real trading days. */
+  const dateAtX = (x: number): string | null => {
+    const n = trimmedHistory.length
+    if (n === 0) return null
+    const i = Math.round(((x - chartData.left) / chartData.plotWidth) * (n - 1))
+    return trimmedHistory[Math.max(0, Math.min(n - 1, i))].date
+  }
+
+  const nativePriceAtY = (y: number): number => {
+    const { top, pricePlotHeight, minValue, maxValue } = chartData
+    const displayPrice = minValue + ((top + pricePlotHeight - y) / pricePlotHeight) * (maxValue - minValue)
+    return displayPrice / fxMultiplier
+  }
+
+  const handleChartClick = async (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!drawMode) return
+    const svg = svgRef.current
+    if (!svg) return
+    const rect = svg.getBoundingClientRect()
+    const y = ((e.clientY - rect.top) / rect.height) * chartData.height
+    const x = ((e.clientX - rect.left) / rect.width) * chartData.width
+    // Ignore a click in the axis gutter or over the volume panel — there is no
+    // price there, and placing an anchor from it would be a guess.
+    if (y < chartData.top || y > chartData.top + chartData.pricePlotHeight) return
+
+    const price = nativePriceAtY(y)
+    if (!isFinite(price) || price <= 0) return
+    setDrawError(null)
+
+    if (drawMode === 'level') {
+      try {
+        setDrawings(await apiClient.addChartDrawing(symbol, Number(price.toFixed(4))))
+      } catch (err) {
+        setDrawError(err instanceof Error ? err.message : 'Failed to save the price level')
+      }
+      return
+    }
+
+    // Trendline: first click sets an anchor, second completes the line.
+    const date = dateAtX(x)
+    if (!date) return
+    if (!pendingAnchor) {
+      setPendingAnchor({ date, price })
+      return
+    }
+    if (date === pendingAnchor.date) {
+      setDrawError('Pick a second point on a different date — a trendline needs two.')
+      return
+    }
+    // Oldest anchor first, so the line always reads left to right regardless
+    // of which end was clicked first.
+    const [a, b] = date < pendingAnchor.date
+      ? [{ date, price }, pendingAnchor]
+      : [pendingAnchor, { date, price }]
+    try {
+      setDrawings(await apiClient.addTrendline(symbol, {
+        startDate: a.date,
+        startPrice: Number(a.price.toFixed(4)),
+        endDate: b.date,
+        endPrice: Number(b.price.toFixed(4)),
+      }))
+      setPendingAnchor(null)
+    } catch (err) {
+      setDrawError(err instanceof Error ? err.message : 'Failed to save the trendline')
+    }
+  }
+
+  const removeDrawing = async (id: number) => {
+    setDrawError(null)
+    try {
+      await apiClient.deleteChartDrawing(id)
+      setDrawings((rows) => rows.filter((r) => r.id !== id))
+    } catch (err) {
+      setDrawError(err instanceof Error ? err.message : 'Failed to remove the price level')
+    }
+  }
+
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current
     if (!svg || trimmedHistory.length === 0) return
@@ -516,7 +708,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   if (error) return <div className="alert alert-error">{error}</div>
   if (trimmedHistory.length === 0) return <p className="chart-message">No historical price data available for {symbol}.</p>
 
-  const tooltipWidth = 170
+  const tooltipWidth = 186
   const tooltipX = hoverData
     ? hoverData.x + 10 + tooltipWidth > chartData.width - chartData.right
       ? hoverData.x - tooltipWidth - 10
@@ -561,21 +753,36 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           <span className="chart-detail">Last: {trimmedHistory[trimmedHistory.length - 1]?.date}</span>
           <div className="sma-selector">
             {(['1w', '1m', '3m', '6m', '12m', '2y'] as const).map((tf) => (
-              <button key={tf} className={`sma-button ${timeframe === tf ? 'active' : ''}`} onClick={() => setTimeframe(tf)}>
+              <button key={tf} className={`sma-button ${timeframe === tf ? 'active' : ''}`} onClick={() => { userAdjusted.current = true; setTimeframe(tf) }}>
                 {tf === '1w' ? '1W' : tf === '1m' ? '1M' : tf === '3m' ? '3M' : tf === '6m' ? '6M' : tf === '12m' ? '12M' : '2Y'}
               </button>
             ))}
             <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
             <button
+              className={`sma-button ${drawMode === 'level' ? 'active' : ''}`}
+              onClick={() => { setDrawMode((v) => (v === 'level' ? null : 'level')); setPendingAnchor(null); setDrawError(null) }}
+              title="Draw a horizontal price level"
+            >
+              ⊹ Level
+            </button>
+            <button
+              className={`sma-button ${drawMode === 'trend' ? 'active' : ''}`}
+              onClick={() => { setDrawMode((v) => (v === 'trend' ? null : 'trend')); setPendingAnchor(null); setDrawError(null) }}
+              title="Draw a trendline between two points"
+            >
+              ╱ Trend
+            </button>
+            <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
+            <button
               className={`sma-button ${chartType === 'line' ? 'active' : ''}`}
-              onClick={() => setChartType('line')}
+              onClick={() => { userAdjusted.current = true; setChartType('line') }}
               title="Show the closing price as a line"
             >
               Line
             </button>
             <button
               className={`sma-button ${showCandles ? 'active' : ''}`}
-              onClick={() => setChartType('candle')}
+              onClick={() => { userAdjusted.current = true; setChartType('candle') }}
               disabled={!hasOhlc}
               title={hasOhlc
                 ? 'Show open/high/low/close candlesticks'
@@ -586,14 +793,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
             <button
               className={`sma-button ${barInterval === 'day' ? 'active' : ''}`}
-              onClick={() => setBarInterval('day')}
+              onClick={() => { userAdjusted.current = true; setBarInterval('day') }}
               title="One bar per trading day"
             >
               Day
             </button>
             <button
               className={`sma-button ${barInterval === 'week' ? 'active' : ''}`}
-              onClick={() => setBarInterval('week')}
+              onClick={() => { userAdjusted.current = true; setBarInterval('week') }}
               title="One bar per week: first open, highest high, lowest low, last close"
             >
               Week
@@ -604,7 +811,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                 key={o.id}
                 className={`sma-button ${activeOverlays.has(o.id) ? 'active' : ''}`}
                 style={activeOverlays.has(o.id) ? { borderColor: o.color, color: o.color } : {}}
-                onClick={() => toggleOverlay(o.id)}
+                onClick={() => { userAdjusted.current = true; toggleOverlay(o.id) }}
                 title={activeOverlays.has(o.id) ? `Hide ${o.label}` : `Show ${o.label}`}
               >
                 {o.label}
@@ -632,14 +839,40 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         </div>
       </div>
       <div className="chart-frame">
+        {drawMode === 'level' && (
+          <div style={{ fontSize: 12, color: '#546e7a', marginBottom: 4 }}>
+            Click anywhere on the price panel to place a level. Click × on a level to remove it.
+          </div>
+        )}
+        {drawMode === 'trend' && (
+          <div style={{ fontSize: 12, color: '#546e7a', marginBottom: 4 }}>
+            {pendingAnchor
+              ? `Anchored at ${pendingAnchor.date} — click a second point to finish the line.`
+              : 'Click the first point of the trendline. Anchors snap to trading days.'}
+          </div>
+        )}
+        {drawError && <div className="alert alert-error" style={{ marginBottom: 4 }}>{drawError}</div>}
         <svg
           ref={svgRef}
           viewBox={`0 0 ${chartData.width} ${chartData.height}`}
           className="chart-svg"
           onMouseMove={handleMouseMove}
           onMouseLeave={() => setHoverIndex(null)}
+          onClick={handleChartClick}
           style={{ cursor: 'crosshair' }}
         >
+          <defs>
+            {/* Trendlines project past their anchors, so they must be kept
+                inside the price panel rather than painting over the axis
+                labels and the volume bars below. */}
+            <clipPath id={clipId}>
+              <rect
+                x={chartData.left} y={chartData.top}
+                width={chartData.plotWidth} height={chartData.pricePlotHeight}
+              />
+            </clipPath>
+          </defs>
+
           <rect x="0" y="0" width={chartData.width} height={chartData.height} fill="#ffffff" rx="18" />
 
           {chartData.yLabels.map(({ y, label }) => (
@@ -694,6 +927,72 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             ))
           ) : (
             <path className="close-line" d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
+          )}
+
+          {/* User-drawn price levels. Anchored by price, so they survive every
+              timeframe, interval and currency change; a level outside the
+              current y-range is simply not drawn rather than expanding the
+              scale and flattening the price series. */}
+          {drawings.map((d) => {
+            const colour = d.colour ?? DRAWING_COLOR
+
+            if (d.kind === 'trend' && d.start_date && d.end_date && d.end_price != null) {
+              const x1 = dateToX(d.start_date)
+              const y1 = chartData.toY(d.price * fxMultiplier)
+              const x2 = dateToX(d.end_date)
+              const y2 = chartData.toY(d.end_price * fxMultiplier)
+              if (x2 === x1) return null
+              // Projected past the second anchor to the right edge — that is
+              // the point of a trendline. The clip path keeps it inside the
+              // price panel instead of painting over the axis and volume bars.
+              const right = chartData.left + chartData.plotWidth
+              const slope = (y2 - y1) / (x2 - x1)
+              const yAtRight = y2 + slope * (right - x2)
+              return (
+                <g key={d.id} clipPath={`url(#${clipId})`}>
+                  <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={colour} strokeWidth="1.5" />
+                  <line
+                    x1={x2} y1={y2} x2={right} y2={yAtRight}
+                    stroke={colour} strokeWidth="1.5" strokeDasharray="4 4" opacity="0.7"
+                  />
+                  <circle cx={x1} cy={y1} r="4" fill={colour} stroke="#fff" strokeWidth="1.5" />
+                  <g style={{ cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); void removeDrawing(d.id) }}>
+                    <title>Remove this trendline</title>
+                    <circle cx={x2} cy={y2} r="6" fill="#fff" stroke={colour} strokeWidth="1.5" />
+                    <text x={x2} y={y2 + 4} fontSize="10" fill={colour} textAnchor="middle" fontFamily="inherit">×</text>
+                  </g>
+                </g>
+              )
+            }
+
+            const y = chartData.toY(d.price * fxMultiplier)
+            if (y < chartData.top || y > chartData.top + chartData.pricePlotHeight) return null
+            return (
+              <g key={d.id}>
+                <line
+                  x1={chartData.left} y1={y}
+                  x2={chartData.left + chartData.plotWidth} y2={y}
+                  stroke={colour} strokeWidth="1.5" strokeDasharray="6 4"
+                />
+                <text x={chartData.left + 4} y={y - 4} fontSize="11" fill={colour} fontFamily="inherit">
+                  {d.label ? `${d.label} ` : ''}{currSym}{(d.price * fxMultiplier).toFixed(2)}
+                </text>
+                {/* Past the plot edge, so it never covers a bar. */}
+                <g style={{ cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); void removeDrawing(d.id) }}>
+                  <title>Remove this level</title>
+                  <circle cx={chartData.left + chartData.plotWidth + 9} cy={y} r="7" fill="#fff" stroke={colour} strokeWidth="1.5" />
+                  <text x={chartData.left + chartData.plotWidth + 9} y={y + 4} fontSize="11" fill={colour} textAnchor="middle" fontFamily="inherit">×</text>
+                </g>
+              </g>
+            )
+          })}
+
+          {pendingAnchor && (
+            <circle
+              cx={dateToX(pendingAnchor.date)}
+              cy={chartData.toY(pendingAnchor.price * fxMultiplier)}
+              r="5" fill="none" stroke={DRAWING_COLOR} strokeWidth="2" strokeDasharray="3 2"
+            />
           )}
 
           {/* Marker dots (breakthrough price / stop loss) */}
@@ -756,20 +1055,33 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
               )}
               {hoverData.overlayValues.map(({ id, label, color, value }, i) =>
                 value !== null ? (
-                  <text key={id} x={tooltipX + 10} y={tooltipRowY(i)} fontSize="12" fill={color} fontFamily="inherit">
-                    {label}: {currSym}{value.toFixed(2)}
-                  </text>
+                  <g key={id}>
+                    <rect x={tooltipX + 10} y={tooltipRowY(i) - 8} width={9} height={9} rx="2" fill={color} />
+                    <text x={tooltipX + 24} y={tooltipRowY(i)} fontSize="12" fill={TOOLTIP_INK} fontFamily="inherit">
+                      {label}: {currSym}{value.toFixed(2)}
+                    </text>
+                  </g>
                 ) : null
               )}
               {markerDots.map((dot, i) => (
-                <text key={`m${i}`} x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + i)} fontSize="12" fill={dot.color} fontFamily="inherit">
-                  {dot.label}: {currSym}{dot.price.toFixed(2)}
-                </text>
+                <g key={`m${i}`}>
+                  <rect x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + i) - 8} width={9} height={9} rx="2" fill={dot.color} />
+                  <text x={tooltipX + 24} y={tooltipRowY(activeOverlayValues.length + i)} fontSize="12" fill={TOOLTIP_INK} fontFamily="inherit">
+                    {dot.label}: {currSym}{dot.price.toFixed(2)}
+                  </text>
+                </g>
               ))}
               {purchaseDot && (
-                <text x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + markerDots.length)} fontSize="12" fill={purchaseDot.onAxis ? PURCHASE_AXIS_COLOR : PURCHASE_COLOR} fontFamily="inherit">
-                  Purchase: {currSym}{purchaseDot.price.toFixed(2)}
-                </text>
+                <g>
+                  <rect
+                    x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + markerDots.length) - 8}
+                    width={9} height={9} rx="2"
+                    fill={purchaseDot.onAxis ? PURCHASE_AXIS_COLOR : PURCHASE_COLOR}
+                  />
+                  <text x={tooltipX + 24} y={tooltipRowY(activeOverlayValues.length + markerDots.length)} fontSize="12" fill={TOOLTIP_INK} fontFamily="inherit">
+                    Purchase: {currSym}{purchaseDot.price.toFixed(2)}
+                  </text>
+                </g>
               )}
             </g>
           )}

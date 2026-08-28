@@ -3,6 +3,7 @@ import { calculateSMA, calculateEMA, getLatestSMA, smaTrend } from './sma'
 import { toWeeklyBars } from './bars'
 import { mapLimit } from './async'
 import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from './holdings'
+import { parseChartDefaults, FALLBACK_CHART_DEFAULTS } from './chartDefaults'
 
 // The FIFO/P&L engine and its test suite now live in the Rust API server
 // (src/portfolio.rs) — these tests cover the utilities that remain
@@ -265,5 +266,45 @@ describe('getRemainingPurchaseLots', () => {
       { id: 3, symbol: 'BBB.AX', transaction_type: 'purchase', date: '2025-02-01', quantity: 5, price: 3 },
     ], 'AAA.AX')
     expect(lots).toEqual([])
+  })
+})
+
+describe('parseChartDefaults', () => {
+  const known = ['sma20', 'ema40', 'sma50', 'sma100', 'sma150', 'sma200']
+
+  it('returns the built-in defaults when nothing is stored', () => {
+    expect(parseChartDefaults(undefined, known)).toEqual(FALLBACK_CHART_DEFAULTS)
+  })
+
+  it('reads a stored setting back', () => {
+    const stored = JSON.stringify({ timeframe: '2y', chartType: 'candle', barInterval: 'week', overlays: ['ema40'] })
+    expect(parseChartDefaults(stored, known)).toEqual({
+      timeframe: '2y', chartType: 'candle', barInterval: 'week', overlays: ['ema40'],
+    })
+  })
+
+  // A value from an older version must not leave the chart in a state its own
+  // controls cannot represent — every button would read inactive with nothing
+  // explaining why.
+  it('falls back field by field on unknown values', () => {
+    const stored = JSON.stringify({ timeframe: '10y', chartType: 'pie', barInterval: 'month', overlays: ['ema40'] })
+    const result = parseChartDefaults(stored, known)
+    expect(result.timeframe).toBe(FALLBACK_CHART_DEFAULTS.timeframe)
+    expect(result.chartType).toBe(FALLBACK_CHART_DEFAULTS.chartType)
+    expect(result.barInterval).toBe(FALLBACK_CHART_DEFAULTS.barInterval)
+    expect(result.overlays).toEqual(['ema40'])
+  })
+
+  it('drops overlay ids that no longer exist', () => {
+    const stored = JSON.stringify({ overlays: ['sma50', 'sma999', 'ema40'] })
+    expect(parseChartDefaults(stored, known).overlays).toEqual(['sma50', 'ema40'])
+  })
+
+  it('survives malformed JSON', () => {
+    expect(parseChartDefaults('{not json', known)).toEqual(FALLBACK_CHART_DEFAULTS)
+  })
+
+  it('allows an empty overlay set, which is a real choice', () => {
+    expect(parseChartDefaults(JSON.stringify({ overlays: [] }), known).overlays).toEqual([])
   })
 })

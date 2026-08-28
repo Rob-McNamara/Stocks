@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
-import PriceChart from './PriceChart'
+import PriceChart, { DRAWING_COLOR } from './PriceChart'
+import { invalidateChartDefaults } from '../utils/chartDefaults'
 
 vi.mock('../services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../services/api')>()
@@ -9,6 +10,11 @@ vi.mock('../services/api', async (importOriginal) => {
     ...actual,
     apiClient: {
       getPriceHistory: vi.fn(),
+      getConfig: vi.fn(),
+      getChartDrawings: vi.fn(),
+      addChartDrawing: vi.fn(),
+      addTrendline: vi.fn(),
+      deleteChartDrawing: vi.fn(),
       getSymbolInfo: vi.fn(),
       getFxRateForDate: vi.fn(),
     },
@@ -18,6 +24,10 @@ vi.mock('../services/api', async (importOriginal) => {
 import { apiClient } from '../services/api'
 const getPriceHistory = apiClient.getPriceHistory as ReturnType<typeof vi.fn>
 const getSymbolInfo = apiClient.getSymbolInfo as ReturnType<typeof vi.fn>
+const getChartDrawings = apiClient.getChartDrawings as ReturnType<typeof vi.fn>
+const addChartDrawing = apiClient.addChartDrawing as ReturnType<typeof vi.fn>
+const addTrendline = apiClient.addTrendline as ReturnType<typeof vi.fn>
+const deleteChartDrawing = apiClient.deleteChartDrawing as ReturnType<typeof vi.fn>
 
 // Chart geometry constants from PriceChart's chartData
 const LEFT = 72
@@ -56,6 +66,17 @@ beforeEach(() => {
   cleanup()
   getPriceHistory.mockReset().mockResolvedValue(HISTORY)
   getSymbolInfo.mockReset().mockResolvedValue([])
+  // No test needed a foreign symbol before, so this mock had no default and
+  // returned undefined the moment one did.
+  ;(apiClient.getFxRateForDate as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue(null)
+  // The defaults fetch is cached module-wide, so it must be dropped between
+  // tests or the first result would be reused by every later one.
+  invalidateChartDefaults()
+  ;(apiClient.getConfig as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue({})
+  getChartDrawings.mockReset().mockResolvedValue([])
+  addChartDrawing.mockReset().mockResolvedValue([])
+  addTrendline.mockReset().mockResolvedValue([])
+  deleteChartDrawing.mockReset().mockResolvedValue(undefined)
 })
 
 afterEach(() => {
@@ -395,5 +416,205 @@ describe('stop-loss marker', () => {
     })
     fireEvent.mouseMove(container.querySelector('svg')!, { clientX: 500, clientY: 100 })
     await waitFor(() => expect(screen.getByText(/Trailing Sell: \$9\.00/)).toBeTruthy())
+  })
+})
+
+describe('drawn price levels', () => {
+  const level = (over: Record<string, unknown> = {}) => ({
+    id: 1, symbol: 'TST.AX', kind: 'horizontal' as const,
+    price: 10, label: null, colour: null,
+    start_date: null, end_date: null, end_price: null, created_at: 'x', ...over,
+  })
+
+  it('draws a level as a full-width line labelled with its price', async () => {
+    getChartDrawings.mockResolvedValue([level({ price: 10, label: 'support' })])
+    const { container } = await renderChart()
+    await waitFor(() => expect(screen.getByText(/support/)).toBeTruthy())
+    const line = [...container.querySelectorAll('line')]
+      .find((l) => l.getAttribute('stroke-dasharray') === '6 4')!
+    expect(line).toBeTruthy()
+    expect(parseFloat(line.getAttribute('x1')!)).toBe(LEFT)
+    expect(parseFloat(line.getAttribute('x2')!)).toBe(LEFT + PLOT_WIDTH)
+    // Horizontal: both ends at the same height.
+    expect(line.getAttribute('y1')).toBe(line.getAttribute('y2'))
+  })
+
+  // Expanding the scale to fit a stray level would flatten the price series
+  // into a band; the level is simply not drawn instead.
+  it('omits a level far outside the visible price range', async () => {
+    getChartDrawings.mockResolvedValue([level({ price: 99999 })])
+    const { container } = await renderChart()
+    await waitFor(() => expect(getChartDrawings).toHaveBeenCalled())
+    const dashed = [...container.querySelectorAll('line')]
+      .filter((l) => l.getAttribute('stroke-dasharray') === '6 4')
+    expect(dashed).toHaveLength(0)
+  })
+
+  it('removes a level when its × is clicked', async () => {
+    getChartDrawings.mockResolvedValue([level({ id: 7, price: 10 })])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('line[stroke-dasharray="6 4"]')).toBeTruthy())
+    // The <title> lives inside the group that carries the handler; selecting
+    // by descendant would match the outer wrapper, which has none.
+    const title = [...container.querySelectorAll('title')]
+      .find((t) => t.textContent === 'Remove this level')!
+    fireEvent.click(title.parentElement!)
+    await waitFor(() => expect(deleteChartDrawing).toHaveBeenCalledWith(7))
+  })
+})
+
+describe('placing a level', () => {
+  const clickPricePanel = (container: HTMLElement, svgY: number) => {
+    const svg = container.querySelector('svg')!
+    // jsdom gives every element a zero-sized rect, so the component's
+    // clientY→viewBox maths needs a real one to divide by.
+    svg.getBoundingClientRect = () => ({
+      top: 0, left: 0, width: 1040, height: 460, right: 1040, bottom: 460, x: 0, y: 0, toJSON: () => {},
+    }) as DOMRect
+    fireEvent.click(svg, { clientY: svgY })
+  }
+
+  it('does nothing until draw mode is on', async () => {
+    const { container } = await renderChart()
+    clickPricePanel(container, 200)
+    expect(addChartDrawing).not.toHaveBeenCalled()
+  })
+
+  // The chart multiplies by the FX rate at render, so a level saved while
+  // viewing AUD must be divided back out — otherwise it lands in the wrong
+  // place the moment the currency toggle flips. This is the same contract the
+  // purchase markers get wrong if `price` is used instead of `original_price`.
+  it('stores a native price, not the AUD figure on screen', async () => {
+    getSymbolInfo.mockResolvedValue([{ symbol: 'TST.AX', currency: 'USD', instrument_type: null, long_name: null }])
+    const { container } = await renderChart({ symbol: 'TST.AX', currency: 'USD' })
+    fireEvent.click(screen.getByTitle(/Draw a horizontal price level/))
+    clickPricePanel(container, 200)
+    await waitFor(() => expect(addChartDrawing).toHaveBeenCalled())
+    const nativePrice = addChartDrawing.mock.calls[0][1]
+
+    // With no AUD toggle applied the multiplier is 1, so the stored figure is
+    // the same one the axis shows — the invariant that must hold either way.
+    const axisLabels = [...container.querySelectorAll('text')]
+      .map((t) => t.textContent ?? '')
+      .filter((t) => /^(US\$|\$)[\d.]+$/.test(t))
+      .map((t) => parseFloat(t.replace(/[^\d.]/g, '')))
+    const lo = Math.min(...axisLabels)
+    const hi = Math.max(...axisLabels)
+    expect(nativePrice).toBeGreaterThanOrEqual(lo - (hi - lo))
+    expect(nativePrice).toBeLessThanOrEqual(hi + (hi - lo))
+  })
+
+  it('saves the price under the cursor', async () => {
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByTitle(/Draw a horizontal price level/))
+    clickPricePanel(container, 200)
+    await waitFor(() => expect(addChartDrawing).toHaveBeenCalled())
+    const [symbol, price] = addChartDrawing.mock.calls[0]
+    expect(symbol).toBe('TST.AX')
+    expect(price).toBeGreaterThan(0)
+  })
+})
+
+describe('trendlines', () => {
+  const trend = (over: Record<string, unknown> = {}) => ({
+    id: 5, symbol: 'TST.AX', kind: 'trend' as const,
+    price: 9, label: null, colour: null,
+    start_date: DATES[5], end_date: DATES[20], end_price: 11,
+    created_at: 'x', ...over,
+  })
+  const solidLines = (c: HTMLElement) =>
+    [...c.querySelectorAll('line')].filter((l) => !l.getAttribute('stroke-dasharray') && l.getAttribute('stroke') === DRAWING_COLOR)
+
+  it('draws a sloped segment between its two anchors', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(solidLines(container).length).toBeGreaterThan(0))
+    const seg = solidLines(container)[0]
+    const x1 = parseFloat(seg.getAttribute('x1')!)
+    const x2 = parseFloat(seg.getAttribute('x2')!)
+    const y1 = parseFloat(seg.getAttribute('y1')!)
+    const y2 = parseFloat(seg.getAttribute('y2')!)
+    expect(Math.abs(x1 - (LEFT + (PLOT_WIDTH * 5) / (DATES.length - 1)))).toBeLessThan(0.5)
+    expect(Math.abs(x2 - (LEFT + (PLOT_WIDTH * 20) / (DATES.length - 1)))).toBeLessThan(0.5)
+    // Rising price means a lower y at the later anchor.
+    expect(y2).toBeLessThan(y1)
+  })
+
+  // Projection past the second anchor is the point of drawing a trendline.
+  it('projects past the second anchor to the right edge', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(solidLines(container).length).toBeGreaterThan(0))
+    const projected = [...container.querySelectorAll('line')]
+      .find((l) => l.getAttribute('stroke-dasharray') === '4 4')!
+    expect(projected).toBeTruthy()
+    expect(Math.abs(parseFloat(projected.getAttribute('x2')!) - (LEFT + PLOT_WIDTH))).toBeLessThan(0.5)
+  })
+
+  // Clamping an off-screen anchor would move it and change the slope — the one
+  // thing a trendline must never do. It is clipped instead.
+  it('keeps its slope when an anchor predates the visible window', async () => {
+    getChartDrawings.mockResolvedValue([trend({ start_date: '2020-01-02', price: 5 })])
+    const { container } = await renderChart()
+    await waitFor(() => expect(solidLines(container).length).toBeGreaterThan(0))
+    const seg = solidLines(container)[0]
+    expect(parseFloat(seg.getAttribute('x1')!)).toBeLessThan(LEFT)
+    expect(seg.closest('g')!.getAttribute('clip-path')).toMatch(/^url\(#/)
+  })
+
+  it('needs two clicks on different dates to save a line', async () => {
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByTitle(/Draw a trendline/))
+    const svg = container.querySelector('svg')!
+    svg.getBoundingClientRect = () => ({
+      top: 0, left: 0, width: 1040, height: 460, right: 1040, bottom: 460, x: 0, y: 0, toJSON: () => {},
+    }) as DOMRect
+
+    fireEvent.click(svg, { clientX: 200, clientY: 200 })
+    expect(addTrendline).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText(/Anchored at/)).toBeTruthy())
+
+    fireEvent.click(svg, { clientX: 800, clientY: 150 })
+    await waitFor(() => expect(addTrendline).toHaveBeenCalled())
+    const [, line] = addTrendline.mock.calls[0]
+    expect(line.startDate < line.endDate).toBe(true)
+    expect(line.startPrice).toBeGreaterThan(0)
+    expect(line.endPrice).toBeGreaterThan(0)
+  })
+})
+
+describe('configured defaults', () => {
+  const setStored = (d: Record<string, unknown>) =>
+    (apiClient.getConfig as ReturnType<typeof vi.fn>).mockResolvedValue({ chart_defaults: JSON.stringify(d) })
+
+  it('opens with the configured period, style, bars and overlays', async () => {
+    setStored({ timeframe: '1m', chartType: 'candle', barInterval: 'week', overlays: ['ema40'] })
+    await renderChart()
+    const active = (label: string) =>
+      screen.getAllByRole('button').find((b) => b.textContent!.trim() === label)!.className.includes('active')
+    await waitFor(() => expect(active('1M')).toBe(true))
+    expect(active('6M')).toBe(false)
+    expect(active('EMA 40')).toBe(true)
+    expect(active('SMA 50')).toBe(false)
+    expect(active('Week')).toBe(true)
+  })
+
+  // The config arrives after first render; snapping a control back a moment
+  // after the user clicked it would look like the chart ignoring the click.
+  it('does not overwrite a control the user has already changed', async () => {
+    let release: (v: Record<string, string>) => void = () => {}
+    ;(apiClient.getConfig as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise<Record<string, string>>((res) => { release = res }),
+    )
+    await renderChart()
+    fireEvent.click(screen.getAllByRole('button').find((b) => b.textContent!.trim() === '1W')!)
+
+    release({ chart_defaults: JSON.stringify({ timeframe: '2y' }) })
+    await new Promise((r) => setTimeout(r, 50))
+
+    const active = (label: string) =>
+      screen.getAllByRole('button').find((b) => b.textContent!.trim() === label)!.className.includes('active')
+    expect(active('1W')).toBe(true)
+    expect(active('2Y')).toBe(false)
   })
 })

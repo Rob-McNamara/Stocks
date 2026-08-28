@@ -416,6 +416,29 @@ export function cashAccountCsvUrl(accountId: number): string {
   return `${API_BASE_URL}/cash/accounts/${accountId}/transactions.csv`
 }
 
+export interface ChartDrawing {
+  id: number
+  symbol: string
+  kind: 'horizontal' | 'trend'
+  /** In the symbol's own currency — the chart applies the FX rate at render. */
+  price: number
+  label: string | null
+  colour: string | null
+  /** Trendlines only: anchors are (start_date, price) and (end_date, end_price). */
+  start_date: string | null
+  end_date: string | null
+  end_price: number | null
+  created_at: string
+}
+
+export interface NewTrendline {
+  startDate: string
+  startPrice: number
+  endDate: string
+  endPrice: number
+  label?: string
+}
+
 export const apiClient = {
   async checkHealth(): Promise<boolean> {
     try {
@@ -476,6 +499,50 @@ export const apiClient = {
       throw new Error(message || 'Failed to fetch portfolio lots')
     }
     return response.json()
+  },
+
+  async getChartDrawings(symbol: string): Promise<ChartDrawing[]> {
+    const response = await apiFetch(`${API_BASE_URL}/chart-drawings/${encodeURIComponent(symbol)}`)
+    if (!response.ok) return []
+    return (await response.json()).drawings ?? []
+  },
+
+  async addChartDrawing(symbol: string, price: number, label?: string): Promise<ChartDrawing[]> {
+    const response = await apiFetch(`${API_BASE_URL}/chart-drawings/${encodeURIComponent(symbol)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'horizontal', price, label: label ?? null }),
+    })
+    if (!response.ok) {
+      throw new Error((await apiErrorMessage(response)) || 'Failed to save the price level')
+    }
+    return (await response.json()).drawings ?? []
+  },
+
+  async addTrendline(symbol: string, line: NewTrendline): Promise<ChartDrawing[]> {
+    const response = await apiFetch(`${API_BASE_URL}/chart-drawings/${encodeURIComponent(symbol)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'trend',
+        price: line.startPrice,
+        start_date: line.startDate,
+        end_date: line.endDate,
+        end_price: line.endPrice,
+        label: line.label ?? null,
+      }),
+    })
+    if (!response.ok) {
+      throw new Error((await apiErrorMessage(response)) || 'Failed to save the trendline')
+    }
+    return (await response.json()).drawings ?? []
+  },
+
+  async deleteChartDrawing(id: number): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/chart-drawings/id/${id}`, { method: 'DELETE' })
+    if (!response.ok) {
+      throw new Error((await apiErrorMessage(response)) || 'Failed to remove the price level')
+    }
   },
 
   async getCashAccounts(): Promise<CashAccount[]> {
