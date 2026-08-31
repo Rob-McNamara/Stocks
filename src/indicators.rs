@@ -57,21 +57,49 @@ pub fn sma_trend(sma: &[Option<f64>], lookback: usize) -> Option<&'static str> {
 }
 
 pub struct CrossoverStats {
-    /// Trading days since the close crossed above the SMA
+    /// Trading days since the close crossed the SMA in the requested direction
     pub days: i64,
     /// Volume on the crossover day vs the preceding 20-day average, in percent
     pub volume_pct: Option<f64>,
+}
+
+/// Which way the close crossed the reference series.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CrossDirection {
+    /// The close rose through the series and has stayed above it since.
+    Above,
+    /// The close fell through the series and has stayed below it since.
+    Below,
 }
 
 /// Walk back from the latest bar to find the last day the close was below the
 /// SMA; the following day is the crossover. `today_volume` is used when the
 /// crossover is "today" (live price crossed but no stored bar exists yet).
 pub fn crossover_stats(history: &[PricePoint], sma: &[Option<f64>], today_volume: Option<i64>) -> CrossoverStats {
+    crossover_stats_dir(history, sma, today_volume, CrossDirection::Above)
+}
+
+/// `crossover_stats` for either direction.
+///
+/// A crossing below is the mirror image, not a separate calculation: walk back
+/// to the last bar that was still on the *other* side, and the bar after it is
+/// the crossing. Both directions share the volume comparison, so a breakdown
+/// reports its conviction the same way a breakout does.
+pub fn crossover_stats_dir(
+    history: &[PricePoint],
+    sma: &[Option<f64>],
+    today_volume: Option<i64>,
+    direction: CrossDirection,
+) -> CrossoverStats {
     for i in (0..sma.len()).rev() {
         let (Some(sma_v), Some(close)) = (sma[i], history.get(i).and_then(|p| p.close)) else {
             continue;
         };
-        if close < sma_v {
+        let still_on_the_other_side = match direction {
+            CrossDirection::Above => close < sma_v,
+            CrossDirection::Below => close > sma_v,
+        };
+        if still_on_the_other_side {
             let crossover_idx = i + 1;
             let days = (sma.len() as i64) - 1 - (i as i64);
             let crossover_vol = if crossover_idx < history.len() {
@@ -169,6 +197,32 @@ mod tests {
         assert_eq!(stats.days, 2);
         // prev volumes before crossover: [100, 100] avg 100; crossover vol 300 → +200%
         assert_eq!(stats.volume_pct, Some(200.0));
+    }
+
+    #[test]
+    fn crossover_counts_days_below() {
+        // The mirror of the case above: above, above, then broke down 2 days ago.
+        let history = pts_v(&[(10.0, 100), (11.0, 100), (9.0, 300), (8.0, 100)]);
+        let sma = vec![Some(10.0), Some(10.0), Some(10.0), Some(10.0)];
+        let stats = crossover_stats_dir(&history, &sma, None, CrossDirection::Below);
+        // last above at index 1 → days = 4-1-1 = 2, breakdown at index 2
+        assert_eq!(stats.days, 2);
+        // A breakdown reports its volume the same way a breakout does
+        assert_eq!(stats.volume_pct, Some(200.0));
+    }
+
+    /// A count is only meaningful on the side the price is actually on. Asked
+    /// for a breakdown on a symbol that is currently *above* the line, the walk
+    /// back matches the latest bar and reports zero days — so callers must
+    /// filter by side first, which is what the dashboard operators do.
+    #[test]
+    fn a_direction_is_meaningless_on_the_wrong_side() {
+        let history = pts_v(&[(9.0, 100), (9.0, 100), (11.0, 100), (12.0, 100)]);
+        let sma = vec![Some(10.0), Some(10.0), Some(10.0), Some(10.0)];
+        let above = crossover_stats_dir(&history, &sma, None, CrossDirection::Above);
+        let below = crossover_stats_dir(&history, &sma, None, CrossDirection::Below);
+        assert_eq!(above.days, 2, "crossed up two bars ago");
+        assert_eq!(below.days, 0, "still above, so no breakdown has happened");
     }
 
     #[test]

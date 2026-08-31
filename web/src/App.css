@@ -80,11 +80,23 @@
 }
 
 /* Content Area */
+/*
+ * Content width is a user setting. The value lives here rather than in
+ * TypeScript so the widths sit beside the layout they affect; the root element
+ * carries data-layout-width, so a change applies immediately with no reload.
+ *
+ * Grids already use auto-fit/minmax and tables are width:100%, so both expand
+ * into whatever this allows without further work.
+ */
+:root { --content-width: 1126px; }
+:root[data-layout-width="wide"] { --content-width: 1600px; }
+:root[data-layout-width="full"] { --content-width: 100%; }
+
 .app-content {
   flex: 1;
   overflow-y: auto;
   padding: 32px;
-  max-width: 1200px;
+  max-width: var(--content-width);
   margin: 0 auto;
   width: 100%;
   box-sizing: border-box;
@@ -163,9 +175,66 @@
   overflow-x: auto;
 }
 
-.chart-svg {
+/*
+ * The measured box. A ResizeObserver feeds its size straight into the chart
+ * geometry, so a change in height reflows the chart rather than stretching it —
+ * whether that change came from the grip below or from the window resizing.
+ *
+ * Height comes from a custom property set by React, which owns the value now
+ * that the grip is ours rather than the browser's.
+ */
+.chart-resize-box {
   width: 100%;
-  height: auto;
+  height: var(--chart-height, 400px);
+  /* Below this the price panel would be clamped to its 120px minimum and the
+     SVG would grow taller than the box — which `overflow: auto` would answer
+     with a scrollbar. 100 + 40 + 120: the volume panel, its gap, and the
+     smallest usable price panel. */
+  min-height: 260px;
+  /* No CSS `resize`: WebKit paints that grip as part of the scrollbar layer,
+     which on a box whose content fits exactly appears only while a resize is in
+     flight and then fades — the handle flashes and cannot be grabbed. The grip
+     below is an ordinary element driven by pointer events instead. */
+  overflow: hidden;
+}
+
+/* The chart's resize handle. A real element rather than the browser's, so it is
+   always visible, works the same in every browser, and can respect the
+   configured height range — which the native handle ignored.
+   Drawn as a solid bar on a ruled strip: the first version was a 2px dotted
+   line in near-white, which worked but could not be found without hunting. */
+.chart-resize-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Tall enough to aim at without hunting; the bar inside is the visual cue,
+     the whole strip is the target. */
+  height: 20px;
+  margin-top: 4px;
+  border-top: 1px solid #e8edf5;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.chart-resize-grip::before {
+  content: '';
+  width: 56px;
+  height: 5px;
+  border-radius: 3px;
+  background: #a3adc0;
+  transition: background 0.15s ease, width 0.15s ease;
+}
+
+.chart-resize-grip:hover::before {
+  background: #667eea;
+  width: 72px;
+}
+
+.chart-resize-grip:active::before {
+  background: #4c5bd4;
+}
+
+.chart-svg {
   display: block;
 }
 
@@ -188,6 +257,10 @@
   display: flex;
   gap: 8px;
   margin-top: 8px;
+  /* The chart's control row grew past the viewport once a seventh overlay was
+     added; wrapping keeps the last buttons reachable without scrolling the
+     whole page sideways to find them. */
+  flex-wrap: wrap;
 }
 
 .sma-button {
@@ -212,6 +285,37 @@
   background: #667eea;
   color: white;
   border-color: #667eea;
+}
+
+/* ---------------------------------------------------------------
+   Holdings heat map — the metric pills and the colour-scale legend
+   sit on one row above the treemap.
+   --------------------------------------------------------------- */
+.heatmap-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.heatmap-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #8a92a6;
+}
+
+/* The ramp mirrors the component's scale endpoints; both ends saturate at the
+   cap the legend labels, so the gradient is not a decorative approximation. */
+.heatmap-ramp {
+  width: 140px;
+  height: 10px;
+  border-radius: 5px;
+  display: inline-block;
+  background: linear-gradient(to right, #9b1a1a 0%, #eceff1 50%, #1b5e20 100%);
 }
 
 .legend-swatch {

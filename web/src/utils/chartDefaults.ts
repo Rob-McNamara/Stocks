@@ -1,4 +1,4 @@
-import { apiClient } from '../services/api'
+import { loadAppConfig } from './appConfig'
 
 /** Single `app_config` key holding the chart's opening state, as JSON. */
 export const CHART_DEFAULTS_KEY = 'chart_defaults'
@@ -13,7 +13,18 @@ export interface ChartDefaults {
   barInterval: BarInterval
   /** Overlay ids switched on when a chart opens. */
   overlays: string[]
+  /** Opening height of the chart frame in pixels; draggable from there. */
+  height: number
 }
+
+/**
+ * Below this the price panel has no room; above it the chart stops being
+ * readable. The floor is the volume panel (100) plus its gap (40) plus the
+ * smallest usable price panel (120) — go under it and the SVG grows taller
+ * than its box, which the frame's `overflow: auto` would show as a scrollbar.
+ * A stored value outside the range is clamped, not discarded.
+ */
+export const CHART_HEIGHT_RANGE = { min: 260, max: 900 } as const
 
 export const TIMEFRAMES: ReadonlyArray<[ChartTimeframe, string]> = [
   ['1w', '1W'], ['1m', '1M'], ['3m', '3M'], ['6m', '6M'], ['12m', '12M'], ['2y', '2Y'],
@@ -25,6 +36,7 @@ export const FALLBACK_CHART_DEFAULTS: ChartDefaults = {
   chartType: 'line',
   barInterval: 'day',
   overlays: ['sma50', 'sma150'],
+  height: 400,
 }
 
 /**
@@ -54,24 +66,13 @@ export function parseChartDefaults(raw: string | undefined, knownOverlayIds: rea
     overlays: Array.isArray(parsed.overlays)
       ? parsed.overlays.filter((id): id is string => typeof id === 'string' && knownOverlayIds.includes(id))
       : FALLBACK_CHART_DEFAULTS.overlays,
+    height:
+      typeof parsed.height === 'number' && Number.isFinite(parsed.height)
+        ? Math.min(CHART_HEIGHT_RANGE.max, Math.max(CHART_HEIGHT_RANGE.min, Math.round(parsed.height)))
+        : FALLBACK_CHART_DEFAULTS.height,
   }
 }
 
-/**
- * Shared fetch of the config record.
- *
- * Several charts render on one screen and would otherwise each pull the whole
- * config. The promise is cached, not the value, so concurrent mounts wait on
- * one request; `invalidateChartDefaults` drops it after a save so the next
- * chart to mount sees the new settings.
- */
-let configPromise: Promise<Record<string, string>> | null = null
-
 export function loadChartDefaults(knownOverlayIds: readonly string[]): Promise<ChartDefaults> {
-  configPromise ??= apiClient.getConfig().catch(() => ({}) as Record<string, string>)
-  return configPromise.then((config) => parseChartDefaults(config[CHART_DEFAULTS_KEY], knownOverlayIds))
-}
-
-export function invalidateChartDefaults(): void {
-  configPromise = null
+  return loadAppConfig().then((config) => parseChartDefaults(config[CHART_DEFAULTS_KEY], knownOverlayIds))
 }

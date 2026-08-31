@@ -32,7 +32,6 @@ const getCachedPrices = apiClient.getCachedPrices as ReturnType<typeof vi.fn>
 
 function riskRow(overrides: Partial<RiskRow> & { symbol: string }): RiskRow {
   return {
-    symbol: overrides.symbol,
     current_price: 100,
     purchase_price: 80,
     pl_pct: 25,

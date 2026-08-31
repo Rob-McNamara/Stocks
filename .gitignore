@@ -19,3 +19,6 @@ stocks-backup-*.db-shm
 exports/
 *-report.html
 *-report-v2.html
+
+# Manual backups taken before a data change; each is a full copy of stocks.db.
+stocks.db.bak-*

@@ -119,12 +119,24 @@ export interface BestWatchlistEntry {
 export interface CustomListEntry {
   symbol: string
   price: number
+  /** The side of the comparison `diff` is measured from — equals `price`
+   *  unless the list compares volume. Absent from an API older than the
+   *  compare field, where the comparison was always the price. */
+  compare_value?: number
   field_value: number
   diff: number
   pct_diff: number
   currency: string | null
   /** True when field_value is a trailing-sell trigger rather than a manual stop loss */
   is_trailing: boolean
+  /** Which table the symbol came from, so a list spanning both sends each row
+   *  to the right screen. Absent from an API older than indicator lists, where
+   *  every row in a list shared the list's own `field_source`. */
+  origin?: 'holdings' | 'watchlist'
+  /** Trading days since the crossing. Only a crossover list reports one. */
+  days?: number | null
+  /** Volume on the crossing day vs the preceding 20-day average, in percent. */
+  volume_cross_pct?: number | null
 }
 
 export interface CustomListResult {
@@ -134,6 +146,11 @@ export interface CustomListResult {
   /** Where the entry symbols live: 'holdings' or 'watchlist' — drives navigation */
   field_source: string
   operator: string
+  /** What the field is compared against: 'price' or 'volume'. */
+  compare: string
+  /** The column the rows are ranked by: 'pct_diff' (the default and the only
+   *  value an older API sends), 'days' or 'volume_cross_pct'. */
+  metric?: string
   field_label: string
   /** Direction the server actually ranked by (request override, else config). */
   sort: 'asc' | 'desc'
@@ -224,6 +241,18 @@ export interface PortfolioHolding {
   /** Effective stop loss in native currency: manual field, or the trailing-sell trigger */
   stop_loss: number | null
   is_trailing_sell: boolean
+  /**
+   * Set when the figures above are measured from a baseline date rather than
+   * from the purchase — for holdings old enough that their original cost is a
+   * record rather than a useful denominator. `invested`, `avg_cost`,
+   * `dividends`, `pl` and `pl_pct` all follow the baseline when this is set.
+   *
+   * Optional rather than nullable: an API older than the baseline omits these
+   * outright, and a strict null check would sail past `undefined` into a crash.
+   */
+  basis_date?: string | null
+  /** Close on the first trading day from `basis_date`, in native currency. */
+  basis_price?: number | null
 }
 
 export interface RiskRow {
@@ -307,6 +336,11 @@ export interface PortfolioHistorySummary {
 export interface PortfolioHistory {
   series: PortfolioHistoryPoint[]
   summary: PortfolioHistorySummary
+  /**
+   * Earliest date the server will report, when a floor is configured. Optional
+   * rather than nullable: an API older than the setting omits it entirely.
+   */
+  start_floor?: string | null
 }
 
 export interface RiskTotals {
@@ -949,7 +983,9 @@ export const apiClient = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, value })
     })
-    if (!response.ok) throw new Error('Failed to update config')
+    // The API validates the JSON config keys and explains what it refused, so
+    // that message is worth far more to the caller than a generic failure.
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to update config')
   },
 
   async analyzeStock(symbol: string, messages: { role: string; content: string }[]): Promise<{ role: string; content: string }> {

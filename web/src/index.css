@@ -51,7 +51,12 @@
 }
 
 #root {
-  width: 1126px;
+  /*
+   * The binding constraint on how much window the app uses — a fixed width
+   * here meant `.app-content`'s max-width never applied. Driven by the Layout
+   * setting; the default is the width the app has always had.
+   */
+  width: var(--content-width, 1126px);
   max-width: 100%;
   margin: 0 auto;
   text-align: center;

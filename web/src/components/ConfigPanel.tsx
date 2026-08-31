@@ -2,10 +2,14 @@ import { useState, useEffect } from 'react'
 import { apiClient } from '../services/api'
 import { OVERLAYS } from './PriceChart'
 import {
-  CHART_DEFAULTS_KEY, FALLBACK_CHART_DEFAULTS, TIMEFRAMES,
-  parseChartDefaults, invalidateChartDefaults,
-  type ChartDefaults, type ChartTimeframe,
+  CHART_DEFAULTS_KEY, CHART_HEIGHT_RANGE, FALLBACK_CHART_DEFAULTS, TIMEFRAMES,
+  parseChartDefaults, type ChartDefaults, type ChartTimeframe,
 } from '../utils/chartDefaults'
+import { invalidateAppConfig } from '../utils/appConfig'
+import {
+  LAYOUT_WIDTH_KEY, LAYOUT_WIDTHS, FALLBACK_LAYOUT_WIDTH,
+  parseLayoutWidth, applyLayoutWidth, type LayoutWidth,
+} from '../utils/layout'
 
 interface ConfigPanelProps {
   onLoading: (loading: boolean) => void
@@ -21,6 +25,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [manualSymbol, setManualSymbol] = useState('')
   const [manualPrice, setManualPrice] = useState('')
   const [editingPrices, setEditingPrices] = useState<Record<string, string>>({})
+  const [historyStart, setHistoryStart] = useState('')
   const [typeSymbol, setTypeSymbol] = useState('')
   const [typeValue, setTypeValue] = useState('ETF')
   const builtInWatchlistKeys = ['breakthrough_price', 'stop_loss_price', 'sector']
@@ -32,17 +37,57 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [newHoldingsFieldLabel, setNewHoldingsFieldLabel] = useState('')
   const [newHoldingsFieldType, setNewHoldingsFieldType] = useState<'text' | 'number' | 'date'>('text')
   const [newHoldingsFieldActions, setNewHoldingsFieldActions] = useState<string[]>(['purchase'])
-  const [dashboardLists, setDashboardLists] = useState<{ key: string; label: string; source: 'holdings' | 'watchlist' | 'both'; field_key: string; operator: 'above' | 'below' | 'pct_above' | 'pct_below'; limit: number; sort?: 'asc' | 'desc' }[]>([])
+  const [dashboardLists, setDashboardLists] = useState<{ key: string; label: string; source: 'holdings' | 'watchlist' | 'both'; field_key: string; operator: 'above' | 'below' | 'pct_above' | 'pct_below' | 'days_above' | 'days_below' | 'volume_cross_pct'; compare?: 'price' | 'volume'; limit: number; sort?: 'asc' | 'desc' }[]>([])
   const [editingWatchlistFieldIndex, setEditingWatchlistFieldIndex] = useState<number | null>(null)
   const [editingHoldingsFieldIndex, setEditingHoldingsFieldIndex] = useState<number | null>(null)
   const [newDashListLabel, setNewDashListLabel] = useState('')
   const [newDashListSource, setNewDashListSource] = useState<'holdings' | 'watchlist' | 'both'>('holdings')
   const [newDashListField, setNewDashListField] = useState('')
-  const [newDashListOperator, setNewDashListOperator] = useState<'above' | 'below' | 'pct_above' | 'pct_below'>('above')
+  const [newDashListOperator, setNewDashListOperator] = useState<'above' | 'below' | 'pct_above' | 'pct_below' | 'days_above' | 'days_below' | 'volume_cross_pct'>('above')
+  // Lists written before this existed have no `compare`; the server reads a
+  // missing value as 'price', so the editor shows the same default.
+  const [newDashListCompare, setNewDashListCompare] = useState<'price' | 'volume'>('price')
+
+  // The API validates these definitions and can refuse the write. Without the
+  // rollback the panel would keep showing a list the server never stored, and
+  // without the banner the refusal would vanish entirely.
+  const saveDashboardLists = async (next: typeof dashboardLists) => {
+    const previous = dashboardLists
+    setDashboardLists(next)
+    try {
+      setError(null)
+      await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
+      onConfigChanged?.()
+    } catch (err) {
+      setDashboardLists(previous)
+      setError(err instanceof Error ? err.message : 'Failed to save dashboard lists')
+    }
+  }
   const [newDashListLimit, setNewDashListLimit] = useState('15')
   const [newDashListSort, setNewDashListSort] = useState<'asc' | 'desc'>('asc')
   const [editingDashListIndex, setEditingDashListIndex] = useState<number | null>(null)
   const [chartDefaults, setChartDefaults] = useState<ChartDefaults>(FALLBACK_CHART_DEFAULTS)
+  const [layoutWidth, setLayoutWidth] = useState<LayoutWidth>(FALLBACK_LAYOUT_WIDTH)
+
+  const saveLayoutWidth = async (width: LayoutWidth) => {
+    const previous = layoutWidth
+    // Applied before the save so the change is visible while it is in flight;
+    // reverted below if the write fails, rather than leaving the screen showing
+    // a width that was never stored.
+    setLayoutWidth(width)
+    applyLayoutWidth(width)
+    try {
+      await apiClient.updateConfig(LAYOUT_WIDTH_KEY, width)
+      invalidateAppConfig()
+      setConfig((c) => ({ ...c, [LAYOUT_WIDTH_KEY]: width }))
+      setSuccess('Layout width saved')
+      setTimeout(() => setSuccess(null), 3000)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save layout width')
+      setLayoutWidth(previous)
+      applyLayoutWidth(previous)
+    }
+  }
 
   /**
    * Written as one JSON value so a change is atomic — four separate keys could
@@ -54,7 +99,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
     try {
       await apiClient.updateConfig(CHART_DEFAULTS_KEY, JSON.stringify(next))
       // Charts cache the config; drop it so the next one to mount reads this.
-      invalidateChartDefaults()
+      invalidateAppConfig()
       setConfig((c) => ({ ...c, [CHART_DEFAULTS_KEY]: JSON.stringify(next) }))
       onConfigChanged?.()
       setSuccess('Chart defaults saved')
@@ -74,6 +119,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       setLoading(true)
       setError(null)
       const data = await apiClient.getConfig()
+      setHistoryStart(data['portfolio_history_start'] ?? '')
       setConfig(data)
       try {
         setCustomFieldDefs((JSON.parse(data['watchlist_custom_fields'] ?? '[]') as typeof customFieldDefs).filter((d) => !builtInWatchlistKeys.includes(d.key)))
@@ -85,6 +131,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
         setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
       } catch { setDashboardLists([]) }
       setChartDefaults(parseChartDefaults(data[CHART_DEFAULTS_KEY], OVERLAYS.map((o) => o.id)))
+      setLayoutWidth(parseLayoutWidth(data[LAYOUT_WIDTH_KEY]))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load configuration')
     } finally {
@@ -625,7 +672,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
           <div className="config-card">
             <h2>Dashboard Lists</h2>
             <p style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
-              Define custom lists for the Dashboard that compare current stock price against a custom field value.
+              Define custom lists for the Dashboard that compare a stock's current price or volume against a custom field value.
             </p>
             {dashboardLists.length > 0 && (
               <table className="holdings-table" style={{ marginBottom: 16 }}>
@@ -633,6 +680,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                   <tr>
                     <th>Label</th>
                     <th>Source</th>
+                    <th>Compare</th>
                     <th>Field</th>
                     <th>Condition</th>
                     <th>Sort</th>
@@ -644,9 +692,9 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                   {dashboardLists.map((dl, i) => (
                     <tr key={dl.key}>
                       <td>{dl.label}</td>
-                      <td style={{ color: '#888' }}>{dl.source}</td>
+                      <td style={{ color: '#888' }}>{dl.compare === 'volume' ? 'Volume' : 'Price'}</td>
                       <td style={{ color: '#555' }}>{dl.field_key}</td>
-                      <td>{{ above: 'Price above field', below: 'Price below field', pct_above: '% above price', pct_below: '% below price' }[dl.operator] ?? dl.operator}</td>
+                      <td>{{ above: 'Above field', below: 'Below field', pct_above: '% above compared value', pct_below: '% below compared value', days_above: 'Days above field', days_below: 'Days below field', volume_cross_pct: 'Volume % on cross above' }[dl.operator] ?? dl.operator}</td>
                       <td style={{ color: '#888' }}>{dl.sort === 'desc' ? 'Desc' : 'Asc'}</td>
                       <td>{dl.limit}</td>
                       <td style={{ display: 'flex', gap: 6 }}>
@@ -658,6 +706,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                             setNewDashListSource(dl.source)
                             setNewDashListField(dl.field_key)
                             setNewDashListOperator(dl.operator)
+                            setNewDashListCompare(dl.compare ?? 'price')
                             setNewDashListLimit(dl.limit.toString())
                             setNewDashListSort(dl.sort ?? 'asc')
                           }}
@@ -668,10 +717,8 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                           className="btn btn-danger btn-small"
                           onClick={async () => {
                             const next = dashboardLists.filter((_, j) => j !== i)
-                            setDashboardLists(next)
                             setEditingDashListIndex(null)
-                            await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
-                            onConfigChanged?.()
+                            await saveDashboardLists(next)
                           }}
                         >
                           Remove
@@ -707,13 +754,31 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                 </select>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <label style={{ fontSize: 12, color: '#666' }}>Custom Field</label>
+                <label style={{ fontSize: 12, color: '#666' }}>Compare</label>
+                <select
+                  value={newDashListCompare}
+                  onChange={(e) => setNewDashListCompare(e.target.value as 'price' | 'volume')}
+                  className="config-input"
+                  title="Which figure is measured against the field"
+                >
+                  <option value="price">Price</option>
+                  <option value="volume">Volume</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 12, color: '#666' }}>Field</label>
                 <select
                   value={newDashListField}
                   onChange={(e) => setNewDashListField(e.target.value)}
                   className="config-input"
                 >
                   <option value="">Select field...</option>
+                  {/* Indicators are derived from stored closes, so they apply to
+                      holdings and watchlist symbols alike — unlike the entries
+                      below, which only exist in one of the two tables. */}
+                  <option value="indicator:sma50">Indicator: 50-Day SMA</option>
+                  <option value="indicator:sma150">Indicator: 150-Day SMA</option>
+                  <option value="indicator:ema40w">Indicator: 40-Week EMA</option>
                   <option value="holdings:stop_loss">Holdings: Stop Loss Price</option>
                   <option value="holdings:trailing_sell_pct">Holdings: Trailing Sell %</option>
                   {holdingsFieldDefs.map((f) => (
@@ -730,13 +795,19 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                 <label style={{ fontSize: 12, color: '#666' }}>Condition</label>
                 <select
                   value={newDashListOperator}
-                  onChange={(e) => setNewDashListOperator(e.target.value as 'above' | 'below' | 'pct_above' | 'pct_below')}
+                  onChange={(e) => setNewDashListOperator(e.target.value as 'above' | 'below' | 'pct_above' | 'pct_below' | 'days_above' | 'days_below' | 'volume_cross_pct')}
                   className="config-input"
                 >
-                  <option value="above">Price above field</option>
-                  <option value="below">Price below field</option>
-                  <option value="pct_above">% above price</option>
-                  <option value="pct_below">% below price</option>
+                  <option value="above">Above field</option>
+                  <option value="below">Below field</option>
+                  <option value="pct_above">% above compared value</option>
+                  <option value="pct_below">% below compared value</option>
+                  {/* Crossover conditions date the crossing instead of
+                      measuring the gap, so they rank on days or on the volume
+                      behind it rather than on the percentage difference. */}
+                  <option value="days_above">Days above field</option>
+                  <option value="days_below">Days below field</option>
+                  <option value="volume_cross_pct">Volume % on cross above</option>
                 </select>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -768,15 +839,14 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                 onClick={async () => {
                   if (editingDashListIndex !== null) {
                     const next = dashboardLists.map((d, j) =>
-                      j === editingDashListIndex ? { ...d, label: newDashListLabel.trim(), source: newDashListSource, field_key: newDashListField, operator: newDashListOperator, limit: parseInt(newDashListLimit) || 15, sort: newDashListSort } : d
+                      j === editingDashListIndex ? { ...d, label: newDashListLabel.trim(), source: newDashListSource, field_key: newDashListField, operator: newDashListOperator, compare: newDashListCompare, limit: parseInt(newDashListLimit) || 15, sort: newDashListSort } : d
                     )
-                    setDashboardLists(next)
                     setEditingDashListIndex(null)
                     setNewDashListLabel('')
                     setNewDashListField('')
                     setNewDashListSort('asc')
-                    await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
-                    onConfigChanged?.()
+                    setNewDashListCompare('price')
+                    await saveDashboardLists(next)
                   } else {
                     const key = newDashListLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
                     if (!key || dashboardLists.some((d) => d.key === key)) return
@@ -786,15 +856,15 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                       source: newDashListSource,
                       field_key: newDashListField,
                       operator: newDashListOperator,
+                      compare: newDashListCompare,
                       limit: parseInt(newDashListLimit) || 15,
                       sort: newDashListSort,
                     }]
-                    setDashboardLists(next)
                     setNewDashListLabel('')
                     setNewDashListField('')
                     setNewDashListSort('asc')
-                    await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
-                    onConfigChanged?.()
+                    setNewDashListCompare('price')
+                    await saveDashboardLists(next)
                   }
                 }}
               >
@@ -803,9 +873,88 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
               {editingDashListIndex !== null && (
                 <button
                   className="btn btn-outline"
-                  onClick={() => { setEditingDashListIndex(null); setNewDashListLabel(''); setNewDashListField(''); setNewDashListSort('asc') }}
+                  onClick={() => { setEditingDashListIndex(null); setNewDashListLabel(''); setNewDashListField(''); setNewDashListSort('asc'); setNewDashListCompare('price') }}
                 >
                   Cancel
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>Layout</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              How much of the window the app uses. Tables, charts and card grids all
+              expand into whatever width you allow.
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {LAYOUT_WIDTHS.map(([value, label, description]) => (
+                <label key={value} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 14 }}>
+                  <input
+                    type="radio"
+                    name="layout-width"
+                    checked={layoutWidth === value}
+                    onChange={() => void saveLayoutWidth(value)}
+                    style={{ marginTop: 3 }}
+                  />
+                  <span>
+                    <strong>{label}</strong>
+                    <span style={{ display: 'block', color: '#666', fontSize: 12 }}>{description}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>Portfolio History Start</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              Earliest date the Portfolio Value chart will show. A holding cannot be
+              valued before its first stored price, so the years before that draw the
+              stock line flat at zero — cash alone, dressed up as portfolio history.
+              Setting a date cuts that stretch off and measures growth from there.
+              Leave it empty to show everything back to your first transaction.
+            </p>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                type="date"
+                value={historyStart}
+                onChange={(e) => setHistoryStart(e.target.value)}
+                className="config-input"
+              />
+              <button
+                className="btn btn-primary"
+                onClick={async () => {
+                  try {
+                    setError(null)
+                    await apiClient.updateConfig('portfolio_history_start', historyStart)
+                    setSuccess(historyStart ? `Portfolio history starts from ${historyStart}` : 'Portfolio history shows everything')
+                    setTimeout(() => setSuccess(null), 3000)
+                    onConfigChanged?.()
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : 'Failed to save the history start date')
+                  }
+                }}
+              >
+                Save
+              </button>
+              {historyStart && (
+                <button
+                  className="btn btn-outline"
+                  onClick={async () => {
+                    try {
+                      setError(null)
+                      setHistoryStart('')
+                      await apiClient.updateConfig('portfolio_history_start', '')
+                      setSuccess('Portfolio history shows everything')
+                      setTimeout(() => setSuccess(null), 3000)
+                      onConfigChanged?.()
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : 'Failed to clear the history start date')
+                    }
+                  }}
+                >
+                  Clear
                 </button>
               )}
             </div>
@@ -841,6 +990,21 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     <option value="line">Line</option>
                     <option value="candle">Candles</option>
                   </select>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <label style={{ fontSize: 12, color: '#666' }}>Height</label>
+                  <input
+                    type="number"
+                    className="config-input"
+                    style={{ width: 90 }}
+                    min={CHART_HEIGHT_RANGE.min}
+                    max={CHART_HEIGHT_RANGE.max}
+                    step={20}
+                    value={chartDefaults.height}
+                    onChange={(e) => setChartDefaults((d) => ({ ...d, height: Number(e.target.value) }))}
+                    onBlur={(e) => void saveChartDefaults({ height: Number(e.target.value) })}
+                    title="Opening height in pixels — drag the bottom edge of a chart to change it for that view only"
+                  />
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                   <label style={{ fontSize: 12, color: '#666' }}>Bars</label>

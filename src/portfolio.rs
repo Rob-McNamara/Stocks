@@ -146,7 +146,7 @@ pub struct SymbolSummary {
     /// Remaining lots after all sales (AUD prices)
     pub lots: Vec<Lot>,
     pub remaining_shares: f64,
-    /// Cost basis of remaining shares (AUD)
+    /// Cost basis of remaining shares (AUD), brokerage included
     pub remaining_cost: f64,
     /// Cost basis of remaining shares in the stock's native currency
     pub native_remaining_cost: f64,
@@ -155,6 +155,29 @@ pub struct SymbolSummary {
     pub realised_pl: f64,
     /// Dividend total read from dividends_total (pre-computed from dividend_events)
     pub dividends_total: f64,
+}
+
+/// The lots a purchase opens, with brokerage folded into the per-share cost.
+///
+/// The fee is part of what the shares cost. Leaving it out overstates profit by
+/// the fee, and asymmetrically so: a sale's fee *is* deducted from its
+/// proceeds, so only the buy side was being given away free.
+///
+/// `brokerage` is AUD by the engine's convention (the same one `realised_pl`
+/// follows), so the native lot converts it back at the transaction's own
+/// implied rate rather than mixing currencies inside one lot.
+fn purchase_lots(tx: &PortfolioTx, qty: f64, price: f64) -> (Lot, Lot) {
+    let fee_per_share = if qty > 0.0 { tx.brokerage.unwrap_or(0.0) / qty } else { 0.0 };
+    let native_price = tx.native_price.unwrap_or(price);
+    let native_fee_per_share = if price > 0.0 {
+        fee_per_share * native_price / price
+    } else {
+        fee_per_share
+    };
+    (
+        Lot { quantity: qty, price: price + fee_per_share },
+        Lot { quantity: qty, price: native_price + native_fee_per_share },
+    )
 }
 
 /// Calculate the FIFO summary for a single symbol's transactions.
@@ -171,8 +194,9 @@ pub fn calc_symbol_summary(txs: &[PortfolioTx]) -> SymbolSummary {
     for tx in &sorted {
         match (tx.tx_type, tx.quantity, tx.price) {
             (TxType::Purchase, Some(qty), Some(price)) => {
-                lots.push(Lot { quantity: qty, price });
-                native_lots.push(Lot { quantity: qty, price: tx.native_price.unwrap_or(price) });
+                let (lot, native_lot) = purchase_lots(tx, qty, price);
+                lots.push(lot);
+                native_lots.push(native_lot);
             }
             (TxType::Sale, Some(qty), Some(price)) => {
                 let cost_basis = apply_fifo_sale(&mut lots, qty);
@@ -196,6 +220,83 @@ pub fn calc_symbol_summary(txs: &[PortfolioTx]) -> SymbolSummary {
 
 /// Effective dividends for a symbol: the API-computed dividends_total when
 /// positive, otherwise the sum of manually recorded dividend transactions.
+/// Cost basis and dividends measured from a baseline date rather than from the
+/// original purchase.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RebasedBasis {
+    /// What the still-held shares were worth at the baseline, plus the actual
+    /// cost of anything bought since.
+    pub cost: f64,
+    /// Dividends received on or after the baseline date.
+    pub dividends: f64,
+}
+
+/// Re-strike a holding's cost basis at `basis_date`.
+///
+/// A position held for decades swamps any recent move — CSL at +2500% since
+/// 2001 hides a 36% fall since 2025 — so this answers "how has it done lately"
+/// without touching the transaction record, which stays the account of what was
+/// actually bought and paid.
+///
+/// Shares already held on the baseline date are valued at `basis_price`.
+/// Anything bought afterwards is valued at what it actually cost, because for
+/// those shares the purchase *is* the baseline. Dividends paid before the date
+/// belong to the earlier period and are excluded; counting them would credit
+/// the new period with income it did not earn.
+pub fn rebase_at(
+    txs: &[PortfolioTx],
+    remaining_shares: f64,
+    basis_date: &str,
+    basis_price: f64,
+) -> RebasedBasis {
+    let sorted = sort_transactions(txs);
+
+    let mut net_before = 0.0;
+    let mut later_shares = 0.0;
+    let mut later_cost = 0.0;
+    let mut dividends = 0.0;
+
+    for tx in &sorted {
+        let before = tx.date.as_str() < basis_date;
+        let qty = tx.quantity.unwrap_or(0.0);
+        match tx.tx_type {
+            TxType::Purchase => {
+                if before {
+                    net_before += qty;
+                } else {
+                    later_shares += qty;
+                    later_cost += qty * tx.price.unwrap_or(0.0) + tx.brokerage.unwrap_or(0.0);
+                }
+            }
+            TxType::Sale => {
+                if before {
+                    net_before -= qty;
+                } else {
+                    later_shares -= qty;
+                }
+            }
+            TxType::Dividend => {
+                if !before {
+                    dividends += tx.amount.unwrap_or(0.0);
+                }
+            }
+            TxType::Other => {}
+        }
+    }
+
+    // A sale after the baseline can eat into the shares that were held at it,
+    // so the split is reconciled against what is actually left rather than
+    // trusted from the running totals.
+    let held_at_basis = net_before.clamp(0.0, remaining_shares.max(0.0));
+    let from_later = (remaining_shares - held_at_basis).max(0.0);
+    let later_avg = if later_shares > 0.0 { later_cost / later_shares } else { 0.0 };
+
+    RebasedBasis {
+        cost: held_at_basis * basis_price + from_later * later_avg,
+        dividends,
+    }
+}
+
 pub fn symbol_dividends(sorted: &[PortfolioTx]) -> f64 {
     let mut from_total = 0.0;
     let mut manual = 0.0;
@@ -299,8 +400,9 @@ pub fn calc_symbol_position(txs: &[PortfolioTx]) -> SymbolPosition {
     for tx in &sorted {
         match (tx.tx_type, tx.quantity, tx.price) {
             (TxType::Purchase, Some(qty), Some(price)) => {
-                lots.push(Lot { quantity: qty, price });
-                native_lots.push(Lot { quantity: qty, price: tx.native_price.unwrap_or(price) });
+                let (lot, native_lot) = purchase_lots(tx, qty, price);
+                lots.push(lot);
+                native_lots.push(native_lot);
             }
             (TxType::Sale, Some(qty), Some(price)) => {
                 let cost_basis = apply_fifo_sale(&mut lots, qty);
@@ -495,7 +597,10 @@ pub fn calc_sold_entries(txs: &[PortfolioTx]) -> Vec<SoldEntry> {
     for tx in &sorted {
         match (tx.tx_type, tx.quantity, tx.price) {
             (TxType::Purchase, Some(qty), Some(price)) if qty != 0.0 && price != 0.0 => {
-                lots.push((qty, price, tx.date.clone()));
+                // Same cost basis the rest of the engine uses: the fee is part
+                // of what the shares cost, so a sale is measured against it.
+                let (lot, _) = purchase_lots(tx, qty, price);
+                lots.push((qty, lot.price, tx.date.clone()));
             }
             (TxType::Sale, Some(qty), Some(price)) if qty != 0.0 && price != 0.0 => {
                 let mut remaining = qty;
@@ -560,6 +665,145 @@ mod tests {
 
     fn day(date: &str, stocks: f64, cash: f64, flow: f64) -> DailyValue {
         DailyValue { date: date.to_string(), stocks, cash, flow }
+    }
+
+    fn tx(id: i64, kind: &str, date: &str, quantity: f64, price: f64, amount: Option<f64>) -> PortfolioTx {
+        PortfolioTx {
+            id,
+            symbol: "TST.AX".to_string(),
+            tx_type: TxType::parse(kind),
+            date: date.to_string(),
+            quantity: Some(quantity),
+            price: Some(price),
+            native_price: Some(price),
+            amount,
+            brokerage: None,
+            dividends_total: 0.0,
+        }
+    }
+
+    /// Brokerage on a buy is part of what the shares cost. Leaving it out
+    /// overstated profit by the fee — and asymmetrically, since a sale's fee
+    /// was always deducted from its proceeds.
+    #[test]
+    fn purchase_brokerage_lands_in_the_cost_basis() {
+        let mut buy = tx(1, "purchase", "2025-01-10", 100.0, 10.0, None);
+        buy.brokerage = Some(20.0);
+        let summary = calc_symbol_summary(&[buy]);
+
+        assert_eq!(summary.remaining_shares, 100.0);
+        assert!((summary.remaining_cost - 1020.0).abs() < 1e-9, "1000 paid for shares plus a 20 fee");
+        // Per share, the fee spreads across the parcel.
+        assert!((summary.lots[0].price - 10.2).abs() < 1e-9);
+    }
+
+    /// The buy and sell fees now bite symmetrically: a round trip at an
+    /// unchanged price is a loss of both fees, not of one.
+    #[test]
+    fn a_round_trip_at_the_same_price_loses_both_fees() {
+        let mut buy = tx(1, "purchase", "2025-01-10", 100.0, 10.0, None);
+        buy.brokerage = Some(20.0);
+        let mut sell = tx(2, "sale", "2025-06-10", 100.0, 10.0, None);
+        sell.brokerage = Some(15.0);
+
+        let summary = calc_symbol_summary(&[buy, sell]);
+        assert!((summary.realised_pl - -35.0).abs() < 1e-9, "expected -35, got {}", summary.realised_pl);
+        assert_eq!(summary.remaining_shares, 0.0);
+    }
+
+    /// FIFO consumes the fee with the shares it was paid on, so a partial sale
+    /// carries only its share of it.
+    #[test]
+    fn brokerage_follows_its_own_lot_through_a_partial_sale() {
+        let mut buy = tx(1, "purchase", "2025-01-10", 100.0, 10.0, None);
+        buy.brokerage = Some(20.0);
+        let sell = tx(2, "sale", "2025-06-10", 40.0, 12.0, None);
+
+        let summary = calc_symbol_summary(&[buy, sell]);
+        // 40 sold at 12 against a 10.20 basis; 60 left at 10.20.
+        assert!((summary.realised_pl - 72.0).abs() < 1e-9, "expected 72, got {}", summary.realised_pl);
+        assert!((summary.remaining_cost - 612.0).abs() < 1e-9);
+    }
+
+    /// The fee is recorded in AUD, so the native lot has to convert it rather
+    /// than adding dollars to a price quoted in another currency.
+    #[test]
+    fn native_cost_converts_the_fee_at_the_trades_own_rate() {
+        let mut buy = tx(1, "purchase", "2025-01-10", 10.0, 150.0, None);
+        buy.native_price = Some(100.0); // 1.5 AUD per unit of native currency
+        buy.brokerage = Some(30.0); // AUD
+        let summary = calc_symbol_summary(&[buy]);
+
+        assert!((summary.remaining_cost - 1530.0).abs() < 1e-9, "AUD: 1500 + 30");
+        // The same fee is 20 in native terms, so 2 per share on top of 100.
+        assert!((summary.native_remaining_cost - 1020.0).abs() < 1e-9,
+            "native: 1000 + 20, got {}", summary.native_remaining_cost);
+    }
+
+    /// A transaction with no fee recorded must be unchanged by any of this.
+    #[test]
+    fn a_purchase_without_brokerage_is_unaffected() {
+        let summary = calc_symbol_summary(&[tx(1, "purchase", "2025-01-10", 100.0, 10.0, None)]);
+        assert!((summary.remaining_cost - 1000.0).abs() < 1e-9);
+    }
+
+    /// The case this exists for: a decades-old holding whose original cost
+    /// tells you nothing about how it has done lately.
+    #[test]
+    fn rebase_values_held_shares_at_the_baseline_price() {
+        // 50 shares bought in 2001 at 7.34; baseline 2025 price 281.18.
+        let txs = vec![tx(1, "purchase", "2001-07-01", 50.0, 7.34, None)];
+        let basis = rebase_at(&txs, 50.0, "2025-01-01", 281.18);
+        assert!((basis.cost - 14059.0).abs() < 1e-6, "50 × 281.18, not 50 × 7.34");
+        assert_eq!(basis.dividends, 0.0);
+    }
+
+    /// Dividends paid before the baseline belong to the earlier period —
+    /// counting them would credit the new one with income it did not earn.
+    #[test]
+    fn rebase_counts_only_dividends_from_the_baseline_on() {
+        let txs = vec![
+            tx(1, "purchase", "2001-07-01", 50.0, 7.34, None),
+            tx(2, "dividend", "2024-09-09", 50.0, 0.0, Some(108.73)),
+            tx(3, "dividend", "2025-03-10", 50.0, 0.0, Some(103.64)),
+            tx(4, "dividend", "2026-03-10", 50.0, 0.0, Some(90.49)),
+        ];
+        let basis = rebase_at(&txs, 50.0, "2025-01-01", 281.18);
+        assert!((basis.dividends - 194.13).abs() < 1e-6, "the 2024 payment is excluded");
+    }
+
+    /// A share bought after the baseline was never worth the baseline price —
+    /// for it, the purchase *is* the baseline.
+    #[test]
+    fn rebase_values_later_purchases_at_what_they_cost() {
+        let txs = vec![
+            tx(1, "purchase", "2001-07-01", 50.0, 7.34, None),
+            tx(2, "purchase", "2025-06-01", 10.0, 300.0, None),
+        ];
+        let basis = rebase_at(&txs, 60.0, "2025-01-01", 281.18);
+        // 50 × 281.18 baseline + 10 × 300 actual
+        assert!((basis.cost - (14059.0 + 3000.0)).abs() < 1e-6);
+    }
+
+    /// A sale after the baseline eats into the shares held at it, so the basis
+    /// has to follow what is actually left rather than the original count.
+    #[test]
+    fn rebase_shrinks_with_a_later_sale() {
+        let txs = vec![
+            tx(1, "purchase", "2001-07-01", 50.0, 7.34, None),
+            tx(2, "sale", "2025-06-01", 20.0, 300.0, None),
+        ];
+        let basis = rebase_at(&txs, 30.0, "2025-01-01", 281.18);
+        assert!((basis.cost - 30.0 * 281.18).abs() < 1e-6, "only the 30 still held are valued");
+    }
+
+    /// A holding bought entirely after the baseline has no baseline shares, so
+    /// its rebased cost is simply what it cost.
+    #[test]
+    fn rebase_of_a_wholly_later_holding_is_its_actual_cost() {
+        let txs = vec![tx(1, "purchase", "2025-06-01", 10.0, 42.0, None)];
+        let basis = rebase_at(&txs, 10.0, "2025-01-01", 281.18);
+        assert!((basis.cost - 420.0).abs() < 1e-6);
     }
 
     #[test]

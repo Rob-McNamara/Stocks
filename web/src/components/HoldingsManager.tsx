@@ -4,6 +4,7 @@ import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemaining
 import { settlementAccountsFor } from '../utils/cash'
 import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
+import HoldingsHeatMap from './HoldingsHeatMap'
 
 // Thin client: FIFO, cost basis, dividends, FX conversion, manual-price and
 // instrument-type overrides, and SMA are all computed by the API server
@@ -39,7 +40,7 @@ const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', '
 
 // Symbol-level fields with dedicated inputs — excluded from the user-defined
 // custom-field plumbing.
-const BUILT_IN_HOLDINGS_KEYS = ['stop_loss', 'trailing_sell_pct', 'trailing_sell_date', 'sector']
+const BUILT_IN_HOLDINGS_KEYS = ['stop_loss', 'trailing_sell_pct', 'trailing_sell_date', 'sector', 'pl_basis_date', 'pl_basis_price']
 
 interface HoldingsPrefill {
   symbol: string
@@ -105,6 +106,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  // The record form lives in a dialog. The card it used to fill now holds only
+  // the trigger, so the holdings tables sit at the top of the screen.
+  const [showRecordDialog, setShowRecordDialog] = useState(false)
 
   // Shared by the trade and dividend rows: income arrives in a currency just as
   // a purchase is paid in one, and a foreign dividend recorded as AUD would be
@@ -123,6 +127,56 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       ))}
     </select>
   )
+
+  // Extracted so a confirmed Cancel clears the form the same way a successful
+  // save does — otherwise "discard" would leave the discarded values behind.
+  const resetTransactionForm = () => {
+    setSymbol('')
+    setQuantity('')
+    setPrice('')
+    setAmount('')
+    setBrokerage('')
+    setNotes('')
+    setStopLossPrice('')
+    setTrailingSellPct('')
+    setTrailingSellDate('')
+    setSector('')
+    setCustomFieldValues({})
+    setDate(new Date().toISOString().slice(0, 10))
+    setCurrency('AUD')
+    setCashAccountId('')
+    setFxRate(null)
+    setFxRateDate(null)
+  }
+
+  const recordFormIsDirty = () =>
+    [symbol, quantity, price, amount, brokerage, notes, stopLossPrice, trailingSellPct, trailingSellDate, sector]
+      .some((v) => v.trim() !== '') ||
+    Object.values(customFieldValues).some((v) => v.trim() !== '')
+
+  // Unlike the short edit dialogs in this file, this form is long enough that
+  // losing it to a stray dismissal would be costly — hence the confirm, and no
+  // close-on-overlay-click.
+  const closeRecordDialog = () => {
+    if (recordFormIsDirty() && !confirm('Discard this unsaved transaction?')) return
+    resetTransactionForm()
+    setError(null)
+    setShowRecordDialog(false)
+  }
+
+  // A ref keeps the Escape handler reading current form values; subscribing on
+  // every render instead would re-bind the listener continuously.
+  const closeRecordDialogRef = useRef(closeRecordDialog)
+  closeRecordDialogRef.current = closeRecordDialog
+
+  useEffect(() => {
+    if (!showRecordDialog) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeRecordDialogRef.current()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [showRecordDialog])
 
   useEffect(() => {
     loadHoldings()
@@ -162,6 +216,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     setTrailingSellDate('')
     prefillAppliedSymbol.current = prefill.symbol.trim().toUpperCase()
     prefillPendingSymbol.current = prefill.symbol.trim().toUpperCase()
+    // The form is behind a button now, so a prefill that did not open the
+    // dialog would look like "Move to Holdings" had done nothing.
+    setShowRecordDialog(true)
     onPrefillConsumed?.()
   }, [prefill])
 
@@ -280,7 +337,9 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       symbol: symbol.trim(),
       transaction_type: transactionType,
       date,
-      brokerage: brokerage ? parseFloat(brokerage) : undefined,
+      // The brokerage input is hidden for a dividend; a value left over from a
+      // trade the user was mid-way through must not ride along with it.
+      brokerage: transactionType !== 'dividend' && brokerage ? parseFloat(brokerage) : undefined,
       notes: notes.trim() || undefined,
       custom_fields: Object.keys(customFieldValues).length > 0 ? customFieldValues : undefined,
       cash_account_id: cashAccountId ? Number(cashAccountId) : null,
@@ -370,12 +429,16 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
         ? (await apiClient.addHoldingFromWatchlist(payload)).transaction
         : await apiClient.addHoldingTransaction(payload)
 
-      // Save built-in symbol-level fields if provided
+      // Save built-in symbol-level fields if provided. Only a purchase offers
+      // these inputs, so only a purchase may write them — otherwise a sale
+      // would silently re-save whatever the form still held.
       const builtInUpdates: Record<string, string> = {}
-      if (stopLossPrice.trim()) builtInUpdates['stop_loss'] = stopLossPrice.trim()
-      if (trailingSellPct.trim()) builtInUpdates['trailing_sell_pct'] = trailingSellPct.trim()
-      if (trailingSellDate.trim()) builtInUpdates['trailing_sell_date'] = trailingSellDate.trim()
-      if (sector) builtInUpdates['sector'] = sector
+      if (transactionType === 'purchase') {
+        if (stopLossPrice.trim()) builtInUpdates['stop_loss'] = stopLossPrice.trim()
+        if (trailingSellPct.trim()) builtInUpdates['trailing_sell_pct'] = trailingSellPct.trim()
+        if (trailingSellDate.trim()) builtInUpdates['trailing_sell_date'] = trailingSellDate.trim()
+        if (sector) builtInUpdates['sector'] = sector
+      }
       if (Object.keys(builtInUpdates).length > 0) {
         const sym = symbol.trim().toUpperCase()
         await apiClient.updateHoldingsSymbolFields(sym, holdingsSymbolFields[sym]?.['_notes'] ?? null, builtInUpdates)
@@ -399,22 +462,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       // The prefill is consumed by the save — later manual entry of the same
       // symbol should pre-populate from its stored fields again
       prefillAppliedSymbol.current = null
-      setSymbol('')
-      setQuantity('')
-      setPrice('')
-      setAmount('')
-      setBrokerage('')
-      setNotes('')
-      setStopLossPrice('')
-      setTrailingSellPct('')
-      setTrailingSellDate('')
-      setSector('')
-      setCustomFieldValues({})
-      setDate(new Date().toISOString().slice(0, 10))
-      setCurrency('AUD')
-      setCashAccountId('')
-      setFxRate(null)
-      setFxRateDate(null)
+      resetTransactionForm()
+      // Only a success closes the dialog: validation and API failures below
+      // must leave it open with the user's input intact.
+      setShowRecordDialog(false)
       setTimeout(() => setSuccess(null), 3000)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save transaction')
@@ -523,6 +574,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     nativeAvgCost: h.native_avg_cost,
     pl: h.pl,
     plPct: h.pl_pct,
+    basisDate: h.basis_date,
     longName: h.long_name,
     instrumentType: h.instrument_type,
     isEtf: h.is_etf,
@@ -597,241 +649,305 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   return (
     <div className="holdings-manager">
       <div className="manager-card">
-        <h2>Record Stock Holding</h2>
-        <form onSubmit={handleSaveTransaction} className="add-symbol-form">
-          <div className="form-group">
-            <input
-              type="text"
-              value={symbol}
-              onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-              placeholder="Symbol (e.g. BHP.AX, AAPL)"
-              className="symbol-input"
-              disabled={loading}
-              maxLength={12}
-            />
-            <select
-              value={transactionType}
-              onChange={(e) => setTransactionType(e.target.value as HoldingTransaction['transaction_type'])}
-              className="config-input"
-              disabled={loading}
-            >
-              <option value="purchase">Purchase</option>
-              <option value="sale">Sale</option>
-              <option value="dividend">Dividend</option>
-            </select>
-            <input
-              type="date"
-              value={date}
-              onChange={(e) => setDate(e.target.value)}
-              className="config-input"
-              disabled={loading}
-            />
-          </div>
-
-          {(transactionType === 'purchase' || transactionType === 'sale') && (
-            <>
-              <div className="form-group">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={quantity}
-                  onChange={(e) => setQuantity(e.target.value)}
-                  placeholder="Quantity"
-                  className="symbol-input"
-                  disabled={loading}
-                />
-                {currencySelect}
-                <input
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={price}
-                  onChange={(e) => setPrice(e.target.value)}
-                  placeholder={currency !== 'AUD' ? `Price per share (${currency})` : 'Price per share (AUD)'}
-                  className="symbol-input"
-                  disabled={loading}
-                />
-              </div>
-              {currency !== 'AUD' && (
-                <div className="form-group" style={{ alignItems: 'center', fontSize: 13, color: '#666', gap: 8 }}>
-                  {fxLoading && <span>Fetching {currency}/AUD rate...</span>}
-                  {!fxLoading && fxRate && price && !isNaN(parseFloat(price)) && (
-                    <>
-                      <span>
-                        Rate: 1 {currency} = {fxRate.toFixed(4)} AUD
-                        {fxRateDate && ` (${fxRateDate})`}
-                      </span>
-                      <span style={{ fontWeight: 600, color: '#333' }}>
-                        → AUD {(parseFloat(price) * fxRate).toFixed(4)} per share
-                      </span>
-                    </>
-                  )}
-                  {!fxLoading && !fxRate && (
-                    <span style={{ color: '#e53935' }}>Could not fetch {currency}/AUD rate for {date}</span>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-
-          {transactionType === 'dividend' && (
-            <>
-              <div className="form-group">
-                {currencySelect}
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  placeholder={currency !== 'AUD' ? `Dividend amount (${currency})` : 'Dividend amount (AUD)'}
-                  className="symbol-input"
-                  disabled={loading}
-                />
-              </div>
-              {currency !== 'AUD' && (
-                <div className="form-group" style={{ alignItems: 'center', fontSize: 13, color: '#666', gap: 8 }}>
-                  {fxLoading && <span>Fetching {currency}/AUD rate...</span>}
-                  {!fxLoading && fxRate && amount && !isNaN(parseFloat(amount)) && (
-                    <span>
-                      Rate: 1 {currency} = {fxRate.toFixed(4)} AUD{fxRateDate && ` (${fxRateDate})`}
-                      {' → '}AUD {(parseFloat(amount) * fxRate).toFixed(2)}
-                    </span>
-                  )}
-                  {!fxLoading && !fxRate && (
-                    <span style={{ color: '#c62828' }}>No {currency}/AUD rate for {date} — cannot save.</span>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-
-          {/* Outside the trade branch: a dividend needs somewhere to land just
-              as much as a purchase needs somewhere to draw from. */}
-          {cashAccounts.length > 0 && (
-            <div className="form-group">
-              <select
-                value={settlementAccounts.some((a) => String(a.id) === cashAccountId) ? cashAccountId : ''}
-                onChange={(e) => setCashAccountId(e.target.value)}
-                className="config-input"
-                disabled={loading || settlementAccounts.length === 0}
-                title={transactionType === 'purchase'
-                  ? 'Which cash account this purchase is paid from'
-                  : 'Which cash account this money is paid into'}
-              >
-                <option value="">
-                  {settlementAccounts.length === 0
-                    ? `No account can settle ${currency} — this will not touch the ledger`
-                    : transactionType === 'purchase'
-                      ? 'Pay from… (optional)'
-                      : 'Deposit into… (optional)'}
-                </option>
-                {settlementAccounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.name} — {a.currency} {a.balance.toLocaleString('en-AU', { maximumFractionDigits: 2 })}
-                  </option>
-                ))}
-              </select>
-              <span style={{ fontSize: 12, color: '#666', alignSelf: 'center' }}>
-                {cashAccountId
-                  ? 'Cash will move automatically when this is saved.'
-                  : 'Leave blank to record it without touching cash.'}
-              </span>
-            </div>
-          )}
-
-          <div className="form-group">
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={brokerage}
-              onChange={(e) => setBrokerage(e.target.value)}
-              placeholder="Brokerage fee (optional)"
-              className="symbol-input"
-              disabled={loading}
-            />
-            <input
-              type="text"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="Notes (optional)"
-              className="symbol-input"
-              disabled={loading}
-            />
-            <select
-              value={sector}
-              onChange={(e) => setSector(e.target.value)}
-              className="config-input"
-              disabled={loading}
-              title="Sector"
-              style={{ minWidth: 140 }}
-            >
-              <option value="">Sector (optional)</option>
-              {sector && !sectorOptions.includes(sector) && (
-                <option value={sector}>{sector}</option>
-              )}
-              {sectorOptions.map((s) => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </select>
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={stopLossPrice}
-              onChange={(e) => setStopLossPrice(e.target.value)}
-              placeholder="Stop Loss Price (optional)"
-              className="symbol-input"
-              disabled={loading}
-            />
-            <input
-              type="number"
-              min="0"
-              step="0.1"
-              value={trailingSellPct}
-              onChange={(e) => setTrailingSellPct(e.target.value)}
-              placeholder="Trailing Sell % (optional)"
-              className="symbol-input"
-              disabled={loading}
-            />
-            <input
-              type="date"
-              value={trailingSellDate}
-              onChange={(e) => setTrailingSellDate(e.target.value)}
-              placeholder="Trailing Sell Date"
-              className="symbol-input"
-              disabled={loading}
-              title="Date trailing sell was placed"
-            />
-            <button type="submit" className="btn btn-primary" disabled={loading}>
-              {loading ? 'Saving...' : 'Record Transaction'}
-            </button>
-          </div>
-          {holdingsFieldDefs.filter((def) => def.actions.includes(transactionType)).length > 0 && (
-            <div className="form-group" style={{ flexWrap: 'wrap' }}>
-              {holdingsFieldDefs
-                .filter((def) => def.actions.includes(transactionType))
-                .map((def) => (
-                  <input
-                    key={def.key}
-                    type={def.type}
-                    value={customFieldValues[def.key] ?? ''}
-                    onChange={(e) => setCustomFieldValues((prev) => ({ ...prev, [def.key]: e.target.value }))}
-                    placeholder={def.label}
-                    className="symbol-input"
-                    disabled={loading}
-                    style={{ flex: 1, minWidth: 120 }}
-                  />
-                ))}
-            </div>
-          )}
-        </form>
+        <div className="card-header" style={{ marginBottom: 0 }}>
+          <h2>Record Stock Holding</h2>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => setShowRecordDialog(true)}
+            disabled={loading}
+          >
+            Record Holding…
+          </button>
+        </div>
       </div>
 
-      {error && <div className="alert alert-error">❌ {error}</div>}
+      {showRecordDialog && (
+        <div className="modal-overlay">
+          <div className="modal-card" style={{ width: 720, maxWidth: '100%' }}>
+            {/* The form wraps header/body/footer so the submit button in the
+                footer still belongs to it, and carries the card's column
+                sizing so the body is what scrolls. */}
+            <form
+              onSubmit={handleSaveTransaction}
+              style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0 }}
+            >
+              <div className="modal-header">
+                <h3 style={{ margin: 0 }}>Record Stock Holding</h3>
+              </div>
+              <div className="modal-body">
+                <div className="add-symbol-form">
+                  <div className="form-group">
+                    <input
+                      type="text"
+                      value={symbol}
+                      onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+                      placeholder="Symbol (e.g. BHP.AX, AAPL)"
+                      className="symbol-input"
+                      disabled={loading}
+                      maxLength={12}
+                    />
+                    <select
+                      value={transactionType}
+                      onChange={(e) => setTransactionType(e.target.value as HoldingTransaction['transaction_type'])}
+                      className="config-input"
+                      disabled={loading}
+                    >
+                      <option value="purchase">Purchase</option>
+                      <option value="sale">Sale</option>
+                      <option value="dividend">Dividend</option>
+                    </select>
+                    <input
+                      type="date"
+                      value={date}
+                      onChange={(e) => setDate(e.target.value)}
+                      className="config-input"
+                      disabled={loading}
+                    />
+                  </div>
+
+                  {(transactionType === 'purchase' || transactionType === 'sale') && (
+                    <>
+                      <div className="form-group">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={quantity}
+                          onChange={(e) => setQuantity(e.target.value)}
+                          placeholder="Quantity"
+                          className="symbol-input"
+                          disabled={loading}
+                        />
+                        {currencySelect}
+                        <input
+                          type="number"
+                          min="0"
+                          step="any"
+                          value={price}
+                          onChange={(e) => setPrice(e.target.value)}
+                          placeholder={currency !== 'AUD' ? `Price per share (${currency})` : 'Price per share (AUD)'}
+                          className="symbol-input"
+                          disabled={loading}
+                        />
+                      </div>
+                      {currency !== 'AUD' && (
+                        <div className="form-group" style={{ alignItems: 'center', fontSize: 13, color: '#666', gap: 8 }}>
+                          {fxLoading && <span>Fetching {currency}/AUD rate...</span>}
+                          {!fxLoading && fxRate && price && !isNaN(parseFloat(price)) && (
+                            <>
+                              <span>
+                                Rate: 1 {currency} = {fxRate.toFixed(4)} AUD
+                                {fxRateDate && ` (${fxRateDate})`}
+                              </span>
+                              <span style={{ fontWeight: 600, color: '#333' }}>
+                                → AUD {(parseFloat(price) * fxRate).toFixed(4)} per share
+                              </span>
+                            </>
+                          )}
+                          {!fxLoading && !fxRate && (
+                            <span style={{ color: '#e53935' }}>Could not fetch {currency}/AUD rate for {date}</span>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {transactionType === 'dividend' && (
+                    <>
+                      <div className="form-group">
+                        {currencySelect}
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={amount}
+                          onChange={(e) => setAmount(e.target.value)}
+                          placeholder={currency !== 'AUD' ? `Dividend amount (${currency})` : 'Dividend amount (AUD)'}
+                          className="symbol-input"
+                          disabled={loading}
+                        />
+                      </div>
+                      {currency !== 'AUD' && (
+                        <div className="form-group" style={{ alignItems: 'center', fontSize: 13, color: '#666', gap: 8 }}>
+                          {fxLoading && <span>Fetching {currency}/AUD rate...</span>}
+                          {!fxLoading && fxRate && amount && !isNaN(parseFloat(amount)) && (
+                            <span>
+                              Rate: 1 {currency} = {fxRate.toFixed(4)} AUD{fxRateDate && ` (${fxRateDate})`}
+                              {' → '}AUD {(parseFloat(amount) * fxRate).toFixed(2)}
+                            </span>
+                          )}
+                          {!fxLoading && !fxRate && (
+                            <span style={{ color: '#c62828' }}>No {currency}/AUD rate for {date} — cannot save.</span>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {/* Outside the trade branch: a dividend needs somewhere to land just
+                      as much as a purchase needs somewhere to draw from. */}
+                  {cashAccounts.length > 0 && (
+                    <div className="form-group">
+                      <select
+                        value={settlementAccounts.some((a) => String(a.id) === cashAccountId) ? cashAccountId : ''}
+                        onChange={(e) => setCashAccountId(e.target.value)}
+                        className="config-input"
+                        disabled={loading || settlementAccounts.length === 0}
+                        title={transactionType === 'purchase'
+                          ? 'Which cash account this purchase is paid from'
+                          : 'Which cash account this money is paid into'}
+                      >
+                        <option value="">
+                          {settlementAccounts.length === 0
+                            ? `No account can settle ${currency} — this will not touch the ledger`
+                            : transactionType === 'purchase'
+                              ? 'Pay from… (optional)'
+                              : 'Deposit into… (optional)'}
+                        </option>
+                        {settlementAccounts.map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.name} — {a.currency} {a.balance.toLocaleString('en-AU', { maximumFractionDigits: 2 })}
+                          </option>
+                        ))}
+                      </select>
+                      <span style={{ fontSize: 12, color: '#666', alignSelf: 'center' }}>
+                        {cashAccountId
+                          ? 'Cash will move automatically when this is saved.'
+                          : 'Leave blank to record it without touching cash.'}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="form-group">
+                    {/* A dividend is paid, not traded — there is no brokerage on it. */}
+                    {transactionType !== 'dividend' && (
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={brokerage}
+                        onChange={(e) => setBrokerage(e.target.value)}
+                        placeholder="Brokerage fee (optional)"
+                        className="symbol-input"
+                        disabled={loading}
+                      />
+                    )}
+                    <input
+                      type="text"
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      placeholder="Notes (optional)"
+                      className="symbol-input"
+                      disabled={loading}
+                    />
+                    {/* These four are symbol-level, not per-transaction: they
+                        describe the position you are opening and its exit plan.
+                        A sale or a dividend has nothing to say about either. */}
+                    {transactionType === 'purchase' && (
+                      <>
+                        <select
+                          value={sector}
+                          onChange={(e) => setSector(e.target.value)}
+                          className="config-input"
+                          disabled={loading}
+                          title="Sector"
+                          style={{ minWidth: 140 }}
+                        >
+                          <option value="">Sector (optional)</option>
+                          {sector && !sectorOptions.includes(sector) && (
+                            <option value={sector}>{sector}</option>
+                          )}
+                          {sectorOptions.map((s) => (
+                            <option key={s} value={s}>{s}</option>
+                          ))}
+                        </select>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={stopLossPrice}
+                          onChange={(e) => setStopLossPrice(e.target.value)}
+                          placeholder="Stop Loss Price (optional)"
+                          className="symbol-input"
+                          disabled={loading}
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          value={trailingSellPct}
+                          onChange={(e) => setTrailingSellPct(e.target.value)}
+                          placeholder="Trailing Sell % (optional)"
+                          className="symbol-input"
+                          disabled={loading}
+                        />
+                        <input
+                          type="date"
+                          value={trailingSellDate}
+                          onChange={(e) => setTrailingSellDate(e.target.value)}
+                          placeholder="Trailing Sell Date"
+                          className="symbol-input"
+                          disabled={loading}
+                          title="Date trailing sell was placed"
+                        />
+                      </>
+                    )}
+                  </div>
+                  {holdingsFieldDefs.filter((def) => def.actions.includes(transactionType)).length > 0 && (
+                    <div className="form-group" style={{ flexWrap: 'wrap' }}>
+                      {holdingsFieldDefs
+                        .filter((def) => def.actions.includes(transactionType))
+                        .map((def) => (
+                          <input
+                            key={def.key}
+                            type={def.type}
+                            value={customFieldValues[def.key] ?? ''}
+                            onChange={(e) => setCustomFieldValues((prev) => ({ ...prev, [def.key]: e.target.value }))}
+                            placeholder={def.label}
+                            className="symbol-input"
+                            disabled={loading}
+                            style={{ flex: 1, minWidth: 120 }}
+                          />
+                        ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="modal-footer">
+                {/* Errors belong here rather than on the page behind the
+                    overlay, and in the footer they stay visible however far
+                    the body is scrolled. */}
+                {error && (
+                  <span style={{ color: '#c62828', fontSize: 13, marginRight: 'auto', alignSelf: 'center' }}>
+                    ❌ {error}
+                  </span>
+                )}
+                <button type="button" className="btn btn-outline" onClick={closeRecordDialog} disabled={loading}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={loading}>
+                  {loading ? 'Saving...' : 'Record Transaction'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {error && !showRecordDialog && <div className="alert alert-error">❌ {error}</div>}
       {success && <div className="alert alert-success">✓ {success}</div>}
+
+      {serverHoldings.length > 0 && (
+        <div className="manager-card">
+          <div className="card-header">
+            <h2>Heat Map</h2>
+          </div>
+          {/* Clicking a tile drives the chart card below rather than opening
+              anything of its own — the map is a way into a position. */}
+          <HoldingsHeatMap holdings={serverHoldings} onSelectSymbol={setSelectedChartSymbol} />
+        </div>
+      )}
 
       {selectedChartSymbol && (
         <div className="manager-card chart-card">
@@ -1032,7 +1148,10 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                     const pct = item.invested > 0 ? (pl / item.invested) * 100 : null
                     return (
                       <div style={{ color: pl >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
-                        P/L: {pl >= 0 ? '+' : '-'}${Math.abs(pl).toFixed(2)}
+                        {/* A baseline replaces the purchase as the basis, so
+                            there is one figure — labelled with the period it
+                            actually covers rather than left to be assumed. */}
+                        P/L{item.basisDate ? ` since ${item.basisDate}` : ''}: {pl >= 0 ? '+' : '-'}${Math.abs(pl).toFixed(2)}
                         {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
                       </div>
                     )
@@ -1229,6 +1348,22 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 />
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Track P/L from</label>
+                <input
+                  type="date"
+                  value={editCardFields['pl_basis_date'] ?? ''}
+                  onChange={(e) => setEditCardFields((prev) => ({ ...prev, pl_basis_date: e.target.value }))}
+                  className="symbol-input"
+                  style={{ width: '100%' }}
+                  title="Measure profit and loss from this date instead of the original purchase"
+                />
+                <span style={{ fontSize: 11, color: '#666' }}>
+                  {editCardFields['pl_basis_price']
+                    ? `Baseline price $${parseFloat(editCardFields['pl_basis_price']).toFixed(2)} — the transaction record is unchanged.`
+                    : 'Optional. For long-held stocks whose original cost no longer says anything useful.'}
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <label style={{ fontSize: 13, color: '#666' }}>Sector</label>
                 <select
                   value={editCardFields['sector'] ?? ''}
@@ -1283,9 +1418,19 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                     if (symbolChanged) {
                       await apiClient.renameHoldingSymbol(oldSymbol, newSymbol)
                     }
-                    const fields = { ...editCardFields }
+                    // The baseline price is resolved server-side from the date;
+                    // sending back the copy we were shown would assert a value
+                    // the client has no business deciding.
+                    const { pl_basis_price: _shownBasisPrice, ...fields } = editCardFields
+                    const basisChanged =
+                      (editCardFields['pl_basis_date'] ?? '') !== (holdingsSymbolFields[oldSymbol]?.['pl_basis_date'] ?? '')
                     await apiClient.updateHoldingsSymbolFields(targetSymbol, editCardNotes.trim() || null, fields)
                     setEditingSymbolCard(null)
+                    if (basisChanged && !symbolChanged) {
+                      // The rebased figures are server-computed, so the local
+                      // field patch below cannot produce them.
+                      await loadHoldings()
+                    }
                     if (symbolChanged) {
                       // Transactions changed — reload everything and notify other tabs
                       if (selectedChartSymbol === oldSymbol) setSelectedChartSymbol(newSymbol)

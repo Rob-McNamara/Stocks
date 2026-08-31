@@ -257,6 +257,165 @@ fn err_internal(message: impl Into<String>) -> HttpResponse {
     api_error(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
 }
 
+/// The vocabulary a dashboard list definition may use. Kept beside the
+/// validator rather than inline in the engine so the two cannot drift: a value
+/// the engine would silently treat as "matches nothing" is rejected on write.
+const LIST_SOURCES: [&str; 3] = ["holdings", "watchlist", "both"];
+const LIST_OPERATORS: [&str; 7] = [
+    "above", "below", "pct_above", "pct_below", "days_above", "days_below", "volume_cross_pct",
+];
+const LIST_COMPARES: [&str; 2] = ["price", "volume"];
+const LIST_SORTS: [&str; 2] = ["asc", "desc"];
+const LIST_INDICATORS: [&str; 3] = ["sma50", "sma150", "ema40w"];
+
+/// Reject a config value the server would later fail to parse.
+///
+/// These keys hold JSON that other endpoints read back. Without this a typo is
+/// accepted silently and only shows up as an empty dashboard, with nothing
+/// pointing at the cause.
+fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "dashboard_custom_lists" => validate_dashboard_custom_lists(value),
+        "holdings_custom_fields" | "watchlist_custom_fields" => validate_custom_fields(value),
+        PORTFOLIO_HISTORY_START => validate_optional_date(value),
+        _ => Ok(()),
+    }
+}
+
+/// A date setting that may be cleared. Stored as text and compared as text, so
+/// anything but YYYY-MM-DD would silently order wrongly rather than fail.
+fn validate_optional_date(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| format!("'{trimmed}' is not a date in YYYY-MM-DD form"))
+}
+
+fn validate_dashboard_custom_lists(value: &str) -> Result<(), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|err| format!("not valid JSON: {err}"))?;
+    let items = parsed.as_array().ok_or("must be a JSON array of list definitions")?;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for (index, item) in items.iter().enumerate() {
+        let at = |message: String| format!("list {}: {}", index + 1, message);
+        let obj = item.as_object().ok_or_else(|| at("must be an object".into()))?;
+        let text = |field: &str| {
+            obj.get(field)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        // An absent optional field and an explicit null mean the same thing.
+        let optional = |field: &str| obj.get(field).filter(|v| !v.is_null());
+        let one_of = |field: &str, allowed: &[&str], found: &str| -> Result<(), String> {
+            if allowed.contains(&found) {
+                Ok(())
+            } else {
+                Err(at(format!("{field} '{found}' is not one of: {}", allowed.join(", "))))
+            }
+        };
+
+        let key = text("key").ok_or_else(|| at("key is required".into()))?;
+        if !seen.insert(key) {
+            return Err(at(format!("duplicate key '{key}' — keys identify a list to the client")));
+        }
+        text("label").ok_or_else(|| at("label is required".into()))?;
+
+        one_of("source", &LIST_SOURCES, text("source").ok_or_else(|| at("source is required".into()))?)?;
+        one_of("operator", &LIST_OPERATORS, text("operator").ok_or_else(|| at("operator is required".into()))?)?;
+
+        let field_key = text("field_key").ok_or_else(|| at("field_key is required".into()))?;
+        let (prefix, name) = field_key
+            .split_once(':')
+            .ok_or_else(|| at("field_key must look like holdings:key, watchlist:key or indicator:key".into()))?;
+        match prefix {
+            // Custom field names are user-defined and a list may be configured
+            // before the field it points at exists, so only the shape is checked.
+            "holdings" | "watchlist" => {
+                if name.trim().is_empty() {
+                    return Err(at(format!("field_key '{field_key}' names no field")));
+                }
+            }
+            "indicator" => one_of("indicator", &LIST_INDICATORS, name)?,
+            other => {
+                return Err(at(format!(
+                    "field_key prefix '{other}' is not holdings, watchlist or indicator"
+                )))
+            }
+        }
+
+        if let Some(compare) = optional("compare") {
+            one_of("compare", &LIST_COMPARES, compare.as_str().ok_or_else(|| at("compare must be a string".into()))?)?;
+        }
+        if let Some(sort) = optional("sort") {
+            one_of("sort", &LIST_SORTS, sort.as_str().ok_or_else(|| at("sort must be a string".into()))?)?;
+        }
+        if let Some(limit) = optional("limit") {
+            let n = limit.as_u64().ok_or_else(|| at("limit must be a whole number".into()))?;
+            if n == 0 || n > 100 {
+                return Err(at(format!("limit {n} is outside 1-100")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Custom field definitions are simpler — a key and a label each — but they
+/// fail the same way, so they get the same guard.
+fn validate_custom_fields(value: &str) -> Result<(), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|err| format!("not valid JSON: {err}"))?;
+    let items = parsed.as_array().ok_or("must be a JSON array of field definitions")?;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        let at = |message: String| format!("field {}: {}", index + 1, message);
+        let obj = item.as_object().ok_or_else(|| at("must be an object".into()))?;
+        let text = |field: &str| {
+            obj.get(field)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        let key = text("key").ok_or_else(|| at("key is required".into()))?;
+        if !seen.insert(key) {
+            return Err(at(format!("duplicate key '{key}'")));
+        }
+        text("label").ok_or_else(|| at("label is required".into()))?;
+    }
+    Ok(())
+}
+
+/// Read a JSON config value, logging when it cannot be parsed.
+///
+/// The fallback is still the default — a broken blob must not take an endpoint
+/// down — but it leaves a trail in the event log instead of an empty screen
+/// with no explanation.
+fn config_json<T: serde::de::DeserializeOwned + Default>(
+    db_path: &PathBuf,
+    config: &HashMap<String, String>,
+    key: &str,
+) -> T {
+    let Some(raw) = config.get(key) else { return T::default() };
+    match serde_json::from_str(raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let _ = insert_event_log(
+                db_path,
+                "error",
+                "config_parse",
+                "api",
+                Some(key),
+                &format!("Could not parse {key}, falling back to empty: {err}"),
+            );
+            T::default()
+        }
+    }
+}
+
 fn err_bad_request(message: impl Into<String>) -> HttpResponse {
     api_error(actix_web::http::StatusCode::BAD_REQUEST, "bad_request", message)
 }
@@ -553,6 +712,11 @@ async fn update_config(
     let value = payload.value.trim();
     if key.is_empty() {
         return err_bad_request("Config key is required");
+    }
+    if let Err(reason) = validate_config_value(key, value) {
+        let message = format!("Invalid {key}: {reason}");
+        let _ = insert_event_log(&db_path, "warn", "config_update", "api", Some(key), &message);
+        return err_bad_request(message);
     }
 
     match upsert_config(&db_path, key, value) {
@@ -1076,10 +1240,34 @@ async fn update_holdings_symbol_fields(
             let _ = insert_event_log(&db_path, "error", "holdings_symbol_fields_update", "api", Some(&symbol), &format!("Failed to save notes: {}", err));
             return err_internal(err.to_string());
         }
-    if let Some(ref fields) = payload.custom_fields
-        && let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
+    if let Some(ref fields) = payload.custom_fields {
+        if let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, fields) {
             return err_internal(err);
         }
+        // The baseline price is resolved once, here, rather than derived on
+        // every read: stored history is finite and gets trimmed, and a basis
+        // that silently moves is not a record of anything. Clearing the date
+        // clears the price with it.
+        if let Some(date) = fields.get(PL_BASIS_DATE) {
+            let resolved = if date.trim().is_empty() {
+                String::new()
+            } else {
+                match close_on_or_after(&conn, &symbol, date.trim()) {
+                    Some(close) => close.to_string(),
+                    None => {
+                        let message = format!("No stored price for {} on or after {}", symbol, date.trim());
+                        let _ = insert_event_log(&db_path, "warn", "holdings_symbol_fields_update", "api", Some(&symbol), &message);
+                        return err_unprocessable(message);
+                    }
+                }
+            };
+            let mut resolved_field = std::collections::HashMap::new();
+            resolved_field.insert(PL_BASIS_PRICE.to_string(), resolved);
+            if let Err(err) = upsert_holdings_symbol_fields(&conn, &symbol, &resolved_field) {
+                return err_internal(err);
+            }
+        }
+    }
     HttpResponse::Ok().json("ok")
 }
 
@@ -4406,7 +4594,25 @@ async fn get_portfolio_history(db_path: web::Data<PathBuf>, query: web::Query<Hi
         Ok(c) => c,
         Err(err) => return err_internal(err.to_string()),
     };
-    let series = match build_portfolio_history(&conn, query.from.as_deref(), query.to.as_deref()) {
+    // The floor applies to every range, not just "All": a 5-year window reaches
+    // just as far back into the unpriced years as an unbounded one.
+    let floor: Option<String> = load_config(&db_path)
+        .ok()
+        .and_then(|items| {
+            items
+                .into_iter()
+                .find(|item| item.key == PORTFOLIO_HISTORY_START)
+                .map(|item| item.value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty());
+    // ISO dates order lexicographically, so the later of the two is the max.
+    let from = match (query.from.as_deref(), floor.as_deref()) {
+        (Some(requested), Some(floor)) => Some(requested.max(floor)),
+        (None, floor) => floor,
+        (requested, None) => requested,
+    };
+
+    let series = match build_portfolio_history(&conn, from, query.to.as_deref()) {
         Ok(s) => s,
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "portfolio_history", "api", None, &err);
@@ -4441,7 +4647,11 @@ async fn get_portfolio_history(db_path: web::Data<PathBuf>, query: web::Query<Hi
             // do not account for. opening + contributions + gain = end.
             "gain": end_value - opening_value - contributions,
             "twr_pct": twr.map(|r| r * 100.0),
-        }
+        },
+        // Published so the client can hide range buttons the floor makes
+        // identical to each other, rather than offering three ways to ask for
+        // the same window.
+        "start_floor": floor,
     }))
 }
 
@@ -5592,6 +5802,21 @@ fn load_holdings_symbol_fields(db_path: &PathBuf) -> Result<std::collections::Ha
     Ok(result)
 }
 
+/// First stored close on or after `date`, in the symbol's own currency.
+///
+/// A baseline date names a calendar day, which is often not a trading day —
+/// 1 January never is — so it resolves forward to the first bar that exists.
+fn close_on_or_after(conn: &Connection, symbol: &str, date: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT close FROM prices
+          WHERE symbol = ?1 AND date >= ?2 AND close IS NOT NULL
+          ORDER BY date LIMIT 1",
+        params![symbol, date],
+        |row| row.get::<_, f64>(0),
+    )
+    .ok()
+}
+
 fn upsert_holdings_symbol_fields(conn: &Connection, symbol: &str, fields: &std::collections::HashMap<String, String>) -> Result<(), String> {
     for (key, value) in fields {
         if value.is_empty() {
@@ -6673,6 +6898,21 @@ fn fetch_event_log(db_path: &PathBuf, q: &EventQuery) -> Result<(Vec<EventLogEnt
 // ---------------------------------------------------------------------------
 
 const DEFAULT_SECTORS_JSON: &str = r#"["Energy","Materials","Industrials","Consumer Discretionary","Consumer Staples","Health Care","Financials","Information Technology","Communication Services","Utilities","Real Estate","Others"]"#;
+/// Symbol-level keys for the profit/loss baseline. `_price` is derived from
+/// `_date` when the date is saved, and both live in `holdings_symbol_fields`,
+/// which is already audited — so this needs no schema change and no new
+/// triggers.
+/// Earliest date the portfolio value chart will report, empty for no floor.
+///
+/// A holding cannot be valued before its first stored price bar, so the years
+/// before that are drawn with the stock line flat at zero — cash alone, dressed
+/// up as portfolio history. The floor cuts that stretch off rather than
+/// inviting it to be read as a real drawdown.
+const PORTFOLIO_HISTORY_START: &str = "portfolio_history_start";
+
+const PL_BASIS_DATE: &str = "pl_basis_date";
+const PL_BASIS_PRICE: &str = "pl_basis_price";
+
 const SUPPORTED_CURRENCIES: [&str; 9] = ["AUD", "USD", "GBP", "EUR", "JPY", "CAD", "HKD", "SGD", "NZD"];
 
 fn to_portfolio_txs(rows: &[HoldingTransaction]) -> Vec<PortfolioTx> {
@@ -6774,12 +7014,6 @@ fn stored_sma(conn: &Connection, symbol: &str, period: usize) -> Option<f64> {
     Some(closes.iter().sum::<f64>() / period as f64)
 }
 
-/// Latest N-day exponential moving average from stored daily closes (no network).
-///
-/// Seeded with the simple average of the oldest full window, then iterated
-/// forward with k = 2/(period+1) — the same definition as `calculateEMA` in the
-/// web client, over the same 600-bar window the chart requests, so the Analysis
-/// table and the chart's EMA overlay agree.
 /// Exponential moving average over *weekly* closes.
 ///
 /// A 40-week EMA is not a 200-day EMA. Both span roughly the same calendar, but
@@ -6795,8 +7029,8 @@ fn stored_weekly_ema(conn: &Connection, symbol: &str, period: usize) -> Option<f
         return None;
     }
     // Daily rows to read before collapsing. An EMA needs history well beyond
-    // its period to settle, and a week costs ~5 rows, so this is the weekly
-    // equivalent of `stored_ema`'s lookback.
+    // its period to settle, and a week costs ~5 rows, so 40 weeks of settled
+    // average needs years of dailies behind it.
     const LOOKBACK_DAYS: i64 = 3000;
     let mut stmt = conn
         .prepare(
@@ -6839,29 +7073,163 @@ fn stored_weekly_ema(conn: &Connection, symbol: &str, period: usize) -> Option<f
     Some(ema)
 }
 
-fn stored_ema(conn: &Connection, symbol: &str, period: usize) -> Option<f64> {
-    // An EMA needs history well beyond its period to settle, unlike an SMA
-    // which only ever looks at exactly `period` closes.
-    const LOOKBACK: i64 = 600;
-    let mut stmt = conn
-        .prepare("SELECT close FROM prices WHERE symbol = ?1 AND close IS NOT NULL ORDER BY date DESC LIMIT ?2")
-        .ok()?;
-    let mut closes: Vec<f64> = stmt
-        .query_map(params![symbol, LOOKBACK], |row| row.get::<_, f64>(0))
-        .ok()?
-        .flatten()
-        .collect();
-    if closes.len() < period || period == 0 {
+/// The cost basis and dividends a holding's performance is measured against,
+/// and the baseline it came from when one is set.
+///
+/// A per-symbol baseline *replaces* the purchase rather than sitting beside it:
+/// for a holding bought decades ago the original price is a record, not a
+/// useful denominator. Both the holdings endpoint and the overview aggregate go
+/// through here, so the Holdings screen and the Dashboard total can never
+/// disagree about the same position.
+///
+/// The stored basis price is native, like the closes it came from, so it is
+/// converted at today's rate — an approximation for a foreign holding, but
+/// consistent with the current value it is measured against.
+fn effective_basis(
+    ctx: &PortfolioContext,
+    symbol: &str,
+    txs: &[portfolio::PortfolioTx],
+    remaining_shares: f64,
+    purchase_cost: f64,
+    purchase_dividends: f64,
+) -> (f64, f64, Option<(String, f64)>) {
+    let fields = ctx.fields.get(symbol);
+    let date = fields.and_then(|f| f.get(PL_BASIS_DATE)).map(|d| d.trim()).filter(|d| !d.is_empty());
+    let native = fields
+        .and_then(|f| f.get(PL_BASIS_PRICE))
+        .and_then(|p| p.trim().parse::<f64>().ok())
+        .filter(|p| *p > 0.0);
+    if let (Some(date), Some(native)) = (date, native) {
+        let basis = portfolio::rebase_at(txs, remaining_shares, date, ctx.to_aud(symbol, native));
+        // A zero basis would divide the percentage by nothing; fall back to the
+        // purchase rather than reporting an infinite return.
+        if basis.cost > 0.0 {
+            return (basis.cost, basis.dividends, Some((date.to_string(), native)));
+        }
+    }
+    (purchase_cost, purchase_dividends, None)
+}
+
+/// Latest value of a dashboard `indicator:` field, in the symbol's own
+/// currency — the same basis as the stored closes it is derived from, so it
+/// needs no FX conversion to compare against a native price.
+///
+/// Keys are matched exactly rather than parsed for a period: the Configuration
+/// screen offers a fixed set, and an explicit list keeps a typo from silently
+/// producing an empty dashboard table.
+fn indicator_value(conn: &Connection, symbol: &str, key: &str) -> Option<f64> {
+    match key {
+        "sma50" => stored_sma(conn, symbol, 50),
+        "sma150" => stored_sma(conn, symbol, 150),
+        "ema40w" => stored_weekly_ema(conn, symbol, 40),
+        _ => None,
+    }
+}
+
+/// Stored daily bars for one symbol, newest-last, straight from the database.
+///
+/// Deliberately not `fetch_price_history`: that tops up from Yahoo when the
+/// stored window looks short, and a crossover list spanning a few hundred
+/// watchlist symbols would turn one dashboard load into a burst of fetches.
+/// Whatever has been ingested is what the indicator is built from.
+fn load_local_history(conn: &Connection, symbol: &str, days: i64) -> Vec<PriceHistoryPoint> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT date, open, high, low, close, volume FROM prices
+          WHERE symbol = ?1 AND close IS NOT NULL
+          ORDER BY date DESC LIMIT ?2",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![symbol, days], |row| {
+        Ok(PriceHistoryPoint {
+            date: row.get(0)?,
+            open: row.get(1)?,
+            high: row.get(2)?,
+            low: row.get(3)?,
+            close: row.get(4)?,
+            volume: row.get(5)?,
+        })
+    }) else {
+        return Vec::new();
+    };
+    let mut history: Vec<PriceHistoryPoint> = rows.flatten().collect();
+    history.reverse();
+    history
+}
+
+/// The reference series a crossover is measured against, aligned one-to-one
+/// with `history` so a crossing can be counted in trading days.
+///
+/// `constant` covers a stored field — a breakthrough price does not move, so
+/// its series is that number repeated, and "days above" reads as days since the
+/// price cleared it.
+fn crossover_reference(
+    history: &[PriceHistoryPoint],
+    field_key: &str,
+    constant: Option<f64>,
+) -> Option<Vec<Option<f64>>> {
+    use stocks::indicators as ind;
+    let points = indicator_points(history);
+    match field_key {
+        "sma50" => Some(ind::calculate_sma(&points, 50)),
+        "sma150" => Some(ind::calculate_sma(&points, 150)),
+        "ema40w" => weekly_ema_series(history, 40),
+        _ => constant.map(|c| vec![Some(c); history.len()]),
+    }
+}
+
+/// A weekly EMA spread back over the daily bars it covers, so a weekly
+/// indicator can still be crossed in days.
+///
+/// Each day carries the EMA of the last *completed* week before it. Using the
+/// running week's own value would let a bar be compared against an average that
+/// includes its own close — the count would then shift retroactively as the
+/// week finished.
+fn weekly_ema_series(history: &[PriceHistoryPoint], period: usize) -> Option<Vec<Option<f64>>> {
+    if period == 0 {
         return None;
     }
-    closes.reverse(); // query returns newest first; the EMA walks forward
-
-    let k = 2.0 / (period as f64 + 1.0);
-    let mut ema = closes[..period].iter().sum::<f64>() / period as f64;
-    for close in &closes[period..] {
-        ema = close * k + ema * (1.0 - k);
+    // Collapse to one close per week, remembering which week each daily bar is
+    // in so the finished EMA can be mapped back onto the dailies.
+    let mut weeks: Vec<NaiveDate> = Vec::new();
+    let mut weekly_closes: Vec<f64> = Vec::new();
+    let mut bar_week: Vec<Option<usize>> = Vec::with_capacity(history.len());
+    for bar in history {
+        let parsed = NaiveDate::parse_from_str(&bar.date, "%Y-%m-%d").ok();
+        match (parsed, bar.close) {
+            (Some(date), Some(close)) => {
+                let monday = date.week(chrono::Weekday::Mon).first_day();
+                if weeks.last() == Some(&monday) {
+                    *weekly_closes.last_mut()? = close;
+                } else {
+                    weeks.push(monday);
+                    weekly_closes.push(close);
+                }
+                bar_week.push(Some(weeks.len() - 1));
+            }
+            _ => bar_week.push(None),
+        }
     }
-    Some(ema)
+    if weekly_closes.len() < period {
+        return None;
+    }
+
+    // EMA over the weekly closes: index i holds the value once week i closes.
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut weekly_ema: Vec<Option<f64>> = vec![None; weekly_closes.len()];
+    let mut ema = weekly_closes[..period].iter().sum::<f64>() / period as f64;
+    weekly_ema[period - 1] = Some(ema);
+    for i in period..weekly_closes.len() {
+        ema = weekly_closes[i] * k + ema * (1.0 - k);
+        weekly_ema[i] = Some(ema);
+    }
+
+    Some(
+        bar_week
+            .iter()
+            .map(|w| w.and_then(|i| if i == 0 { None } else { weekly_ema[i - 1] }))
+            .collect(),
+    )
 }
 
 struct EffectivePrice {
@@ -7054,8 +7422,6 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
         let ep = ctx.prices.get(symbol);
         let price_aud = ep.and_then(|p| p.aud);
         let current_value = price_aud.filter(|p| *p != 0.0).map(|p| summary.remaining_shares * p).unwrap_or(0.0);
-        let invested = summary.remaining_cost;
-        let pl = current_value - invested + dividends;
         let sym_fields = ctx.fields.get(symbol);
         let fields: HashMap<&String, &String> = sym_fields
             .map(|f| f.iter().filter(|(k, _)| k.as_str() != "_notes").collect())
@@ -7069,6 +7435,25 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
                 Some((sl, trailing)) => (Some(sl), trailing),
                 None => (None, false),
             };
+
+        let (invested, dividends, rebased) = effective_basis(
+            &ctx,
+            symbol,
+            txs,
+            summary.remaining_shares,
+            summary.remaining_cost,
+            dividends,
+        );
+        let (avg_cost, native_avg_cost) = match rebased.as_ref() {
+            Some((_, native)) => (Some(ctx.to_aud(symbol, *native)), Some(*native)),
+            None => (
+                (summary.remaining_shares > 0.0)
+                    .then(|| summary.remaining_cost / summary.remaining_shares),
+                (summary.remaining_shares > 0.0)
+                    .then(|| summary.native_remaining_cost / summary.remaining_shares),
+            ),
+        };
+        let pl = current_value - invested + dividends;
         holdings.push(serde_json::json!({
             "symbol": symbol,
             "long_name": ctx.info.get(symbol).and_then(|i| i.1.clone()),
@@ -7081,8 +7466,8 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             "fields": fields,
             "shares": summary.remaining_shares,
             "invested": invested,
-            "avg_cost": if summary.remaining_shares > 0.0 { Some(invested / summary.remaining_shares) } else { None },
-            "native_avg_cost": if summary.remaining_shares > 0.0 { Some(summary.native_remaining_cost / summary.remaining_shares) } else { None },
+            "avg_cost": avg_cost,
+            "native_avg_cost": native_avg_cost,
             "current_price": price_aud,
             "native_current_price": ep.and_then(|p| p.native),
             "price_source": ep.map(|p| p.source).unwrap_or("none"),
@@ -7094,6 +7479,10 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             "dividends": dividends,
             "pl": pl,
             "pl_pct": if invested > 0.0 { Some(pl / invested * 100.0) } else { None },
+            // Present when the figures above are measured from a baseline
+            // rather than from the purchase, so the client can say which.
+            "basis_date": rebased.as_ref().map(|(date, _)| date.clone()),
+            "basis_price": rebased.as_ref().map(|(_, native)| *native),
             "sma150": sma150,
             "stop_loss": stop_loss,
             "is_trailing_sell": is_trailing_sell,
@@ -7238,15 +7627,25 @@ async fn get_portfolio_overview(
         if pos.remaining_shares > 0.0 {
             let price = ctx.prices.get(symbol).and_then(|p| p.aud).filter(|p| *p != 0.0);
             let current_value = price.map(|p| pos.remaining_shares * p).unwrap_or(0.0);
-            let sym_pl = current_value - pos.remaining_cost + pos.dividends;
-            holdings_agg.add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+            // Same basis the Holdings screen reports, so the totals here are the
+            // sum of what that screen shows rather than a second opinion.
+            let (cost, dividends, _) = effective_basis(
+                &ctx,
+                symbol,
+                txs,
+                pos.remaining_shares,
+                pos.remaining_cost,
+                pos.dividends,
+            );
+            let sym_pl = current_value - cost + dividends;
+            holdings_agg.add(current_value, dividends, sym_pl, cost);
             if ctx.etf.get(symbol).copied().unwrap_or(false) {
-                etf_agg.add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+                etf_agg.add(current_value, dividends, sym_pl, cost);
             } else {
-                equity_agg.add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+                equity_agg.add(current_value, dividends, sym_pl, cost);
             }
             let sector = ctx.sector_of(symbol).unwrap_or_else(|| "Unallocated".to_string());
-            sector_aggs.entry(sector).or_default().add(current_value, pos.dividends, sym_pl, pos.remaining_cost);
+            sector_aggs.entry(sector).or_default().add(current_value, dividends, sym_pl, cost);
         }
 
         let sym_sold_pl = pos.sold_pl();
@@ -7353,6 +7752,11 @@ async fn get_portfolio_overview(
         source: String,
         field_key: String,
         operator: String,
+        /// What the field is compared against: "price" (default) or "volume".
+        /// Volume is a raw share count with no currency, so it is never
+        /// converted the way a price is.
+        #[serde(default)]
+        compare: Option<String>,
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
@@ -7363,18 +7767,9 @@ async fn get_portfolio_overview(
         key: String,
         label: String,
     }
-    let list_defs: Vec<DashboardListDef> = config
-        .get("dashboard_custom_lists")
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-    let holdings_field_defs: Vec<FieldDef> = config
-        .get("holdings_custom_fields")
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-    let watchlist_field_defs: Vec<FieldDef> = config
-        .get("watchlist_custom_fields")
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let list_defs: Vec<DashboardListDef> = config_json(&db_path, &config, "dashboard_custom_lists");
+    let holdings_field_defs: Vec<FieldDef> = config_json(&db_path, &config, "holdings_custom_fields");
+    let watchlist_field_defs: Vec<FieldDef> = config_json(&db_path, &config, "watchlist_custom_fields");
 
     // Needed to derive trailing stop-loss triggers for the stop_loss lists;
     // on failure those lists degrade to manual stop losses only.
@@ -7385,38 +7780,148 @@ async fn get_portfolio_overview(
             None
         }
     };
+    // Crossover operators need the whole aligned series, not just the latest
+    // indicator value, so their history is read up front — but only when a list
+    // actually asks for one, leaving every other dashboard load untouched.
+    const CROSS_OPS: [&str; 3] = ["days_above", "days_below", "volume_cross_pct"];
+    let cross_defs: Vec<&DashboardListDef> = list_defs
+        .iter()
+        .filter(|d| CROSS_OPS.contains(&d.operator.as_str()))
+        .collect();
+    // A 40-week EMA needs years of bars to settle; the same lookback as
+    // `stored_weekly_ema` keeps a "days above" list agreeing with the plain
+    // "above" list on the same indicator.
+    let cross_window: i64 = if cross_defs.iter().any(|d| d.field_key.ends_with(":ema40w")) { 3000 } else { 600 };
+    let mut cross_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in &cross_defs {
+        if def.source == "holdings" || def.source == "both" {
+            for (symbol, txs) in &ctx.groups {
+                if portfolio::calc_symbol_position(txs).remaining_shares > 0.0 {
+                    cross_symbols.insert(symbol.clone());
+                }
+            }
+        }
+        if def.source == "watchlist" || def.source == "both" {
+            cross_symbols.extend(watch_unique.iter().cloned());
+        }
+    }
+    let cross_histories: HashMap<String, Vec<PriceHistoryPoint>> = match list_conn.as_ref() {
+        Some(conn) => cross_symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), load_local_history(conn, symbol, cross_window)))
+            .collect(),
+        None => HashMap::new(),
+    };
+    if !cross_defs.is_empty() && cross_histories.is_empty() {
+        let _ = insert_event_log(&db_path, "warn", "portfolio_fetch", "api", None, "Crossover lists configured but no price history could be read; those lists will be empty");
+    }
+
+    let cross_stats = |symbol: &str,
+                       field_key: &str,
+                       constant: Option<f64>,
+                       direction: stocks::indicators::CrossDirection,
+                       today_volume: Option<i64>|
+     -> Option<stocks::indicators::CrossoverStats> {
+        let history = cross_histories.get(symbol)?;
+        let reference = crossover_reference(history, field_key, constant)?;
+        let points = indicator_points(history);
+        Some(stocks::indicators::crossover_stats_dir(&points, &reference, today_volume, direction))
+    };
+
+    // Indicators are read per symbol from `prices`, and a weekly EMA sweeps
+    // thousands of rows. Two lists on the same indicator would pay that twice,
+    // so results are memoised for the life of the request.
+    let indicator_cache: std::cell::RefCell<HashMap<(String, String), Option<f64>>> =
+        std::cell::RefCell::new(HashMap::new());
+    let cached_indicator = |symbol: &str, key: &str| -> Option<f64> {
+        let cache_key = (symbol.to_string(), key.to_string());
+        if let Some(hit) = indicator_cache.borrow().get(&cache_key) {
+            return *hit;
+        }
+        let value = list_conn.as_ref().and_then(|conn| indicator_value(conn, symbol, key));
+        indicator_cache.borrow_mut().insert(cache_key, value);
+        value
+    };
+
     let custom_lists: Vec<serde_json::Value> = list_defs
         .iter()
         .map(|def| {
             let (field_source, field_key) = def.field_key.split_once(':').unwrap_or(("", ""));
+            // An indicator is derived from price history, so it exists for any
+            // symbol regardless of which table the symbol lives in. `source`
+            // alone then decides which branches run.
+            let is_indicator = field_source == "indicator";
             struct Entry {
                 symbol: String,
                 price: f64,
+                /// The side of the comparison the diff is measured from —
+                /// equal to `price` unless the list compares volume.
+                compare_value: f64,
+                /// Which table this symbol came from. Per entry rather than per
+                /// list because an indicator list sourced from "both" mixes
+                /// holdings and watchlist rows, and each navigates elsewhere.
+                origin: &'static str,
+                /// Trading days since the crossing, on a crossover list only.
+                days: Option<i64>,
+                /// Volume on the crossing day vs the preceding 20-day average.
+                volume_cross_pct: Option<f64>,
                 field_value: f64,
                 diff: f64,
                 pct_diff: f64,
                 currency: Option<String>,
                 is_trailing: bool,
             }
+            let compare_volume = def.compare.as_deref() == Some("volume");
+            // "Volume on cross" is the breakout case measured a different way,
+            // so it shares a direction with days_above and differs only in what
+            // the list is ranked by.
+            let cross_dir = match def.operator.as_str() {
+                "days_above" | "volume_cross_pct" => Some(stocks::indicators::CrossDirection::Above),
+                "days_below" => Some(stocks::indicators::CrossDirection::Below),
+                _ => None,
+            };
+            // The column the list is ranked by, so the client knows which
+            // header to make sortable and which figures to show.
+            let metric = match def.operator.as_str() {
+                "days_above" | "days_below" => "days",
+                "volume_cross_pct" => "volume_cross_pct",
+                _ => "pct_diff",
+            };
             let matches_op = |diff: f64| match def.operator.as_str() {
-                "above" | "pct_below" => diff > 0.0,
-                "below" | "pct_above" => diff < 0.0,
+                "above" | "pct_below" | "days_above" | "volume_cross_pct" => diff > 0.0,
+                "below" | "pct_above" | "days_below" => diff < 0.0,
                 _ => false,
             };
             let mut entries: Vec<Entry> = Vec::new();
 
-            if (def.source == "holdings" || def.source == "both") && field_source == "holdings" {
+            if (def.source == "holdings" || def.source == "both") && (is_indicator || field_source == "holdings") {
                 for (symbol, txs) in &ctx.groups {
                     let pos = portfolio::calc_symbol_position(txs);
                     if pos.remaining_shares <= 0.0 {
                         continue;
                     }
                     let Some(price) = ctx.prices.get(symbol).and_then(|p| p.native) else { continue };
+                    // A volume list still needs the price above: the stop-loss
+                    // fallback below is priced, and the price stays on the
+                    // entry as context.
+                    let compare_value = if compare_volume {
+                        match ctx.prices.get(symbol).and_then(|p| p.volume).filter(|v| *v > 0) {
+                            Some(v) => v as f64,
+                            None => continue,
+                        }
+                    } else {
+                        price
+                    };
                     // The built-in stop_loss field falls back to the
                     // trailing-sell trigger, so holdings protected by a
                     // trailing stop appear in stop-loss lists too. Prices
                     // here are native, so closes need no conversion.
-                    let (fv, is_trailing) = if field_key == "stop_loss" && let Some(conn) = list_conn.as_ref() {
+                    let (fv, is_trailing) = if is_indicator {
+                        match cached_indicator(symbol, field_key).filter(|v| *v > 0.0) {
+                            Some(v) => (v, false),
+                            None => continue,
+                        }
+                    } else if field_key == "stop_loss" && let Some(conn) = list_conn.as_ref() {
                         match effective_stop_loss(conn, symbol, ctx.fields.get(symbol), Some(price), |p| p) {
                             Some((sl, trailing)) if sl > 0.0 => (sl, trailing),
                             _ => continue,
@@ -7425,43 +7930,87 @@ async fn get_portfolio_overview(
                         let Some(fv) = ctx.fields.get(symbol).and_then(|f| f.get(field_key)).and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) else { continue };
                         (fv, false)
                     };
-                    let diff = price - fv;
+                    let diff = compare_value - fv;
                     if matches_op(diff) {
+                        // A row that cannot be dated has nothing to rank on, so
+                        // it is dropped rather than shown with a blank column.
+                        let (days, volume_cross_pct) = match cross_dir {
+                            Some(dir) => {
+                                let constant = if is_indicator { None } else { Some(fv) };
+                                let volume = ctx.prices.get(symbol).and_then(|p| p.volume);
+                                match cross_stats(symbol, field_key, constant, dir, volume) {
+                                    Some(stats) => (Some(stats.days), stats.volume_pct),
+                                    None => continue,
+                                }
+                            }
+                            None => (None, None),
+                        };
                         entries.push(Entry {
                             symbol: symbol.clone(),
                             price,
+                            compare_value,
                             field_value: fv,
                             diff,
                             pct_diff: diff / fv * 100.0,
                             currency: ctx.info.get(symbol).and_then(|i| i.2.clone()),
                             is_trailing,
+                            origin: "holdings",
+                            days,
+                            volume_cross_pct,
                         });
                     }
                 }
             }
 
-            if (def.source == "watchlist" || def.source == "both") && field_source == "watchlist" {
+            if (def.source == "watchlist" || def.source == "both") && (is_indicator || field_source == "watchlist") {
                 for row in &watchlist_rows {
                     if entries.iter().any(|e| e.symbol == row.symbol) {
                         continue;
                     }
                     let Some(price) = watch_prices.get(&row.symbol).and_then(|p| p.price) else { continue };
-                    let fv = match field_key {
-                        "breakthrough_price" => row.breakthrough_price,
-                        "stop_loss_price" => row.stop_loss_price,
-                        _ => row.custom_fields.get(field_key).and_then(|v| v.parse::<f64>().ok()),
+                    let compare_value = if compare_volume {
+                        match watch_prices.get(&row.symbol).and_then(|p| p.volume).filter(|v| *v > 0) {
+                            Some(v) => v as f64,
+                            None => continue,
+                        }
+                    } else {
+                        price
+                    };
+                    let fv = if is_indicator {
+                        cached_indicator(&row.symbol, field_key)
+                    } else {
+                        match field_key {
+                            "breakthrough_price" => row.breakthrough_price,
+                            "stop_loss_price" => row.stop_loss_price,
+                            _ => row.custom_fields.get(field_key).and_then(|v| v.parse::<f64>().ok()),
+                        }
                     };
                     let Some(fv) = fv.filter(|v| *v > 0.0) else { continue };
-                    let diff = price - fv;
+                    let diff = compare_value - fv;
                     if matches_op(diff) {
+                        let (days, volume_cross_pct) = match cross_dir {
+                            Some(dir) => {
+                                let constant = if is_indicator { None } else { Some(fv) };
+                                let volume = watch_prices.get(&row.symbol).and_then(|p| p.volume);
+                                match cross_stats(&row.symbol, field_key, constant, dir, volume) {
+                                    Some(stats) => (Some(stats.days), stats.volume_pct),
+                                    None => continue,
+                                }
+                            }
+                            None => (None, None),
+                        };
                         entries.push(Entry {
                             symbol: row.symbol.clone(),
                             price,
+                            compare_value,
                             field_value: fv,
                             diff,
                             pct_diff: diff / fv * 100.0,
                             currency: None,
                             is_trailing: false,
+                            origin: "watchlist",
+                            days,
+                            volume_cross_pct,
                         });
                     }
                 }
@@ -7476,12 +8025,18 @@ async fn get_portfolio_overview(
                 .or(def.sort.as_deref());
             let pct_op = def.operator == "pct_above" || def.operator == "pct_below";
             entries.sort_by(|a, b| {
-                let cmp = if pct_op {
-                    a.pct_diff.abs().partial_cmp(&b.pct_diff.abs())
-                } else {
-                    a.pct_diff.partial_cmp(&b.pct_diff)
-                }
-                .unwrap_or(std::cmp::Ordering::Equal);
+                // A missing figure sorts last in the requested direction rather
+                // than drifting to the top of a reversed list.
+                let cmp = match metric {
+                    "days" => a.days.unwrap_or(i64::MAX).cmp(&b.days.unwrap_or(i64::MAX)),
+                    "volume_cross_pct" => a
+                        .volume_cross_pct
+                        .unwrap_or(f64::MAX)
+                        .partial_cmp(&b.volume_cross_pct.unwrap_or(f64::MAX))
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    _ if pct_op => a.pct_diff.abs().partial_cmp(&b.pct_diff.abs()).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => a.pct_diff.partial_cmp(&b.pct_diff).unwrap_or(std::cmp::Ordering::Equal),
+                };
                 if sort_dir == Some("desc") { cmp.reverse() } else { cmp }
             });
             let limit = def.limit.unwrap_or(15);
@@ -7489,6 +8044,9 @@ async fn get_portfolio_overview(
             entries.truncate(limit);
 
             let builtin_labels: HashMap<&str, &str> = HashMap::from([
+                ("sma50", "50-Day SMA"),
+                ("sma150", "150-Day SMA"),
+                ("ema40w", "40-Week EMA"),
                 ("breakthrough_price", "Breakthrough Price"),
                 ("stop_loss_price", "Stop Loss Price"),
                 ("stop_loss", "Stop Loss Price"),
@@ -7510,6 +8068,12 @@ async fn get_portfolio_overview(
                 // derived from the field_key prefix. Drives click navigation.
                 "field_source": field_source,
                 "operator": def.operator,
+                // Which side the diff is measured from, so the client can label
+                // and format that column as a price or a share count.
+                "compare": if compare_volume { "volume" } else { "price" },
+                // Which column the rows are ranked by: "pct_diff", "days" or
+                // "volume_cross_pct".
+                "metric": metric,
                 "field_label": field_label,
                 // The direction actually applied — the request override if one
                 // was given, else the list's config, else the "asc" default. The
@@ -7522,11 +8086,17 @@ async fn get_portfolio_overview(
                 "entries": entries.iter().map(|e| serde_json::json!({
                     "symbol": e.symbol,
                     "price": e.price,
+                    "compare_value": e.compare_value,
                     "field_value": e.field_value,
                     "diff": e.diff,
                     "pct_diff": e.pct_diff,
                     "currency": e.currency,
                     "is_trailing": e.is_trailing,
+                    // Per-entry so a "both"-sourced indicator list sends each
+                    // row to the screen its symbol actually lives on.
+                    "origin": e.origin,
+                    "days": e.days,
+                    "volume_cross_pct": e.volume_cross_pct,
                 })).collect::<Vec<_>>(),
             })
         })
@@ -7834,15 +8404,19 @@ async fn get_meta(db_path: web::Data<PathBuf>) -> impl Responder {
             return err_internal(err);
         }
     };
-    let sectors: serde_json::Value = config
-        .get("sectors")
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| serde_json::from_str(DEFAULT_SECTORS_JSON).unwrap());
+    let sectors: serde_json::Value = match config.get("sectors") {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let _ = insert_event_log(&db_path, "error", "config_parse", "api", Some("sectors"), &format!("Could not parse sectors, falling back to the built-in list: {err}"));
+                serde_json::from_str(DEFAULT_SECTORS_JSON).unwrap()
+            }
+        },
+        None => serde_json::from_str(DEFAULT_SECTORS_JSON).unwrap(),
+    };
     let parse_defs = |key: &str| -> serde_json::Value {
-        config
-            .get(key)
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_else(|| serde_json::json!([]))
+        let defs: Vec<serde_json::Value> = config_json(&db_path, &config, key);
+        serde_json::Value::Array(defs)
     };
     HttpResponse::Ok().json(serde_json::json!({
         "sectors": sectors,
@@ -7853,7 +8427,7 @@ async fn get_meta(db_path: web::Data<PathBuf>) -> impl Responder {
         "holdings_custom_fields": parse_defs("holdings_custom_fields"),
         "watchlist_custom_fields": parse_defs("watchlist_custom_fields"),
         "dashboard_custom_lists": parse_defs("dashboard_custom_lists"),
-        "reserved_holdings_keys": ["stop_loss", "trailing_sell_pct", "trailing_sell_date", "sector"],
+        "reserved_holdings_keys": ["stop_loss", "trailing_sell_pct", "trailing_sell_date", "sector", PL_BASIS_DATE, PL_BASIS_PRICE],
         "reserved_watchlist_keys": ["breakthrough_price", "stop_loss_price", "sector"],
     }))
 }
@@ -8746,11 +9320,16 @@ mod tests {
         add_tx("SOLD.AX", "purchase", "2026-01-05", 10.0, 5.0);
         add_tx("SOLD.AX", "sale", "2026-04-01", 10.0, 6.0);
 
-        for (sym, price) in [("MAN.AX", 12.0), ("TRL.AX", 28.0), ("PART.AX", 1.5), ("SOLD.AX", 7.0)] {
+        for (sym, price, volume) in [
+            ("MAN.AX", 12.0, 500_000_i64),
+            ("TRL.AX", 28.0, 120_000),
+            ("PART.AX", 1.5, 90_000),
+            ("SOLD.AX", 7.0, 10_000),
+        ] {
             conn.execute(
-                "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
-                 VALUES (?1, ?2, '2026-07-11T00:00:00Z', '2026-07-10')",
-                params![sym, price],
+                "INSERT INTO cached_current_prices (symbol, price, volume, last_updated, price_date)
+                 VALUES (?1, ?2, ?3, '2026-07-11T00:00:00Z', '2026-07-10')",
+                params![sym, price, volume],
             )
             .unwrap();
         }
@@ -8993,6 +9572,623 @@ mod tests {
 
         // PART.AX has no stop loss of either kind
         assert!(entries.as_array().unwrap().iter().all(|e| e["symbol"] != "PART.AX"));
+    }
+
+    /// A list may rank on the day's volume instead of the price. Everything
+    /// else — the operator, the ranking, the truncate — is unchanged, so the
+    /// only thing under test is which number reaches the comparison.
+    #[actix_web::test]
+    async fn overview_list_can_compare_volume_against_a_stored_field() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let conn = open_db(&db_path).unwrap();
+        for (sym, value) in [("MAN.AX", "100000"), ("TRL.AX", "200000")] {
+            conn.execute(
+                "INSERT INTO holdings_symbol_fields (symbol, field_key, value) VALUES (?1, 'min_volume', ?2)",
+                params![sym, value],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('dashboard_custom_lists', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![r#"[{"key":"vol","label":"Heavy Volume","source":"holdings","field_key":"holdings:min_volume","operator":"above","compare":"volume"}]"#],
+        )
+        .unwrap();
+
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = body["custom_lists"].as_array().unwrap().iter().find(|l| l["key"] == "vol").expect("volume list missing");
+        assert_eq!(list["compare"], "volume");
+
+        let entries = &list["entries"];
+        let man = find(entries, "MAN.AX");
+        assert!(close_to(&man["compare_value"], 500_000.0), "volume drives the comparison");
+        assert!(close_to(&man["price"], 12.0), "the price stays on the entry as context");
+        // (500000 − 100000) / 100000
+        assert!(close_to(&man["pct_diff"], 400.0));
+
+        // 120k volume is below its 200k threshold, so the operator excludes it
+        // even though its *price* is far above the same number would suggest.
+        assert!(entries.as_array().unwrap().iter().all(|e| e["symbol"] != "TRL.AX"));
+    }
+
+    /// An `indicator:` field is derived from stored closes rather than typed by
+    /// a user, so it exists for any symbol with enough history. The fixture's
+    /// flat 150-day series makes every SMA equal to the close it repeats.
+    #[actix_web::test]
+    async fn overview_indicator_list_ranks_holdings_against_the_50_day_sma() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('dashboard_custom_lists', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![r#"[{"key":"above_sma","label":"Above 50SMA","source":"holdings","field_key":"indicator:sma50","operator":"above"}]"#],
+        )
+        .unwrap();
+
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = body["custom_lists"].as_array().unwrap().iter().find(|l| l["key"] == "above_sma").expect("indicator list missing");
+        assert_eq!(list["field_label"], "50-Day SMA", "the key resolves to a readable heading");
+
+        let entries = &list["entries"];
+        let man = find(entries, "MAN.AX");
+        assert!(close_to(&man["field_value"], 10.0), "flat closes at 10.0");
+        assert!(close_to(&man["pct_diff"], 20.0), "price 12 against a 10.0 average");
+        assert_eq!(man["origin"], "holdings", "drives which screen the symbol links to");
+
+        // PART.AX trades at 1.50 against a 3.0 average, so `above` excludes it.
+        assert!(entries.as_array().unwrap().iter().all(|e| e["symbol"] != "PART.AX"));
+        // TRL.AX has two closes — no 50-day average exists, so it cannot qualify.
+        assert!(entries.as_array().unwrap().iter().all(|e| e["symbol"] != "TRL.AX"));
+    }
+
+    /// The three keys the Configuration screen offers, and the two ways a key
+    /// yields nothing: an unknown name, and history too short for the window.
+    #[test]
+    fn indicator_value_resolves_the_three_offered_keys() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for i in 0..150 {
+            let date = (start + chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TST.AX', ?1, 10.0, 'x')",
+                params![date],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(indicator_value(&conn, "TST.AX", "sma50"), Some(10.0));
+        assert_eq!(indicator_value(&conn, "TST.AX", "sma150"), Some(10.0));
+        // 150 calendar days is about 21 weeks — a 40-week average has no value
+        // to report yet, and must say so rather than average what it has.
+        assert_eq!(indicator_value(&conn, "TST.AX", "ema40w"), None);
+        assert_eq!(indicator_value(&conn, "TST.AX", "sma999"), None, "an unknown key is not a period to guess at");
+    }
+
+    /// Seed one holding whose closes sit on `before` for 50 bars and `after`
+    /// for 5, so a crossing of a 10.0 threshold lands exactly 5 bars back. The
+    /// crossing bar carries triple volume, making its surge checkable.
+    fn seed_crossing_fixture(before: f64, after: f64) -> (NamedTempFile, PathBuf) {
+        let (file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+             VALUES (1, 'TST.AX', 'purchase', '2025-12-01', 100.0, 9.0, 0.0, '2025-12-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for i in 0..55 {
+            let date = (start + chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
+            let (close, volume) = if i < 50 {
+                (before, 100_i64)
+            } else if i == 50 {
+                (after, 300)
+            } else {
+                (after, 100)
+            };
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, volume, fetched_at) VALUES ('TST.AX', ?1, ?2, ?3, 'x')",
+                params![date, close, volume],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO cached_current_prices (symbol, price, volume, last_updated, price_date)
+             VALUES ('TST.AX', ?1, 100, '2026-03-01T00:00:00Z', '2026-02-24')",
+            params![after],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO holdings_symbol_fields (symbol, field_key, value) VALUES ('TST.AX', 'target', '10.0')",
+            [],
+        )
+        .unwrap();
+        (file, db_path)
+    }
+
+    fn set_single_list(db_path: &PathBuf, json: &str) {
+        let conn = open_db(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO app_config (key, value) VALUES ('dashboard_custom_lists', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![json],
+        )
+        .unwrap();
+    }
+
+    /// "Days above" dates the crossing rather than measuring the gap, and
+    /// reports the volume behind it — the pair that makes a breakout readable.
+    #[actix_web::test]
+    async fn overview_days_above_list_counts_from_the_crossing() {
+        let (_file, db_path) = seed_crossing_fixture(8.0, 12.0);
+        set_single_list(&db_path, r#"[{"key":"broke_out","label":"Broke Out","source":"holdings","field_key":"holdings:target","operator":"days_above"}]"#);
+
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = body["custom_lists"].as_array().unwrap().iter().find(|l| l["key"] == "broke_out").unwrap();
+        assert_eq!(list["metric"], "days", "the ranked column, so the client knows which header sorts");
+
+        let tst = find(&list["entries"], "TST.AX");
+        assert_eq!(tst["days"], 5, "50 bars below then 5 above");
+        // The crossing bar traded 300 against a 100 average over the prior 20.
+        assert!(close_to(&tst["volume_cross_pct"], 200.0));
+    }
+
+    /// The mirror case: the same shape upside down must date the breakdown,
+    /// not silently reuse the breakout walk.
+    #[actix_web::test]
+    async fn overview_days_below_list_dates_the_breakdown() {
+        let (_file, db_path) = seed_crossing_fixture(12.0, 8.0);
+        set_single_list(&db_path, r#"[{"key":"broke_down","label":"Broke Down","source":"holdings","field_key":"holdings:target","operator":"days_below"}]"#);
+
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = body["custom_lists"].as_array().unwrap().iter().find(|l| l["key"] == "broke_down").unwrap();
+        let tst = find(&list["entries"], "TST.AX");
+        assert_eq!(tst["days"], 5);
+        assert!(close_to(&tst["volume_cross_pct"], 200.0));
+
+        // A "days above" list over the same data must find nothing: the price
+        // is below its target, so the operator excludes it before any counting.
+        set_single_list(&db_path, r#"[{"key":"broke_out","label":"Broke Out","source":"holdings","field_key":"holdings:target","operator":"days_above"}]"#);
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = body["custom_lists"].as_array().unwrap().iter().find(|l| l["key"] == "broke_out").unwrap();
+        assert!(list["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Ranking by the volume behind the crossing is a different order from
+    /// ranking by its date, so the metric has to reach the sort.
+    #[actix_web::test]
+    async fn overview_volume_cross_list_reports_its_metric() {
+        let (_file, db_path) = seed_crossing_fixture(8.0, 12.0);
+        set_single_list(&db_path, r#"[{"key":"conviction","label":"Conviction","source":"holdings","field_key":"holdings:target","operator":"volume_cross_pct","sort":"desc"}]"#);
+
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = body["custom_lists"].as_array().unwrap().iter().find(|l| l["key"] == "conviction").unwrap();
+        assert_eq!(list["metric"], "volume_cross_pct");
+        assert_eq!(list["sort"], "desc");
+        let tst = find(&list["entries"], "TST.AX");
+        assert!(close_to(&tst["volume_cross_pct"], 200.0));
+        assert_eq!(tst["days"], 5, "the date is still reported alongside it");
+    }
+
+    /// Every shape the Configuration screen can produce must survive the
+    /// guard — a validator that rejects valid input is worse than none.
+    #[test]
+    fn config_validation_accepts_everything_the_editor_can_build() {
+        let valid = r#"[
+            {"key":"a","label":"Above","source":"holdings","field_key":"holdings:stop_loss","operator":"above","limit":15,"sort":"asc"},
+            {"key":"b","label":"Volume","source":"watchlist","field_key":"watchlist:breakthrough_price","operator":"pct_below","compare":"volume"},
+            {"key":"c","label":"SMA","source":"both","field_key":"indicator:sma50","operator":"days_above"},
+            {"key":"d","label":"SMA150","source":"holdings","field_key":"indicator:sma150","operator":"days_below"},
+            {"key":"e","label":"EMA","source":"holdings","field_key":"indicator:ema40w","operator":"volume_cross_pct","sort":"desc"},
+            {"key":"f","label":"Nulls","source":"holdings","field_key":"holdings:x","operator":"below","compare":null,"sort":null,"limit":null}
+        ]"#;
+        assert_eq!(validate_dashboard_custom_lists(valid), Ok(()));
+        assert_eq!(validate_dashboard_custom_lists("[]"), Ok(()), "no lists is a legitimate configuration");
+    }
+
+    /// Each rejection names the offending list and value: the message is the
+    /// whole point, since the alternative was an empty dashboard and silence.
+    #[test]
+    fn config_validation_rejects_and_explains() {
+        let base = |extra: &str| format!(r#"[{{"key":"a","label":"A","source":"holdings","field_key":"holdings:x","operator":"above"{extra}}}]"#);
+        let cases: Vec<(String, &str)> = vec![
+            ("{not json".to_string(), "not valid JSON"),
+            (r#"{"key":"a"}"#.to_string(), "must be a JSON array"),
+            ("[3]".to_string(), "must be an object"),
+            (r#"[{"label":"A","source":"holdings","field_key":"holdings:x","operator":"above"}]"#.to_string(), "key is required"),
+            (r#"[{"key":"a","source":"holdings","field_key":"holdings:x","operator":"above"}]"#.to_string(), "label is required"),
+            (r#"[{"key":"a","label":"A","source":"nowhere","field_key":"holdings:x","operator":"above"}]"#.to_string(), "source 'nowhere' is not one of"),
+            (r#"[{"key":"a","label":"A","source":"holdings","field_key":"holdings:x","operator":"sideways"}]"#.to_string(), "operator 'sideways' is not one of"),
+            (r#"[{"key":"a","label":"A","source":"holdings","field_key":"stop_loss","operator":"above"}]"#.to_string(), "field_key must look like"),
+            (r#"[{"key":"a","label":"A","source":"holdings","field_key":"sectors:x","operator":"above"}]"#.to_string(), "prefix 'sectors' is not"),
+            (r#"[{"key":"a","label":"A","source":"holdings","field_key":"indicator:sma200","operator":"above"}]"#.to_string(), "indicator 'sma200' is not one of"),
+            (base(r#","compare":"turnover""#), "compare 'turnover' is not one of"),
+            (base(r#","sort":"up""#), "sort 'up' is not one of"),
+            (base(r#","limit":0"#), "limit 0 is outside 1-100"),
+            (base(r#","limit":500"#), "limit 500 is outside 1-100"),
+            (base(r#","limit":"lots""#), "limit must be a whole number"),
+        ];
+        for (json, expected) in cases {
+            let err = validate_dashboard_custom_lists(&json)
+                .expect_err(&format!("should have been rejected: {json}"));
+            assert!(err.contains(expected), "expected {expected:?} in {err:?}");
+        }
+
+        // A duplicate key silently shadows a list in the client, so it is caught here.
+        let dup = r#"[{"key":"a","label":"A","source":"holdings","field_key":"holdings:x","operator":"above"},
+                      {"key":"a","label":"B","source":"holdings","field_key":"holdings:y","operator":"below"}]"#;
+        assert!(validate_dashboard_custom_lists(dup).unwrap_err().contains("duplicate key 'a'"));
+    }
+
+    #[test]
+    fn config_validation_leaves_unrelated_keys_alone() {
+        // Most config values are plain scalars and must not be parsed as JSON.
+        assert_eq!(validate_config_value("manual_price_TST.AX", "12.50"), Ok(()));
+        assert_eq!(validate_config_value("sectors", "not json at all"), Ok(()));
+        // Field definitions share the failure mode, so they share the guard.
+        assert!(validate_config_value("holdings_custom_fields", "{}").is_err());
+        assert_eq!(validate_config_value("holdings_custom_fields", r#"[{"key":"k","label":"L"}]"#), Ok(()));
+        assert!(validate_config_value("watchlist_custom_fields", r#"[{"key":"k"}]"#).unwrap_err().contains("label is required"));
+    }
+
+    /// The endpoint must refuse the write, not accept it and fail later.
+    #[actix_web::test]
+    async fn update_config_rejects_a_malformed_dashboard_list() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let before: String = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT value FROM app_config WHERE key = 'dashboard_custom_lists'", [], |r| r.get(0))
+            .unwrap();
+
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(update_config),
+        )
+        .await;
+        let body = serde_json::json!({
+            "key": "dashboard_custom_lists",
+            "value": r#"[{"key":"a","label":"A","source":"holdings","field_key":"indicator:sma42","operator":"above"}]"#,
+        });
+        let req = actix_web::test::TestRequest::put().uri("/api/config").set_json(&body).to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert!(json["error"]["message"].as_str().unwrap().contains("sma42"), "the message names the bad value: {json}");
+
+        let after: String = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT value FROM app_config WHERE key = 'dashboard_custom_lists'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "a rejected write must not touch the stored config");
+    }
+
+    /// A value written before the guard existed still has to be survivable —
+    /// but it must leave a trail rather than an unexplained empty dashboard.
+    #[actix_web::test]
+    async fn a_malformed_stored_config_is_logged_not_swallowed() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        open_db(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE app_config SET value = '[{\"key\": truncated' WHERE key = 'dashboard_custom_lists'",
+                [],
+            )
+            .unwrap();
+
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        assert!(body["custom_lists"].as_array().unwrap().is_empty(), "the rest of the dashboard still renders");
+
+        let logged: i64 = open_db(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE level = 'error' AND event_type = 'config_parse' AND symbol = 'dashboard_custom_lists'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, 1, "the parse failure is recorded against the key that caused it");
+    }
+
+    /// One long-held position: bought cheaply in 2024, worth far more now, with
+    /// dividends either side of a 2025 baseline.
+    fn seed_legacy_holding() -> (NamedTempFile, PathBuf) {
+        let (file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+             VALUES (1, 'TST.AX', 'purchase', '2024-01-10', 100.0, 5.0, 0.0, '2024-01-10T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        for (id, date, amount) in [(2, "2024-06-01", 50.0), (3, "2025-06-01", 30.0)] {
+            conn.execute(
+                "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, amount, created_at)
+                 VALUES (?1, 'TST.AX', 'dividend', ?2, 100.0, ?3, '2024-01-01T00:00:00Z')",
+                params![id, date, amount],
+            )
+            .unwrap();
+        }
+        // 1 January is never a trading day, so the baseline has to resolve
+        // forward to the 2nd.
+        for (date, close) in [("2025-01-02", 20.0), ("2026-06-01", 25.0)] {
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TST.AX', ?1, ?2, 'x')",
+                params![date, close],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
+             VALUES ('TST.AX', 25.0, '2026-06-02T00:00:00Z', '2026-06-01')",
+            [],
+        )
+        .unwrap();
+        (file, db_path)
+    }
+
+    async fn put_basis_date(db_path: &PathBuf, date: &str) -> actix_web::http::StatusCode {
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(update_holdings_symbol_fields),
+        )
+        .await;
+        let body = serde_json::json!({ "custom_fields": { PL_BASIS_DATE: date } });
+        let req = actix_web::test::TestRequest::put()
+            .uri("/api/holdings/symbol-fields/TST.AX")
+            .set_json(&body)
+            .to_request();
+        actix_web::test::call_service(&app, req).await.status()
+    }
+
+    fn stored_field(db_path: &PathBuf, key: &str) -> Option<String> {
+        open_db(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM holdings_symbol_fields WHERE symbol = 'TST.AX' AND field_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// The baseline price is resolved once on save. Deriving it on every read
+    /// would let the figure move whenever stored history is trimmed, and a
+    /// basis that moves is not a record of anything.
+    #[actix_web::test]
+    async fn saving_a_basis_date_resolves_and_stores_its_price() {
+        let (_file, db_path) = seed_legacy_holding();
+        assert!(put_basis_date(&db_path, "2025-01-01").await.is_success());
+        assert_eq!(stored_field(&db_path, PL_BASIS_DATE).as_deref(), Some("2025-01-01"));
+        assert_eq!(
+            stored_field(&db_path, PL_BASIS_PRICE),
+            Some("20".to_string()),
+            "1 January is not a trading day; the close resolves forward to the 2nd"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_basis_date_with_no_stored_price_is_refused() {
+        let (_file, db_path) = seed_legacy_holding();
+        let status = put_basis_date(&db_path, "2030-01-01").await;
+        assert_eq!(status, actix_web::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(stored_field(&db_path, PL_BASIS_PRICE), None, "nothing is stored for a date we cannot price");
+    }
+
+    #[actix_web::test]
+    async fn clearing_the_basis_date_clears_its_price() {
+        let (_file, db_path) = seed_legacy_holding();
+        assert!(put_basis_date(&db_path, "2025-01-01").await.is_success());
+        assert!(put_basis_date(&db_path, "").await.is_success());
+        assert_eq!(stored_field(&db_path, PL_BASIS_DATE), None);
+        assert_eq!(stored_field(&db_path, PL_BASIS_PRICE), None, "a stale price outliving its date would be misread");
+    }
+
+    /// A baseline *replaces* the purchase as the cost basis. The point is not
+    /// to show two numbers — it is that for a holding bought long ago the
+    /// original price is a record, not a useful denominator.
+    #[actix_web::test]
+    async fn a_baseline_replaces_the_purchase_as_the_cost_basis() {
+        let (_file, db_path) = seed_legacy_holding();
+        assert!(put_basis_date(&db_path, "2025-01-01").await.is_success());
+
+        let body = get_json(&db_path, "/api/portfolio/holdings").await;
+        let tst = find(&body["holdings"], "TST.AX");
+
+        // Bought at 5.00, but the baseline close was 20.00, so that is the cost.
+        assert!(close_to(&tst["invested"], 2000.0), "100 shares at the 20.00 baseline, not the 5.00 purchase");
+        assert!(close_to(&tst["avg_cost"], 20.0));
+        assert!(close_to(&tst["native_avg_cost"], 20.0));
+        // Only income earned since the baseline counts toward the return.
+        assert!(close_to(&tst["dividends"], 30.0), "the 2024 payment belongs to the period we stopped caring about");
+        // 100 × 25 − 2000 + 30
+        assert!(close_to(&tst["pl"], 530.0));
+        assert!(close_to(&tst["pl_pct"], 26.5));
+
+        // Reported so the client can say which period the figures cover.
+        assert_eq!(tst["basis_date"], "2025-01-01");
+        assert!(close_to(&tst["basis_price"], 20.0));
+
+        // The lifetime figures are gone from the payload — one holding, one
+        // set of numbers. The purchase itself is untouched in the ledger.
+        assert!(tst.get("pl_since").is_none());
+        let txs = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT price FROM holdings_transactions WHERE id = 1", [], |r| r.get::<_, f64>(0))
+            .unwrap();
+        assert!((txs - 5.0).abs() < 1e-9, "the purchase price stays on record");
+    }
+
+    /// The Dashboard total must be the sum of what the Holdings screen shows.
+    /// Two code paths computing the same position separately is exactly how
+    /// they come to disagree, so both go through one basis helper.
+    #[actix_web::test]
+    async fn the_overview_total_follows_the_same_baseline() {
+        let (_file, db_path) = seed_legacy_holding();
+
+        let before = get_json(&db_path, "/api/portfolio/overview").await;
+        assert!(close_to(&before["totals"]["holdings_pl"], 2080.0), "lifetime while no baseline is set");
+
+        assert!(put_basis_date(&db_path, "2025-01-01").await.is_success());
+        let after = get_json(&db_path, "/api/portfolio/overview").await;
+        assert!(
+            close_to(&after["totals"]["holdings_pl"], 530.0),
+            "the total re-bases with the holding, not after it"
+        );
+
+        // And it equals what the Holdings screen reports for that position.
+        let holdings = get_json(&db_path, "/api/portfolio/holdings").await;
+        assert!(close_to(&find(&holdings["holdings"], "TST.AX")["pl"], 530.0));
+    }
+
+    /// Without a baseline nothing changes: the purchase is still the basis,
+    /// and every dividend still counts.
+    #[actix_web::test]
+    async fn a_holding_with_no_basis_measures_from_its_purchase() {
+        let (_file, db_path) = seed_legacy_holding();
+        let body = get_json(&db_path, "/api/portfolio/holdings").await;
+        let tst = find(&body["holdings"], "TST.AX");
+        assert!(tst["basis_date"].is_null());
+        assert!(close_to(&tst["invested"], 500.0));
+        assert!(close_to(&tst["avg_cost"], 5.0));
+        assert!(close_to(&tst["dividends"], 80.0), "both payments count");
+        // 100 × 25 − 500 + 80
+        assert!(close_to(&tst["pl"], 2080.0));
+    }
+
+    async fn history_json(db_path: &std::path::Path, uri: &str) -> serde_json::Value {
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.to_path_buf())).service(get_portfolio_history),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get().uri(uri).to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert!(resp.status().is_success(), "{} returned {}", uri, resp.status());
+        actix_web::test::read_body_json(resp).await
+    }
+
+    fn set_history_floor(db_path: &PathBuf, value: &str) {
+        open_db(db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO app_config (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![PORTFOLIO_HISTORY_START, value],
+            )
+            .unwrap();
+    }
+
+    /// Without a floor the series still reaches back to the first transaction —
+    /// the setting is opt-in, and an empty value must change nothing.
+    #[actix_web::test]
+    async fn history_without_a_floor_starts_at_the_first_transaction() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        for value in ["", "   "] {
+            set_history_floor(&db_path, value);
+            let body = history_json(&db_path, "/api/portfolio/history").await;
+            assert_eq!(body["summary"]["start_date"], "2026-01-05", "earliest holding transaction");
+            assert!(body["start_floor"].is_null());
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_floor_truncates_the_unbounded_range() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        set_history_floor(&db_path, "2026-03-01");
+
+        let body = history_json(&db_path, "/api/portfolio/history").await;
+        assert_eq!(body["summary"]["start_date"], "2026-03-01");
+        assert_eq!(body["start_floor"], "2026-03-01", "published so the client can drop swallowed ranges");
+    }
+
+    /// The floor is not only about "All". A five-year button reaches just as far
+    /// back into the unpriced years as an unbounded request does.
+    #[actix_web::test]
+    async fn a_floor_raises_an_earlier_requested_range() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        set_history_floor(&db_path, "2026-03-01");
+        let body = history_json(&db_path, "/api/portfolio/history?from=2020-01-01").await;
+        assert_eq!(body["summary"]["start_date"], "2026-03-01", "the request is raised to the floor");
+    }
+
+    /// A window that already starts after the floor is left alone — clamping
+    /// must not widen a range the user deliberately narrowed.
+    #[actix_web::test]
+    async fn a_floor_leaves_a_later_range_untouched() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        set_history_floor(&db_path, "2026-01-01");
+        let body = history_json(&db_path, "/api/portfolio/history?from=2026-05-01").await;
+        assert_eq!(body["summary"]["start_date"], "2026-05-01");
+    }
+
+    /// Re-basing the opening value is the point, not a side effect: a return
+    /// measured across years the holdings could not be priced is meaningless.
+    #[actix_web::test]
+    async fn a_floor_rebases_the_opening_value_and_return() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let wide = history_json(&db_path, "/api/portfolio/history").await;
+        set_history_floor(&db_path, "2026-03-01");
+        let narrow = history_json(&db_path, "/api/portfolio/history").await;
+
+        assert_ne!(
+            wide["summary"]["opening_value"], narrow["summary"]["opening_value"],
+            "the anchor moves with the window"
+        );
+        assert_ne!(wide["summary"]["twr_pct"], narrow["summary"]["twr_pct"]);
+    }
+
+    #[test]
+    fn history_floor_must_be_a_date_or_empty() {
+        assert_eq!(validate_config_value(PORTFOLIO_HISTORY_START, "2025-01-01"), Ok(()));
+        assert_eq!(validate_config_value(PORTFOLIO_HISTORY_START, ""), Ok(()), "clearing the floor is allowed");
+        // Stored and compared as text, so a non-ISO date would order wrongly
+        // rather than fail — it has to be refused on the way in.
+        assert!(validate_config_value(PORTFOLIO_HISTORY_START, "01/01/2025").is_err());
+        assert!(validate_config_value(PORTFOLIO_HISTORY_START, "last year").is_err());
+    }
+
+    /// A weekly indicator crossed in days must use the last *completed* week.
+    /// Feeding a bar the average that already contains its own close would let
+    /// the day count shift retroactively as the week finished.
+    #[test]
+    fn weekly_ema_series_uses_the_last_completed_week() {
+        let bar = |date: &str, close: f64| PriceHistoryPoint {
+            date: date.to_string(),
+            open: None,
+            high: None,
+            low: None,
+            close: Some(close),
+            volume: None,
+        };
+        let history = vec![
+            bar("2026-01-05", 100.0), // week 1 (Mon)
+            bar("2026-01-09", 105.0), // week 1 close
+            bar("2026-01-12", 200.0), // week 2
+            bar("2026-01-16", 205.0), // week 2 close
+            bar("2026-01-19", 300.0), // week 3
+        ];
+        let series = weekly_ema_series(&history, 2).expect("three weeks is enough for period 2");
+        assert_eq!(series.len(), history.len(), "one value per daily bar");
+        // Weeks 1 and 2 have no completed 2-week average behind them yet.
+        assert_eq!(series[0], None);
+        assert_eq!(series[1], None);
+        assert_eq!(series[2], None);
+        assert_eq!(series[3], None);
+        // Week 3's bar sees week 2's seed — the mean of 105 and 205 — and not
+        // the value that includes its own 300.
+        assert_eq!(series[4], Some(155.0));
+
+        // Two weeks cannot support a 40-week average.
+        assert_eq!(weekly_ema_series(&history, 40), None);
+    }
+
+    /// The default is unchanged: a list with no `compare` still ranks on price.
+    #[actix_web::test]
+    async fn overview_list_defaults_to_comparing_price() {
+        let (_file, db_path) = seed_portfolio_fixture();
+        let body = get_json(&db_path, "/api/portfolio/overview").await;
+        let list = stop_loss_list(&body);
+        assert_eq!(list["compare"], "price");
+        let man = find(&list["entries"], "MAN.AX");
+        assert!(close_to(&man["compare_value"], 12.0));
     }
 
     #[actix_web::test]
@@ -10388,13 +11584,11 @@ mod tests {
             }
         }
         let conn = open_db(&db_path).unwrap();
+        // Exactly the mean of the two week-closing values. A daily EMA(2) over
+        // the same five bars would land near 192, so this figure alone rules
+        // out the collapse silently going away.
         let ema = stored_weekly_ema(&conn, "TST.AX", 2).expect("two weeks is enough for period 2");
         assert!((ema - 155.0).abs() < 1e-9, "expected the mean of 105 and 205, got {ema}");
-
-        // A daily EMA over the same rows sees five bars, not two, and lands
-        // somewhere else entirely — the two must not be confused.
-        let daily = stored_ema(&conn, "TST.AX", 2).unwrap();
-        assert!((daily - ema).abs() > 1.0, "daily and weekly should differ, got {daily} vs {ema}");
     }
 
     /// A week with only one trading day is still a week.
@@ -10419,29 +11613,6 @@ mod tests {
         assert!((stored_weekly_ema(&conn, "TST.AX", 2).unwrap() - 20.0).abs() < 1e-9);
         // Only two weeks exist, so a 40-week average has nothing to report.
         assert_eq!(stored_weekly_ema(&conn, "TST.AX", 40), None);
-    }
-
-    #[test]
-    fn stored_ema_seeds_from_the_first_window_then_weights_forward() {
-        let (_file, db_path) = setup_test_db();
-        let conn = open_db(&db_path).unwrap();
-        // Closes 1..5 on consecutive days
-        for (i, close) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
-            conn.execute(
-                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('TST.AX', ?1, ?2, 'x')",
-                params![format!("2026-01-0{}", i + 1), close],
-            )
-            .unwrap();
-        }
-
-        // period 3: seed = (1+2+3)/3 = 2, k = 0.5
-        // then 4 × 0.5 + 2 × 0.5 = 3, then 5 × 0.5 + 3 × 0.5 = 4
-        let ema = stored_ema(&conn, "TST.AX", 3).unwrap();
-        assert!((ema - 4.0).abs() < 1e-9, "expected 4.0, got {ema}");
-
-        // Shorter history than the period yields nothing rather than a partial average
-        assert_eq!(stored_ema(&conn, "TST.AX", 50), None);
-        assert_eq!(stored_ema(&conn, "MISSING.AX", 3), None);
     }
 
     /// Bars the OHLC backfill could not reach have a NULL high; those must fall

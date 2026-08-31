@@ -69,7 +69,7 @@ export default function PortfolioHistoryChart({ series }: { series: PortfolioHis
     const labelCount = Math.min(6, series.length)
     const xLabels = Array.from({ length: labelCount }, (_, i) => {
       const index = Math.round((i / Math.max(labelCount - 1, 1)) * (series.length - 1))
-      const anchor = i === 0 ? 'start' : i === labelCount - 1 ? 'end' : 'middle'
+      const anchor: 'start' | 'end' | 'middle' = i === 0 ? 'start' : i === labelCount - 1 ? 'end' : 'middle'
       return { x: xAt(index), label: formatDate(series[index].date), anchor }
     })
 

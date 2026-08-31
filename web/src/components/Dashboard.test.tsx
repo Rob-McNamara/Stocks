@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor, within, cleanup, fireEvent } from '@testing-library/react'
 import Dashboard from './Dashboard'
-import type { PortfolioOverview } from '../services/api'
+import type { CustomListEntry, PortfolioOverview } from '../services/api'
 
 // The Dashboard is a pure renderer over GET /api/portfolio/overview — mock
 // the client and feed it a canned payload.
@@ -39,6 +39,31 @@ function historyFixture() {
 
 const emptyAgg = { count: 0, value: 0, dividends: 0, pl: 0, cost: 0 }
 
+/**
+ * A custom-list row. `compare_value` defaults to the price, which is what the
+ * server sends for every list that is not comparing volume — keeping the
+ * fixtures to the fields each test actually cares about.
+ */
+function entry(
+  symbol: string,
+  price: number,
+  field_value: number,
+  extra: Partial<CustomListEntry> = {},
+): CustomListEntry {
+  const diff = price - field_value
+  return {
+    symbol,
+    price,
+    compare_value: price,
+    field_value,
+    diff,
+    pct_diff: (diff / field_value) * 100,
+    currency: null,
+    is_trailing: false,
+    ...extra,
+  }
+}
+
 function overviewFixture(): PortfolioOverview {
   return {
     totals: { stock_count: 2, total_value: 2690, total_pl: 680, holdings_pl: 630, sold_pl: 50 },
@@ -66,11 +91,12 @@ function overviewFixture(): PortfolioOverview {
         field_label: 'Stop Loss Price',
         // The server always reports the direction it ranked by, and whether the
         // limit cut anything — the header renders its arrow from these.
+        compare: 'price',
         sort: 'asc',
         truncated: false,
         entries: [
-          { symbol: 'MAN.AX', price: 12.0, field_value: 9.0, diff: 3.0, pct_diff: 33.33, currency: null, is_trailing: false },
-          { symbol: 'TRL.AX', price: 28.0, field_value: 27.0, diff: 1.0, pct_diff: 3.7, currency: null, is_trailing: true },
+          entry('MAN.AX', 12.0, 9.0),
+          entry('TRL.AX', 28.0, 27.0, { is_trailing: true }),
         ],
       },
     ],
@@ -100,6 +126,42 @@ describe('Dashboard custom lists', () => {
     expect(rows[0].textContent).toContain('$12.00')
     expect(rows[0].textContent).toContain('$9.00')
     expect(rows[0].textContent).toContain('+33.33%')
+  })
+
+  // A volume list ranks the same way but on a share count, so the column has to
+  // change its heading and stop formatting the number as money.
+  it('labels and formats the compared column as volume when the list says so', async () => {
+    const fixture = overviewFixture()
+    const list = fixture.custom_lists[0]
+    list.label = 'Heavy Volume'
+    list.compare = 'volume'
+    list.operator = 'above'
+    list.field_label = 'Min Volume'
+    list.entries = [entry('MAN.AX', 12.0, 100000, { compare_value: 500000, diff: 400000, pct_diff: 400 })]
+    getPortfolioOverview.mockResolvedValue(fixture)
+    await renderDashboard()
+
+    const table = screen.getByText('Heavy Volume').closest('.manager-card')! as HTMLElement
+    expect(within(table).getByText('Volume')).toBeTruthy()
+    expect(within(table).queryByText('Price')).toBeNull()
+
+    const row = within(table).getAllByRole('row')[1]
+    expect(row.textContent).toContain('500,000')
+    // The price is still in the payload but must not reach the column
+    expect(row.textContent).not.toContain('$12.00')
+    expect(table.textContent).toContain('volume is above Min Volume')
+  })
+
+  // Deploying the client ahead of the API is a normal state, and the field is
+  // new — a row without it must render the price, not blank the dashboard.
+  it('falls back to the price when the API sends no compare_value', async () => {
+    const fixture = overviewFixture()
+    fixture.custom_lists[0].entries = [entry('MAN.AX', 12.0, 9.0, { compare_value: undefined })]
+    getPortfolioOverview.mockResolvedValue(fixture)
+    await renderDashboard()
+
+    const table = screen.getByText('Stop Losses').closest('.manager-card')! as HTMLElement
+    expect(within(table).getAllByRole('row')[1].textContent).toContain('$12.00')
   })
 
   it('marks trailing-sell triggers with the T badge and leaves manual stops unmarked', async () => {
@@ -148,10 +210,7 @@ describe('Stop Losses Difference sorting', () => {
     // The server returns a different row set for desc — one the asc cut excluded
     const desc = overviewFixture()
     desc.custom_lists[0].sort = 'desc'
-    desc.custom_lists[0].entries = [
-      { symbol: 'CUT.AX', price: 20.0, field_value: 10.0, diff: 10.0, pct_diff: 100, currency: null, is_trailing: false },
-      { symbol: 'MAN.AX', price: 12.0, field_value: 9.0, diff: 3.0, pct_diff: 33.33, currency: null, is_trailing: false },
-    ]
+    desc.custom_lists[0].entries = [entry('CUT.AX', 20.0, 10.0), entry('MAN.AX', 12.0, 9.0)]
     getPortfolioOverview.mockResolvedValue(desc)
 
     fireEvent.click(diffHeader())
@@ -195,15 +254,148 @@ describe('Stop Losses Difference sorting', () => {
       ...fixture.custom_lists[0],
       key: 'breakthroughs',
       label: 'Breakthrough Price',
-      entries: [
-        { symbol: 'AAA.AX', price: 5.0, field_value: 4.0, diff: 1.0, pct_diff: 25, currency: null, is_trailing: false },
-      ],
+      entries: [entry('AAA.AX', 5.0, 4.0)],
     })
     getPortfolioOverview.mockResolvedValue(fixture)
     await renderDashboard()
 
     fireEvent.click(diffHeader())
     await waitFor(() => expect(getPortfolioOverview).toHaveBeenLastCalledWith({ stop_losses: 'desc' }))
+  })
+})
+
+// A crossover list is about when the price crossed and how much volume was
+// behind it, so it trades the Difference column for that pair.
+describe('crossover list columns', () => {
+  function crossFixture(operator: string, metric: string) {
+    const fixture = overviewFixture()
+    const list = fixture.custom_lists[0]
+    list.label = 'Broke Out'
+    list.operator = operator
+    list.metric = metric
+    list.field_label = '50-Day SMA'
+    list.entries = [entry('MAN.AX', 12.0, 10.0, { days: 5, volume_cross_pct: 200 })]
+    return fixture
+  }
+
+  const card = () => screen.getByText('Broke Out').closest('.manager-card')! as HTMLElement
+
+  it('replaces Difference with the day count and the volume behind it', async () => {
+    getPortfolioOverview.mockResolvedValue(crossFixture('days_above', 'days'))
+    await renderDashboard()
+
+    expect(within(card()).getByText(/^Days Above/)).toBeTruthy()
+    expect(within(card()).getByText('Vol on Cross')).toBeTruthy()
+    expect(within(card()).queryByText(/^Difference/)).toBeNull()
+
+    const row = within(card()).getAllByRole('row')[1]
+    expect(row.textContent).toContain('5d')
+    expect(row.textContent).toContain('+200%')
+    expect(row.textContent).not.toContain('20.00%')
+  })
+
+  it('names the column for the direction being counted', async () => {
+    getPortfolioOverview.mockResolvedValue(crossFixture('days_below', 'days'))
+    await renderDashboard()
+    expect(within(card()).getByText(/^Days Below/)).toBeTruthy()
+  })
+
+  // Reversing re-ranks on the server by the list's metric alone, so only that
+  // column may carry the sort affordance.
+  it('makes only the ranked column sortable', async () => {
+    getPortfolioOverview.mockResolvedValue(crossFixture('volume_cross_pct', 'volume_cross_pct'))
+    await renderDashboard()
+
+    const volHeader = within(card()).getByText(/^Vol on Cross/)
+    expect(volHeader.className).toContain('sortable-header')
+    expect(volHeader.textContent).toContain('↑')
+    expect(within(card()).getByText('Days Above').className).not.toContain('sortable-header')
+
+    fireEvent.click(volHeader)
+    await waitFor(() => expect(getPortfolioOverview).toHaveBeenLastCalledWith({ stop_losses: 'desc' }))
+  })
+
+  it('renders a dash when a row has no crossing figures', async () => {
+    const fixture = crossFixture('days_above', 'days')
+    fixture.custom_lists[0].entries = [entry('MAN.AX', 12.0, 10.0, { days: null, volume_cross_pct: null })]
+    getPortfolioOverview.mockResolvedValue(fixture)
+    await renderDashboard()
+
+    const row = within(card()).getAllByRole('row')[1]
+    expect(row.textContent).toContain('—')
+  })
+
+  // An API predating the metric sends none, and its lists are all percentage
+  // gaps — the Difference column must survive that.
+  it('keeps the Difference column when the API sends no metric', async () => {
+    const fixture = overviewFixture()
+    delete fixture.custom_lists[0].metric
+    getPortfolioOverview.mockResolvedValue(fixture)
+    await renderDashboard()
+
+    const table = screen.getByText('Stop Losses').closest('.manager-card')! as HTMLElement
+    expect(within(table).getByText(/^Difference/)).toBeTruthy()
+    expect(within(table).getAllByRole('row')[1].textContent).toContain('33.33%')
+  })
+})
+
+/**
+ * A holding cannot be valued before its first stored price, so a configured
+ * floor cuts off the years the chart would otherwise draw with the stock line
+ * flat at zero. Ranges reaching past it return the same window as "All".
+ */
+describe('portfolio history range buttons', () => {
+  const rangeButtons = () => {
+    const card = screen.getByText('Portfolio Value').closest('.manager-card')! as HTMLElement
+    return within(card).getAllByRole('button').map((b) => b.textContent)
+  }
+
+  it('offers every range when no floor is configured', async () => {
+    await renderDashboard()
+    expect(rangeButtons()).toEqual(['3M', '6M', '12M', '2Y', '5Y', 'All'])
+  })
+
+  it('keeps them all when the floor predates every range', async () => {
+    getPortfolioHistory.mockResolvedValue({ ...historyFixture(), start_floor: '2000-01-01' })
+    await renderDashboard()
+    expect(rangeButtons()).toEqual(['3M', '6M', '12M', '2Y', '5Y', 'All'])
+  })
+
+  // Today's date as the floor is before every bounded range's start, whenever
+  // the suite happens to run — so the expectation does not drift with the clock.
+  it('drops the ranges the floor swallows', async () => {
+    const today = new Date().toISOString().slice(0, 10)
+    getPortfolioHistory.mockResolvedValue({ ...historyFixture(), start_floor: today })
+    await renderDashboard()
+    expect(rangeButtons()).toEqual(['All'])
+  })
+
+  // Otherwise no button is lit and the chart shows a window nothing claims.
+  it('falls back to All when the selected range is dropped', async () => {
+    await renderDashboard()
+    const card = () => screen.getByText('Portfolio Value').closest('.manager-card')! as HTMLElement
+    fireEvent.click(within(card()).getByRole('button', { name: '5Y' }))
+    await waitFor(() =>
+      expect(getPortfolioHistory).toHaveBeenLastCalledWith(expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/)),
+    )
+
+    const today = new Date().toISOString().slice(0, 10)
+    getPortfolioHistory.mockResolvedValue({ ...historyFixture(), start_floor: today })
+    // Any refetch now carries the floor back with it.
+    fireEvent.click(within(card()).getByRole('button', { name: '3M' }))
+
+    await waitFor(() => expect(rangeButtons()).toEqual(['All']))
+    // "All" asks for no start date at all, leaving the window to the server.
+    await waitFor(() => expect(getPortfolioHistory).toHaveBeenLastCalledWith(undefined))
+  })
+
+  // An API older than the setting omits the field rather than sending null.
+  it('offers every range when the API sends no floor at all', async () => {
+    const older = historyFixture() as Record<string, unknown>
+    delete older.start_floor
+    getPortfolioHistory.mockResolvedValue(older)
+    await renderDashboard()
+    expect(rangeButtons()).toEqual(['3M', '6M', '12M', '2Y', '5Y', 'All'])
   })
 })
 
@@ -229,6 +421,44 @@ describe('Dashboard navigation', () => {
     await renderDashboard({ onNavigateToHoldings })
     fireEvent.click(screen.getByRole('button', { name: 'TRL.AX' }))
     expect(onNavigateToHoldings).toHaveBeenCalledWith('TRL.AX')
+  })
+
+  // An indicator list sourced from "both" mixes the tables, so one list-level
+  // field_source cannot route every row — each row carries its own origin.
+  it('routes each row of a mixed list by its own origin', async () => {
+    const onNavigateToHoldings = vi.fn()
+    const onNavigateToWatchlist = vi.fn()
+    const fixture = overviewFixture()
+    const list = fixture.custom_lists[0]
+    list.label = 'Above 50SMA'
+    list.source = 'both'
+    list.field_source = 'indicator'
+    list.field_label = '50-Day SMA'
+    list.entries = [
+      entry('HELD.AX', 12.0, 10.0, { origin: 'holdings' }),
+      entry('WATCH.AX', 8.0, 5.0, { origin: 'watchlist' }),
+    ]
+    getPortfolioOverview.mockResolvedValue(fixture)
+    await renderDashboard({ onNavigateToHoldings, onNavigateToWatchlist })
+
+    const table = screen.getByText('Above 50SMA').closest('.manager-card')! as HTMLElement
+    fireEvent.click(within(table).getByRole('button', { name: 'HELD.AX' }))
+    expect(onNavigateToHoldings).toHaveBeenCalledWith('HELD.AX')
+    fireEvent.click(within(table).getByRole('button', { name: 'WATCH.AX' }))
+    expect(onNavigateToWatchlist).toHaveBeenCalledWith('WATCH.AX')
+  })
+
+  // Older payloads have no per-row origin; the list-level source still routes.
+  it('falls back to the list field_source when a row has no origin', async () => {
+    const onNavigateToHoldings = vi.fn()
+    const fixture = overviewFixture()
+    fixture.custom_lists[0].entries = [entry('MAN.AX', 12.0, 9.0, { origin: undefined })]
+    getPortfolioOverview.mockResolvedValue(fixture)
+    await renderDashboard({ onNavigateToHoldings })
+
+    const table = screen.getByText('Stop Losses').closest('.manager-card')! as HTMLElement
+    fireEvent.click(within(table).getByRole('button', { name: 'MAN.AX' }))
+    expect(onNavigateToHoldings).toHaveBeenCalledWith('MAN.AX')
   })
 
   it('renders plain text instead of buttons when no navigation handler is wired', async () => {

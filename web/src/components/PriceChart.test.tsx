@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
-import PriceChart, { DRAWING_COLOR } from './PriceChart'
-import { invalidateChartDefaults } from '../utils/chartDefaults'
+import PriceChart, { DRAWING_COLOR, OVERLAYS } from './PriceChart'
+import { invalidateAppConfig } from '../utils/appConfig'
+import { CHART_HEIGHT_RANGE } from '../utils/chartDefaults'
 
 vi.mock('../services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../services/api')>()
@@ -30,6 +31,10 @@ const addTrendline = apiClient.addTrendline as ReturnType<typeof vi.fn>
 const deleteChartDrawing = apiClient.deleteChartDrawing as ReturnType<typeof vi.fn>
 
 // Chart geometry constants from PriceChart's chartData
+// jsdom has no ResizeObserver, so the chart keeps its unmeasured fallback
+// frame of 1100x400 — the same geometry it used before it was measured. These
+// pixel expectations therefore stay valid, and a test that needs a different
+// size can stub ResizeObserver.
 const LEFT = 72
 const PLOT_WIDTH = 1040 - 72 - 20
 
@@ -71,7 +76,7 @@ beforeEach(() => {
   ;(apiClient.getFxRateForDate as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue(null)
   // The defaults fetch is cached module-wide, so it must be dropped between
   // tests or the first result would be reused by every later one.
-  invalidateChartDefaults()
+  invalidateAppConfig()
   ;(apiClient.getConfig as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue({})
   getChartDrawings.mockReset().mockResolvedValue([])
   addChartDrawing.mockReset().mockResolvedValue([])
@@ -113,11 +118,46 @@ describe('EMA 40 overlay', () => {
     expect(button.className).not.toContain('active')
     expect(screen.queryByText('40-day EMA')).toBeNull()
 
-    // Buttons read left to right by period: 20, 40, 50, 100, 150, 200
+    // Buttons read left to right by period: 20, 40, 50, 100, 150, 200, 200.
+    // The two 200s sit together, simple before exponential.
     const labels = [...document.querySelectorAll('.sma-button')]
       .map((b) => b.textContent!.trim())
       .filter((t) => /^(SMA|EMA) /.test(t))
-    expect(labels).toEqual(['SMA 20', 'EMA 40', 'SMA 50', 'SMA 100', 'SMA 150', 'SMA 200'])
+    expect(labels).toEqual(['SMA 20', 'EMA 40', 'SMA 50', 'SMA 100', 'SMA 150', 'SMA 200', 'EMA 200'])
+  })
+
+  /**
+   * The two 200-period lines track each other closely, so they have to be
+   * separable by more than position: different colours, and the EMA's own dash.
+   */
+  it('distinguishes EMA 200 from the SMA 200 it overlaps', async () => {
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByRole('button', { name: 'SMA 200' }))
+    fireEvent.click(screen.getByRole('button', { name: 'EMA 200' }))
+
+    expect(screen.getByText('200-day EMA')).toBeTruthy()
+    expect(screen.getByText('200-day SMA')).toBeTruthy()
+
+    const strokes = [...container.querySelectorAll('path[stroke-dasharray]')].map((p) => ({
+      colour: p.getAttribute('stroke'),
+      dash: p.getAttribute('stroke-dasharray'),
+    }))
+    const ema = strokes.find((s) => s.colour === '#33691e')
+    const sma = strokes.find((s) => s.colour === '#3949ab')
+    expect(ema).toBeTruthy()
+    expect(sma).toBeTruthy()
+    // Colour carries the identity; the dash says which kind of average it is.
+    expect(ema!.dash).not.toBe(sma!.dash)
+  })
+
+  // No overlay may reuse a colour the chart already paints — the palette note
+  // records a version where SMA lines vanished into the candle bodies.
+  it('keeps every overlay colour clear of the marks the chart already paints', async () => {
+    const painted = ['#2f5ce4', '#4caf50', '#f44336', '#ff9800']
+    const used = OVERLAYS.map((o) => o.color.toLowerCase())
+    for (const colour of painted) expect(used).not.toContain(colour)
+    // And distinct from each other, so no two lines are the same colour.
+    expect(new Set(used).size).toBe(used.length)
   })
 
   it('draws the EMA line and legend entry when enabled', async () => {
@@ -463,6 +503,163 @@ describe('drawn price levels', () => {
   })
 })
 
+/**
+ * The chart is resized by a real element rather than CSS `resize`: WebKit only
+ * paints the native grip while a resize is in flight on a box whose content
+ * fits, so it flashed and vanished in Safari before it could be grabbed.
+ */
+describe('chart resize grip', () => {
+  const grip = (container: HTMLElement) =>
+    container.querySelector('.chart-resize-grip') as HTMLElement
+
+  const box = (container: HTMLElement) =>
+    container.querySelector('.chart-resize-box') as HTMLElement
+
+  const heightOf = (container: HTMLElement) =>
+    parseInt(box(container).style.getPropertyValue('--chart-height'), 10)
+
+  const drag = (container: HTMLElement, deltaY: number) => {
+    const g = grip(container)
+    // jsdom has no pointer capture; the component calls it on the target.
+    g.setPointerCapture = () => {}
+    g.releasePointerCapture = () => {}
+    fireEvent.pointerDown(g, { clientY: 500, pointerId: 1 })
+    fireEvent.pointerMove(g, { clientY: 500 + deltaY, pointerId: 1 })
+    fireEvent.pointerUp(g, { clientY: 500 + deltaY, pointerId: 1 })
+  }
+
+  it('is always present, not only mid-gesture', async () => {
+    const { container } = await renderChart()
+    expect(grip(container)).toBeTruthy()
+    // And CSS resize is gone, so nothing depends on the browser drawing it.
+    expect(box(container).style.resize).toBe('')
+  })
+
+  it('grows the chart when dragged down and shrinks it when dragged up', async () => {
+    const { container } = await renderChart()
+    const start = heightOf(container)
+
+    drag(container, 120)
+    expect(heightOf(container)).toBe(start + 120)
+
+    drag(container, -60)
+    expect(heightOf(container)).toBe(start + 120 - 60)
+  })
+
+  /**
+   * The native handle ignored the configured range entirely — the chart could
+   * be dragged to any height at all. Owning the gesture is what makes the
+   * bounds real.
+   */
+  it('holds the drag inside the configured height range', async () => {
+    const { container } = await renderChart()
+    drag(container, 5000)
+    expect(heightOf(container)).toBe(CHART_HEIGHT_RANGE.max)
+    drag(container, -5000)
+    expect(heightOf(container)).toBe(CHART_HEIGHT_RANGE.min)
+  })
+
+  it('returns to the configured height on a double-click', async () => {
+    const { container } = await renderChart()
+    const start = heightOf(container)
+    drag(container, 150)
+    expect(heightOf(container)).not.toBe(start)
+
+    fireEvent.doubleClick(grip(container))
+    expect(heightOf(container)).toBe(start)
+  })
+})
+
+describe('price scale zoom', () => {
+  const gutter = (container: HTMLElement) =>
+    [...container.querySelectorAll('title')]
+      .find((t) => /Drag to zoom the price scale/.test(t.textContent!))!.parentElement!
+
+  const axisLabels = (container: HTMLElement) =>
+    [...container.querySelectorAll('text')]
+      .map((t) => t.textContent!)
+      .filter((t) => /^\$[\d.]+$/.test(t))
+
+  const dragGutter = (container: HTMLElement, deltaY: number) => {
+    fireEvent.mouseDown(gutter(container), { clientY: 300 })
+    fireEvent.mouseMove(window, { clientY: 300 - deltaY })
+    fireEvent.mouseUp(window)
+  }
+
+  it('fits the data until the scale is touched', async () => {
+    const { container } = await renderChart()
+    expect(screen.queryByRole('button', { name: /Fit/ })).toBeNull()
+    // Two decimals is right for a whole-span view.
+    expect(axisLabels(container).every((l) => /\.\d{2}$/.test(l))).toBe(true)
+  })
+
+  // Dragging up magnifies: the same data covers a narrower price range, so the
+  // gap between the top and bottom tick shrinks.
+  it('narrows the price range when the gutter is dragged up', async () => {
+    const { container } = await renderChart()
+    const span = () => {
+      const l = axisLabels(container).map((x) => parseFloat(x.slice(1)))
+      return Math.max(...l) - Math.min(...l)
+    }
+    const before = span()
+    dragGutter(container, 200)
+    expect(span()).toBeLessThan(before * 0.75)
+  })
+
+  it('widens it when dragged down', async () => {
+    const { container } = await renderChart()
+    const span = () => {
+      const l = axisLabels(container).map((x) => parseFloat(x.slice(1)))
+      return Math.max(...l) - Math.min(...l)
+    }
+    const before = span()
+    dragGutter(container, -200)
+    expect(span()).toBeGreaterThan(before * 1.25)
+  })
+
+  /**
+   * Five ticks two decimals wide would all read the same once the window is a
+   * few cents across, leaving an axis that says nothing.
+   */
+  it('adds decimals as the range tightens, so ticks stay distinguishable', async () => {
+    const { container } = await renderChart()
+    dragGutter(container, 600)
+    const labels = axisLabels(container)
+    expect(new Set(labels).size).toBe(labels.length)
+  })
+
+  it('offers a way back, and takes it', async () => {
+    const { container } = await renderChart()
+    const before = axisLabels(container)
+    dragGutter(container, 200)
+    expect(axisLabels(container)).not.toEqual(before)
+
+    fireEvent.click(screen.getByRole('button', { name: /Fit/ }))
+    expect(axisLabels(container)).toEqual(before)
+    expect(screen.queryByRole('button', { name: /Fit/ })).toBeNull()
+  })
+
+  it('resets when the timeframe changes, rather than carrying over', async () => {
+    const { container } = await renderChart()
+    dragGutter(container, 200)
+    expect(screen.getByRole('button', { name: /Fit/ })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: '1M' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Fit/ })).toBeNull())
+  })
+
+  /**
+   * The gutter sits outside the price band, which is exactly where
+   * `handleChartClick` bails — so zooming must never place a drawing.
+   */
+  it('does not place a drawing when the gutter is used in draw mode', async () => {
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByTitle(/Draw a horizontal price level/))
+    dragGutter(container, 150)
+    expect(addChartDrawing).not.toHaveBeenCalled()
+  })
+})
+
 describe('placing a level', () => {
   const clickPricePanel = (container: HTMLElement, svgY: number) => {
     const svg = container.querySelector('svg')!
@@ -616,5 +813,41 @@ describe('configured defaults', () => {
       screen.getAllByRole('button').find((b) => b.textContent!.trim() === label)!.className.includes('active')
     expect(active('1W')).toBe(true)
     expect(active('2Y')).toBe(false)
+  })
+})
+
+describe('measured geometry', () => {
+  // Without a ResizeObserver the chart must still draw at its original size
+  // rather than collapsing to zero — this is the path every test above takes.
+  it('falls back to the original frame when the container cannot be measured', async () => {
+    const { container } = await renderChart()
+    const svg = container.querySelector('svg')!
+    expect(svg.getAttribute('viewBox')).toBe('0 0 1100 400')
+  })
+
+  it('redraws at the observed size, keeping the viewBox 1:1 with pixels', async () => {
+    const originals = window.ResizeObserver
+    let notify: ((entries: Array<{ contentRect: { width: number; height: number } }>) => void) | null = null
+    class Stub {
+      constructor(cb: typeof notify) { notify = cb }
+      observe() { notify?.([{ contentRect: { width: 1686, height: 640 } }]) }
+      disconnect() {}
+      unobserve() {}
+    }
+    ;(window as unknown as { ResizeObserver: unknown }).ResizeObserver = Stub
+
+    try {
+      const { container } = await renderChart()
+      await waitFor(() => {
+        expect(container.querySelector('svg')!.getAttribute('viewBox')).toBe('0 0 1686 640')
+      })
+      const svg = container.querySelector('svg')!
+      // Matching width/height attributes are what stop the browser scaling the
+      // drawing — and with it, the text.
+      expect(svg.getAttribute('width')).toBe('1686')
+      expect(svg.getAttribute('height')).toBe('640')
+    } finally {
+      ;(window as unknown as { ResizeObserver: unknown }).ResizeObserver = originals
+    }
   })
 })

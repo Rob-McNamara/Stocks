@@ -1,8 +1,8 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { apiClient, type ChartDrawing } from '../services/api'
 import { calculateSMA, calculateEMA } from '../utils/sma'
 import { toWeeklyBars } from '../utils/bars'
-import { loadChartDefaults, FALLBACK_CHART_DEFAULTS, type ChartTimeframe } from '../utils/chartDefaults'
+import { loadChartDefaults, FALLBACK_CHART_DEFAULTS, CHART_HEIGHT_RANGE, type ChartTimeframe } from '../utils/chartDefaults'
 
 interface PriceHistoryPoint {
   date: string
@@ -30,6 +30,16 @@ const PURCHASE_AXIS_COLOR = '#ff9800'
 /** User-drawn support/resistance levels. */
 /** Recessive grey: an annotation, deliberately outside the series hue space. */
 export const DRAWING_COLOR = '#5f6368'
+/** Volume panel geometry, in CSS pixels — fixed, so height changes go to price. */
+/**
+ * How far the price scale may be zoomed. Below 1 the data shrinks toward the
+ * middle of the panel; above it the view magnifies. The ceiling stops a drag
+ * running away into a range no tick label could distinguish.
+ */
+const Y_ZOOM_RANGE = { min: 0.25, max: 20 } as const
+
+const VOLUME_PANEL_HEIGHT = 100
+const VOLUME_PANEL_GAP = 40
 /**
  * Tooltip text sits on a near-black panel, so it wears an ink colour and a
  * coloured swatch carries the series identity. Painting the text itself in the
@@ -88,10 +98,23 @@ interface OverlayDef {
  * 200 the down-candle red, so in candle mode those lines vanished into the
  * bars — and its brown fell below the chroma floor, reading as grey.
  *
- * Checked with the data-viz validator on a white surface: the full six pass
+ * Checked with the data-viz validator on a white surface: the full seven pass
  * the lightness band, chroma floor, adjacent-pair CVD separation and contrast;
  * the three in heaviest use (EMA 40, SMA 50, SMA 150) also pass as their own
  * set, since they are typically shown together.
+ *
+ * EMA 200's green is a compromise, and worth stating plainly. With thirteen
+ * chromatic colours already on the chart the space is full: a sweep of 576
+ * candidates found nothing separating cleanly from all of them, and every
+ * best-scoring option was a blue that collided with the price line in *normal*
+ * vision — the same way SMA 150 and SMA 200 once vanished into the candles.
+ * This green protects against the always-painted marks instead (ΔE 21 from the
+ * up-candle, 26 from SMA 200, which it tracks closely). What it costs is
+ * separation from SMA 150 under protanopia, where the two read alike; the
+ * differing dash and the legend label are what distinguish them there.
+ *
+ * A seventh line was the last one this palette could take. Another needs a
+ * slot freed first — SMA 100 is the least-used candidate.
  */
 export const OVERLAYS: readonly OverlayDef[] = [
   { id: 'sma20',  label: 'SMA 20',  period: 20,  kind: 'sma', color: '#827717', dash: '8 6' },
@@ -100,6 +123,7 @@ export const OVERLAYS: readonly OverlayDef[] = [
   { id: 'sma100', label: 'SMA 100', period: 100, kind: 'sma', color: '#c2185b', dash: '8 6' },
   { id: 'sma150', label: 'SMA 150', period: 150, kind: 'sma', color: '#a15c00', dash: '8 6' },
   { id: 'sma200', label: 'SMA 200', period: 200, kind: 'sma', color: '#3949ab', dash: '8 6' },
+  { id: 'ema200', label: 'EMA 200', period: 200, kind: 'ema', color: '#33691e', dash: '3 4' },
 ]
 
 function buildPath(points: Array<{ x: number; y: number | null }>) {
@@ -130,9 +154,61 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   // detectedCurrency is resolved from symbol info — more reliable than the prop when
   // the parent's symbolInfo cache hasn't been populated yet for this symbol.
   const [detectedCurrency, setDetectedCurrency] = useState<string>('AUD')
+  /**
+   * Callback ref rather than an effect: the frame is rendered only once the
+   * history has loaded, so an effect with an empty dependency list runs while
+   * the ref is still null and never observes anything.
+   */
+  const resizeObserver = useRef<ResizeObserver | null>(null)
+  const frameRef = useCallback((node: HTMLDivElement | null) => {
+    resizeObserver.current?.disconnect()
+    resizeObserver.current = null
+    if (!node || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      // A collapsed frame (hidden tab, mid-layout) would otherwise produce NaN
+      // geometry from a zero-width plot.
+      if (width > 0 && height > 0) {
+        setFrame({ width: Math.round(width), height: Math.round(height) })
+      }
+    })
+    observer.observe(node)
+    resizeObserver.current = observer
+  }, [])
+  /**
+   * Rendered size of the chart frame, in CSS pixels.
+   *
+   * The chart used to draw into a fixed 1100x400 viewBox and let the browser
+   * scale it, so on a wide screen every label, tick and candle grew with the
+   * container and the height was dictated by the width. Measuring instead means
+   * the viewBox matches the rendered size 1:1 — SVG units become CSS pixels, so
+   * an 11px label is 11px at any width, and height is free to be set
+   * independently.
+   *
+   * The defaults match the old fixed viewBox, so a frame that has not been
+   * measured yet (or a test without ResizeObserver) renders exactly as before.
+   */
+  const [frame, setFrame] = useState({ width: 1100, height: FALLBACK_CHART_DEFAULTS.height })
+  /** Opening height of the frame; the user can drag it taller from there. */
+  const [chartFrameHeight, setChartFrameHeight] = useState(FALLBACK_CHART_DEFAULTS.height)
+  /** The configured opening height, so a double-click on the grip can restore it. */
+  const [chartDefaultHeight, setChartDefaultHeight] = useState(FALLBACK_CHART_DEFAULTS.height)
   const svgRef = useRef<SVGSVGElement>(null)
   // Unique per chart: several can share a page (Holdings list, Analysis).
   const clipId = useId().replace(/:/g, '')
+
+  /**
+   * Vertical zoom on the price scale. 1 is auto-fit — the data span plus its
+   * padding, exactly as before this existed. Above 1 the same data occupies
+   * more of the panel, magnifying small moves; below 1 it is compressed.
+   *
+   * `yCenter` is the price the view is centred on, in display currency. Null
+   * follows the data's own midpoint, so a zoom stays put as bars arrive rather
+   * than drifting.
+   */
+  const [yZoom, setYZoom] = useState(1)
+  const [yCenter, setYCenter] = useState<number | null>(null)
+  const yZoomed = yZoom !== 1 || yCenter !== null
 
   const isInternational = detectedCurrency !== 'AUD'
 
@@ -268,6 +344,8 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       setChartType(d.chartType)
       setBarInterval(d.barInterval)
       setActiveOverlays(new Set(d.overlays))
+      setChartFrameHeight(d.height)
+      setChartDefaultHeight(d.height)
     })
     return () => { cancelled = true }
   }, [])
@@ -282,6 +360,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       .catch(() => { if (!cancelled) setDrawings([]) })
     return () => { cancelled = true }
   }, [symbol])
+
 
   const trimmedHistory = useMemo(() => {
     if (seriesHistory.length === 0) return seriesHistory
@@ -334,8 +413,12 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const showCandles = chartType === 'candle' && hasOhlc
 
   const chartData = useMemo(() => {
-    const width = 1040
-    const height = 260
+    // 60px of the frame is the right margin the stop-loss and level markers
+    // sit in, outside the plot; the rest is the plot box.
+    const width = Math.max(320, frame.width - 60)
+    // The volume panel and its gap are fixed, so the price panel takes what is
+    // left — a taller frame grows the price panel, not the volume bars.
+    const height = Math.max(120, frame.height - VOLUME_PANEL_HEIGHT - VOLUME_PANEL_GAP)
     const left = 72
     const right = 20
     const top = 20
@@ -366,8 +449,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const rawMin = Math.min(...validValues, ...markerValues)
     const rawMax = Math.max(...validValues, ...markerValues)
     const padding = (rawMax - rawMin) * 0.05 || 1
-    const minValue = rawMin - padding
-    const maxValue = rawMax + padding
+    // Auto-fit is the span plus padding; zoom scales that span about a centre,
+    // so at yZoom 1 with no centre the domain is exactly what it always was.
+    const fitMin = rawMin - padding
+    const fitMax = rawMax + padding
+    const centre = yCenter ?? (fitMin + fitMax) / 2
+    const halfSpan = ((fitMax - fitMin) || 2) / 2 / yZoom
+    const minValue = centre - halfSpan
+    const maxValue = centre + halfSpan
     const priceRange = maxValue - minValue || 1
 
     const toY = (v: number) => top + plotHeight - ((v - minValue) / priceRange) * plotHeight
@@ -418,8 +507,8 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
 
     const volumeValues = trimmedHistory.map((item) => item.volume ?? 0)
     const maxVolume = Math.max(...volumeValues, 1)
-    const volumeHeight = 100
-    const volumeTop = height + 40
+    const volumeHeight = VOLUME_PANEL_HEIGHT
+    const volumeTop = height + VOLUME_PANEL_GAP
     const volumePlotHeight = volumeHeight - 20
 
     const volumeBars = trimmedHistory.map((item, index) => {
@@ -438,14 +527,27 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     })
 
     const yLabelCount = 5
+    // Two decimals is right for a whole-span view and useless zoomed in: five
+    // ticks across a 3-cent window would all render as the same number. Extra
+    // precision is added only once a cent stops separating adjacent ticks, so
+    // an unzoomed chart reads exactly as it always has. Half a gap is the
+    // threshold — at a full gap the two ends can still round together.
+    const tickGap = priceRange / (yLabelCount - 1)
+    const decimals = Math.min(6, Math.max(2, Math.ceil(-Math.log10(tickGap / 2))))
     const yLabels = Array.from({ length: yLabelCount }, (_, i) => {
       const value = minValue + (priceRange * i) / (yLabelCount - 1)
-      return { y: toY(value), label: `${currSym}${value.toFixed(2)}` }
+      return { y: toY(value), label: `${currSym}${value.toFixed(decimals)}` }
     })
 
     const axisY = top + plotHeight
     const labelY = axisY + 18
-    const labelCount = trimmedHistory.length <= 7 ? trimmedHistory.length : trimmedHistory.length <= 30 ? 4 : 6
+    // Denser axis labels on a wider chart. At the original plot width this
+    // yields exactly the previous counts, so nothing shifts until there is
+    // genuinely more room.
+    const baseCount = trimmedHistory.length <= 7 ? trimmedHistory.length : trimmedHistory.length <= 30 ? 4 : 6
+    const labelCount = trimmedHistory.length <= 7
+      ? baseCount
+      : Math.min(trimmedHistory.length, Math.max(baseCount, Math.round((baseCount * plotWidth) / 948)))
     const xLabels: Array<{ x: number; label: string }> = []
     if (trimmedHistory.length > 0) {
       const indices = Array.from({ length: labelCount }, (_, i) =>
@@ -462,12 +564,12 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     }
 
     return {
-      width: 1100, height: volumeTop + volumeHeight,
+      width: frame.width, height: volumeTop + volumeHeight,
       points, overlayLines, candles, volumeBars, yLabels, xLabels,
       left, right, top, bottom, plotWidth, plotHeight,
       pricePlotHeight: plotHeight, axisY, labelY, toY, minValue, maxValue,
     }
-  }, [trimmedHistory, seriesHistory.length, allOverlays, fxMultiplier, currSym, markerPrice, markers, purchasePrice, purchases, isInternational, showInAud, fxRate, showCandles])
+  }, [frame, trimmedHistory, seriesHistory.length, allOverlays, fxMultiplier, currSym, markerPrice, markers, purchasePrice, purchases, isInternational, showInAud, fxRate, showCandles, yZoom, yCenter])
 
   const allMarkers = useMemo(() => {
     const defs: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }> = []
@@ -604,6 +706,90 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const { top, pricePlotHeight, minValue, maxValue } = chartData
     const displayPrice = minValue + ((top + pricePlotHeight - y) / pricePlotHeight) * (maxValue - minValue)
     return displayPrice / fxMultiplier
+  }
+
+  /**
+   * A zoom belongs to the view it was made in — carried across a symbol or
+   * timeframe change it looks like the chart has rendered wrongly.
+   *
+   * Adjusted during render rather than in an effect: React applies this before
+   * committing, so the chart never paints one frame at the stale zoom the way
+   * an effect-based reset would.
+   */
+  const zoomView = `${symbol}|${timeframe}|${barInterval}|${showInAud}`
+  const [zoomViewSeen, setZoomViewSeen] = useState(zoomView)
+  if (zoomViewSeen !== zoomView) {
+    setZoomViewSeen(zoomView)
+    setYZoom(1)
+    setYCenter(null)
+  }
+
+  /**
+   * Resizing the chart, driven from here rather than by CSS `resize`.
+   *
+   * The native handle is a scrollbar-layer feature in WebKit: on a box whose
+   * content fits exactly, macOS overlay scrollbars materialise that layer only
+   * while a resize is in flight, so the grip flashes and vanishes before it can
+   * be grabbed. Owning the gesture also means `CHART_HEIGHT_RANGE` is actually
+   * enforced — the native handle ignored it — and the height stays React state
+   * instead of an inline style the next render must be careful not to undo.
+   */
+  const handleFrameResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    const startY = e.clientY
+    const startHeight = chartFrameHeight
+    const target = e.currentTarget
+    target.setPointerCapture(e.pointerId)
+
+    const onMove = (move: PointerEvent) => {
+      const next = startHeight + (move.clientY - startY)
+      setChartFrameHeight(
+        Math.min(CHART_HEIGHT_RANGE.max, Math.max(CHART_HEIGHT_RANGE.min, Math.round(next))),
+      )
+    }
+    const onUp = (up: PointerEvent) => {
+      target.releasePointerCapture(up.pointerId)
+      target.removeEventListener('pointermove', onMove)
+      target.removeEventListener('pointerup', onUp)
+    }
+    target.addEventListener('pointermove', onMove)
+    target.addEventListener('pointerup', onUp)
+  }
+
+  const resetYZoom = () => {
+    setYZoom(1)
+    setYCenter(null)
+  }
+
+  /**
+   * Drag the price gutter to zoom, the convention on trading charts. The gutter
+   * is free for it: `handleChartClick` already ignores anything outside the
+   * price band, since there is no price there to anchor a drawing to.
+   *
+   * Dragging up magnifies. The centre is pinned on the first drag so the view
+   * expands about where it already sits rather than snapping to the data's
+   * midpoint.
+   */
+  const handleAxisDrag = (e: React.MouseEvent<SVGRectElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startY = e.clientY
+    const startZoom = yZoom
+    const pinnedCentre = yCenter ?? (chartData.minValue + chartData.maxValue) / 2
+
+    const onMove = (move: MouseEvent) => {
+      // 200px of travel doubles or halves the scale — enough to be deliberate,
+      // little enough to reach the extremes without letting go.
+      const next = startZoom * Math.pow(2, (startY - move.clientY) / 200)
+      setYCenter(pinnedCentre)
+      setYZoom(Math.min(Y_ZOOM_RANGE.max, Math.max(Y_ZOOM_RANGE.min, next)))
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
   }
 
   const handleChartClick = async (e: React.MouseEvent<SVGSVGElement>) => {
@@ -805,6 +991,17 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             >
               Week
             </button>
+            {/* Only while zoomed. Dragging the gutter is the gesture, but
+                nothing advertises it, so the way back has to be visible. */}
+            {yZoomed && (
+              <button
+                className="sma-button"
+                onClick={resetYZoom}
+                title="Return the price scale to fitting the data"
+              >
+                ⤢ Fit
+              </button>
+            )}
             <span style={{ margin: '0 4px', color: '#ccc' }}>|</span>
             {OVERLAYS.map((o) => (
               <button
@@ -852,8 +1049,17 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           </div>
         )}
         {drawError && <div className="alert alert-error" style={{ marginBottom: 4 }}>{drawError}</div>}
+        {/* Height is a custom property so the box can be sized from React state
+            without an inline `height` competing with it. */}
+        <div
+          ref={frameRef}
+          className="chart-resize-box"
+          style={{ '--chart-height': `${chartFrameHeight}px` } as React.CSSProperties}
+        >
         <svg
           ref={svgRef}
+          width={chartData.width}
+          height={chartData.height}
           viewBox={`0 0 ${chartData.width} ${chartData.height}`}
           className="chart-svg"
           onMouseMove={handleMouseMove}
@@ -882,6 +1088,21 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             </g>
           ))}
 
+          {/* The price gutter, as a grab target. Transparent rather than
+              styled: it sits under the tick labels, which stay readable. */}
+          <rect
+            x={0}
+            y={chartData.top}
+            width={chartData.left}
+            height={chartData.pricePlotHeight}
+            fill="transparent"
+            style={{ cursor: 'ns-resize' }}
+            onMouseDown={handleAxisDrag}
+            onDoubleClick={resetYZoom}
+          >
+            <title>Drag to zoom the price scale, double-click to fit</title>
+          </rect>
+
           <line x1={chartData.left} y1={chartData.top} x2={chartData.left} y2={chartData.top + chartData.pricePlotHeight} stroke="#e1e7f1" strokeWidth="1" />
           <line x1={chartData.left} y1={chartData.top + chartData.pricePlotHeight} x2={chartData.width - chartData.right} y2={chartData.top + chartData.pricePlotHeight} stroke="#e1e7f1" strokeWidth="1" />
 
@@ -892,6 +1113,11 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             </g>
           ))}
 
+          {/* Clipped because the y-range is no longer guaranteed to contain the
+              data: zoomed in, the line, the overlays and the candle wicks all
+              run past the panel and would paint over the axis labels and the
+              volume bars below. */}
+          <g clipPath={`url(#${clipId})`}>
           {/* SMA lines — rendered behind price line */}
           {chartData.overlayLines
             .filter((line) => activeOverlays.has(line.id))
@@ -928,6 +1154,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           ) : (
             <path className="close-line" d={buildPath(chartData.points)} fill="none" stroke="#2f5ce4" strokeWidth="2" />
           )}
+          </g>
 
           {/* User-drawn price levels. Anchored by price, so they survive every
               timeframe, interval and currency change; a level outside the
@@ -1086,6 +1313,17 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             </g>
           )}
         </svg>
+        </div>
+        {/* Always visible, unlike the native grip it replaces. */}
+        <div
+          className="chart-resize-grip"
+          onPointerDown={handleFrameResize}
+          onDoubleClick={() => setChartFrameHeight(chartDefaultHeight)}
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Drag to resize the chart, double-click to reset"
+          title="Drag to resize the chart, double-click to reset"
+        />
       </div>
       <div className="chart-legend">
         {showCandles ? (

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { apiClient, type CashAccount, type PortfolioOverview, type CustomListResult, type PortfolioHistory } from '../services/api'
+import { apiClient, type CashAccount, type PortfolioOverview, type CustomListEntry, type CustomListResult, type PortfolioHistory } from '../services/api'
 import PortfolioHistoryChart from './PortfolioHistoryChart'
 
 // Thin client: every number on this screen — totals, breakdowns, sectors,
@@ -21,6 +21,85 @@ const HISTORY_RANGES = [
 
 type HistoryRange = (typeof HISTORY_RANGES)[number][0]
 
+/** Start date a range asks for, or undefined for the unbounded one. */
+function rangeStart(range: HistoryRange): string | undefined {
+  const months = HISTORY_RANGES.find(([value]) => value === range)?.[2]
+  if (months == null) return undefined
+  const cutoff = new Date()
+  cutoff.setMonth(cutoff.getMonth() - months)
+  return cutoff.toISOString().slice(0, 10)
+}
+
+/** Column heading for the quantity a custom list compares against its field. */
+const compareLabel = (list: CustomListResult) => (list.compare === 'volume' ? 'Volume' : 'Price')
+
+/** The same quantity in running prose, for the list's description line. */
+const compareNoun = (list: CustomListResult) => (list.compare === 'volume' ? 'volume' : 'price')
+
+/** What a list selects on, in a sentence. */
+function listCriterion(list: CustomListResult): string {
+  const subject = compareNoun(list)
+  const field = list.field_label
+  switch (list.operator) {
+    case 'above': return `${subject} is above ${field}`
+    case 'below': return `${subject} is below ${field}`
+    case 'pct_below': return `${field} is % below ${subject}`
+    case 'pct_above': return `${field} is % above ${subject}`
+    case 'days_above': return `${subject} has been above ${field}, most recent first`
+    case 'days_below': return `${subject} has been below ${field}, most recent first`
+    case 'volume_cross_pct': return `${subject} crossed above ${field}, ranked by the volume behind it`
+    default: return ''
+  }
+}
+
+/**
+ * The compared figure, falling back to the price. An API predating the compare
+ * field sends no `compare_value` and only ever compared the price — without the
+ * fallback the whole dashboard throws on the first row it renders.
+ */
+const compareValue = (entry: CustomListEntry) => entry.compare_value ?? entry.price
+
+/**
+ * Trailing columns for a custom list, in order, with the ranked one flagged.
+ *
+ * A crossover list is about *when* the price crossed and how much volume was
+ * behind it, so the percentage gap it happens to sit at says nothing useful —
+ * those lists trade the Difference column for the pair that does. Only the
+ * ranked column is sortable, because reversing the list re-ranks on the server
+ * by that metric alone.
+ */
+function metricColumns(list: CustomListResult) {
+  const metric = list.metric ?? 'pct_diff'
+  const columns =
+    metric === 'days' || metric === 'volume_cross_pct'
+      ? [
+          { key: 'days', label: list.operator === 'days_below' ? 'Days Below' : 'Days Above' },
+          { key: 'volume_cross_pct', label: 'Vol on Cross' },
+        ]
+      : [{ key: 'pct_diff', label: 'Difference' }]
+  return columns.map((c) => ({ ...c, ranked: c.key === metric }))
+}
+
+/** One trailing cell, formatted for whichever metric the column holds. */
+function metricCell(key: string, entry: CustomListEntry) {
+  if (key === 'days') {
+    return entry.days == null
+      ? <span style={{ color: '#888' }}>—</span>
+      : <span style={{ color: '#2e7d32', fontWeight: 600 }}>{entry.days}d</span>
+  }
+  if (key === 'volume_cross_pct') {
+    const v = entry.volume_cross_pct
+    return v == null
+      ? <span style={{ color: '#888' }}>—</span>
+      : <span style={{ color: v >= 0 ? '#2e7d32' : '#c62828', fontWeight: 600 }}>{v >= 0 ? '+' : ''}{v.toFixed(0)}%</span>
+  }
+  return (
+    <span style={{ color: entry.pct_diff >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
+      {entry.pct_diff >= 0 ? '+' : ''}{entry.pct_diff.toFixed(2)}%
+    </span>
+  )
+}
+
 export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatchlist, onNavigateToHoldings }: { onLoading: (loading: boolean) => void; holdingsVersion?: number; onNavigateToWatchlist?: (symbol: string) => void; onNavigateToHoldings?: (symbol: string) => void }) {
   const [overview, setOverview] = useState<PortfolioOverview | null>(null)
   const [loading, setLoading] = useState(true)
@@ -37,6 +116,28 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   const [historyRange, setHistoryRange] = useState<HistoryRange>('12m')
   const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
 
+  /**
+   * A range starting at or before the configured floor returns exactly what
+   * "All" returns, so offering it invites the question of why three buttons
+   * give the same answer. The floor arrives with the history, so every button
+   * shows until the first response lands.
+   */
+  const visibleRanges = useMemo(() => {
+    const floor = history?.start_floor
+    if (!floor) return HISTORY_RANGES
+    return HISTORY_RANGES.filter(([value]) => {
+      const start = rangeStart(value)
+      return start === undefined || start > floor
+    })
+  }, [history])
+
+  // Derived rather than synced back into state: losing the selected range to
+  // the floor would otherwise leave no button lit and the chart showing a
+  // window nothing claims.
+  const activeRange: HistoryRange = visibleRanges.some(([value]) => value === historyRange)
+    ? historyRange
+    : 'all'
+
   useEffect(() => {
     load()
   }, [holdingsVersion])
@@ -44,19 +145,13 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   // Loaded separately from the overview: it sweeps every day of history, so a
   // slow response should not hold up the rest of the dashboard.
   useEffect(() => {
-    const from = (() => {
-      const months = HISTORY_RANGES.find(([value]) => value === historyRange)?.[2]
-      if (months == null) return undefined
-      const cutoff = new Date()
-      cutoff.setMonth(cutoff.getMonth() - months)
-      return cutoff.toISOString().slice(0, 10)
-    })()
+    const from = rangeStart(activeRange)
     setHistoryError(null)
     apiClient
       .getPortfolioHistory(from)
       .then(setHistory)
       .catch((err) => setHistoryError(err instanceof Error ? err.message : 'Failed to load portfolio history'))
-  }, [holdingsVersion, historyRange])
+  }, [holdingsVersion, activeRange])
 
   // `quiet` keeps the rendered dashboard on screen while refetching — a sort
   // click should re-rank a table, not blank the entire page.
@@ -195,10 +290,10 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
         <div className="card-header" style={{ marginBottom: 4 }}>
           <h2 style={{ margin: 0 }}>Portfolio Value</h2>
           <div className="sma-selector">
-            {HISTORY_RANGES.map(([value, label]) => (
+            {visibleRanges.map(([value, label]) => (
               <button
                 key={value}
-                className={`sma-button ${historyRange === value ? 'active' : ''}`}
+                className={`sma-button ${activeRange === value ? 'active' : ''}`}
                 onClick={() => setHistoryRange(value)}
               >
                 {label}
@@ -389,12 +484,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
           <div key={list.key} className="manager-card">
             <h2>{list.label}</h2>
             <p className="dashboard-list-desc">
-              {list.source === 'both' ? 'Holdings & Watchlist' : list.source === 'holdings' ? 'Holdings' : 'Watchlist'} stocks where {
-                list.operator === 'above' ? `price is above ${list.field_label}` :
-                list.operator === 'below' ? `price is below ${list.field_label}` :
-                list.operator === 'pct_below' ? `${list.field_label} is % below price` :
-                list.operator === 'pct_above' ? `${list.field_label} is % above price` : ''
-              }
+              {list.source === 'both' ? 'Holdings & Watchlist' : list.source === 'holdings' ? 'Holdings' : 'Watchlist'} stocks where {listCriterion(list)}
             </p>
             {list.entries.length === 0 ? (
               <p className="empty-text">No matching stocks found.</p>
@@ -403,29 +493,45 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
                 <thead>
                   <tr>
                     <th>Symbol</th>
-                    <th>Price</th>
+                    <th>{compareLabel(list)}</th>
                     <th>{list.field_label}</th>
-                    <th
-                      className="sortable-header"
-                      onClick={() => toggleDiffSort(list)}
-                      title={
-                        list.truncated
-                          ? `Sorted ${list.sort === 'asc' ? 'ascending' : 'descending'} — click to reverse and reselect the top ${list.entries.length}`
-                          : `Sorted ${list.sort === 'asc' ? 'ascending' : 'descending'} — click to reverse`
-                      }
-                    >
-                      Difference{sortingKey === list.key ? ' …' : list.sort === 'asc' ? ' ↑' : ' ↓'}
-                    </th>
+                    {metricColumns(list).map((col) =>
+                      col.ranked ? (
+                        <th
+                          key={col.key}
+                          className="sortable-header"
+                          onClick={() => toggleDiffSort(list)}
+                          title={
+                            list.truncated
+                              ? `Sorted ${list.sort === 'asc' ? 'ascending' : 'descending'} — click to reverse and reselect the top ${list.entries.length}`
+                              : `Sorted ${list.sort === 'asc' ? 'ascending' : 'descending'} — click to reverse`
+                          }
+                        >
+                          {col.label}{sortingKey === list.key ? ' …' : list.sort === 'asc' ? ' ↑' : ' ↓'}
+                        </th>
+                      ) : (
+                        <th key={col.key}>{col.label}</th>
+                      )
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {list.entries.map((item) => (
                     <tr key={item.symbol}>
-                      <td>{symbolButton(item.symbol, list.field_source === 'holdings' ? 'holdings' : 'watchlist')}</td>
+                      {/* An indicator list sourced from "both" mixes the two
+                          tables, so the row's own origin wins; the list-level
+                          field_source is the fallback for an older API. */}
+                      <td>{symbolButton(item.symbol, (item.origin ?? list.field_source) === 'holdings' ? 'holdings' : 'watchlist')}</td>
                       <td>
-                        ${item.price.toFixed(2)}
-                        {item.currency && item.currency.toUpperCase() !== 'AUD' && (
-                          <span style={{ fontSize: 10, color: '#e65100', marginLeft: 4 }}>{item.currency.toUpperCase()}</span>
+                        {list.compare === 'volume' ? (
+                          compareValue(item).toLocaleString('en-AU', { maximumFractionDigits: 0 })
+                        ) : (
+                          <>
+                            ${compareValue(item).toFixed(2)}
+                            {item.currency && item.currency.toUpperCase() !== 'AUD' && (
+                              <span style={{ fontSize: 10, color: '#e65100', marginLeft: 4 }}>{item.currency.toUpperCase()}</span>
+                            )}
+                          </>
                         )}
                       </td>
                       <td>
@@ -434,9 +540,9 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
                           <span title="Trailing sell trigger" style={{ fontSize: 10, color: '#7a4fd0', marginLeft: 4, fontWeight: 600 }}>T</span>
                         )}
                       </td>
-                      <td style={{ color: item.pct_diff >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
-                        {item.pct_diff >= 0 ? '+' : ''}{item.pct_diff.toFixed(2)}%
-                      </td>
+                      {metricColumns(list).map((col) => (
+                        <td key={col.key}>{metricCell(col.key, item)}</td>
+                      ))}
                     </tr>
                   ))}
                 </tbody>

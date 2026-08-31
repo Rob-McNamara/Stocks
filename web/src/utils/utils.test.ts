@@ -3,7 +3,8 @@ import { calculateSMA, calculateEMA, getLatestSMA, smaTrend } from './sma'
 import { toWeeklyBars } from './bars'
 import { mapLimit } from './async'
 import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from './holdings'
-import { parseChartDefaults, FALLBACK_CHART_DEFAULTS } from './chartDefaults'
+import { parseChartDefaults, FALLBACK_CHART_DEFAULTS, CHART_HEIGHT_RANGE } from './chartDefaults'
+import { parseLayoutWidth, LAYOUT_WIDTHS, FALLBACK_LAYOUT_WIDTH } from './layout'
 
 // The FIFO/P&L engine and its test suite now live in the Rust API server
 // (src/portfolio.rs) — these tests cover the utilities that remain
@@ -277,9 +278,9 @@ describe('parseChartDefaults', () => {
   })
 
   it('reads a stored setting back', () => {
-    const stored = JSON.stringify({ timeframe: '2y', chartType: 'candle', barInterval: 'week', overlays: ['ema40'] })
+    const stored = JSON.stringify({ timeframe: '2y', chartType: 'candle', barInterval: 'week', overlays: ['ema40'], height: 520 })
     expect(parseChartDefaults(stored, known)).toEqual({
-      timeframe: '2y', chartType: 'candle', barInterval: 'week', overlays: ['ema40'],
+      timeframe: '2y', chartType: 'candle', barInterval: 'week', overlays: ['ema40'], height: 520,
     })
   })
 
@@ -300,11 +301,47 @@ describe('parseChartDefaults', () => {
     expect(parseChartDefaults(stored, known).overlays).toEqual(['sma50', 'ema40'])
   })
 
+  it('clamps a height outside the usable range', () => {
+    expect(parseChartDefaults(JSON.stringify({ height: 50 }), known).height).toBe(CHART_HEIGHT_RANGE.min)
+    expect(parseChartDefaults(JSON.stringify({ height: 5000 }), known).height).toBe(CHART_HEIGHT_RANGE.max)
+  })
+
+  /**
+   * The floor is not arbitrary: under it the price panel is clamped to its
+   * minimum and the chart SVG grows taller than the frame that measures it,
+   * which the frame's `overflow: auto` would surface as a scrollbar. The
+   * volume panel is 100, its gap 40, and the smallest usable price panel 120.
+   */
+  it('floors the height where the volume panel and price panel both still fit', () => {
+    expect(CHART_HEIGHT_RANGE.min).toBe(100 + 40 + 120)
+    // A height stored under an older, lower floor is lifted rather than lost.
+    expect(parseChartDefaults(JSON.stringify({ height: 240 }), known).height).toBe(CHART_HEIGHT_RANGE.min)
+  })
+
+  it('falls back when the height is not a usable number', () => {
+    for (const bad of ['400', null, NaN]) {
+      expect(parseChartDefaults(JSON.stringify({ height: bad }), known).height)
+        .toBe(FALLBACK_CHART_DEFAULTS.height)
+    }
+  })
+
   it('survives malformed JSON', () => {
     expect(parseChartDefaults('{not json', known)).toEqual(FALLBACK_CHART_DEFAULTS)
   })
 
   it('allows an empty overlay set, which is a real choice', () => {
     expect(parseChartDefaults(JSON.stringify({ overlays: [] }), known).overlays).toEqual([])
+  })
+})
+
+describe('parseLayoutWidth', () => {
+  it('accepts every offered width', () => {
+    for (const [value] of LAYOUT_WIDTHS) expect(parseLayoutWidth(value)).toBe(value)
+  })
+
+  it('falls back for nothing stored or an unknown value', () => {
+    expect(parseLayoutWidth(undefined)).toBe(FALLBACK_LAYOUT_WIDTH)
+    expect(parseLayoutWidth('ultrawide')).toBe(FALLBACK_LAYOUT_WIDTH)
+    expect(parseLayoutWidth('')).toBe(FALLBACK_LAYOUT_WIDTH)
   })
 })

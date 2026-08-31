@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
 import { apiClient } from './services/api'
+import { initLayoutWidth } from './utils/layout'
 import WatchlistManager from './components/WatchlistManager'
 import ConfigPanel from './components/ConfigPanel'
 import HoldingsManager from './components/HoldingsManager'
@@ -44,6 +45,12 @@ function App() {
 
   useEffect(() => {
     testBackendConnection()
+  }, [])
+
+  // Applied before anything renders width-sensitive content, so the layout does
+  // not visibly jump from the default to the chosen width on every load.
+  useEffect(() => {
+    void initLayoutWidth()
   }, [])
 
   // On first load, ask the server to refresh prices and dividends. The
