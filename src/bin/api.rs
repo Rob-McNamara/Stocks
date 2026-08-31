@@ -3805,11 +3805,17 @@ fn remove_watchlist_symbol(db_path: &PathBuf, id: i64) -> Result<bool, String> {
         .execute("DELETE FROM watchlist_memberships WHERE id = ?1", params![id])
         .map_err(|err| err.to_string())?;
     if let Some(sym) = symbol {
+        // Both of these used to swallow their errors, and the count defaulted to
+        // zero — so a failed read looked exactly like "no memberships left" and
+        // took the delete branch, destroying the symbol's notes, breakthrough
+        // price and stop loss. Those are the columns this project has already
+        // lost once; a count that cannot be read is not a count of nothing.
         let remaining: i64 = conn
             .query_row("SELECT COUNT(*) FROM watchlist_memberships WHERE symbol = ?1", params![sym], |row| row.get(0))
-            .unwrap_or(0);
+            .map_err(|err| format!("Counting remaining memberships for {}: {}", sym, err))?;
         if remaining == 0 {
-            let _ = conn.execute("DELETE FROM watchlist_symbols WHERE symbol = ?1", params![sym]);
+            conn.execute("DELETE FROM watchlist_symbols WHERE symbol = ?1", params![sym])
+                .map_err(|err| format!("Removing symbol row for {}: {}", sym, err))?;
         }
     }
     Ok(affected > 0)
@@ -4697,7 +4703,13 @@ fn cash_account_currency(conn: &Connection, account_id: i64) -> Option<String> {
 /// Balance of an account in its own currency, optionally as at a date.
 /// Derived from the ledger every time — never stored — so a back-dated entry
 /// is reflected immediately.
-fn cash_balance(conn: &Connection, account_id: i64, as_of: Option<&str>) -> f64 {
+/// Ledger balance for one account, in the account's own currency.
+///
+/// Fallible on purpose. The SQL already `COALESCE`s an empty ledger to zero, so
+/// the only thing a swallowed error could add is a *wrong* zero — reported as a
+/// balance, summed into the portfolio total, and used as a guard against
+/// changing an account's currency. Each caller decides what to do instead.
+fn cash_balance(conn: &Connection, account_id: i64, as_of: Option<&str>) -> Result<f64, String> {
     let (sql, bind_date) = match as_of {
         Some(_) => (
             "SELECT COALESCE(SUM(amount), 0) FROM cash_transactions WHERE account_id = ?1 AND date <= ?2",
@@ -4710,7 +4722,7 @@ fn cash_balance(conn: &Connection, account_id: i64, as_of: Option<&str>) -> f64 
     } else {
         conn.query_row(sql, params![account_id], |row| row.get::<_, f64>(0))
     };
-    result.unwrap_or(0.0)
+    result.map_err(|err| format!("Reading balance for cash account {}: {}", account_id, err))
 }
 
 #[derive(Deserialize)]
@@ -4755,19 +4767,20 @@ fn load_cash_accounts(conn: &Connection) -> Result<Vec<CashAccountRow>, String> 
         .filter_map(|r| r.ok())
         .collect();
 
-    Ok(rows
-        .into_iter()
+    // Collected through `Result` so a balance that cannot be read fails the whole
+    // listing rather than reporting one account as empty among the rest.
+    rows.into_iter()
         .map(|(id, name, currency, interest_rate, include, notes, created_at)| {
-            let balance = cash_balance(conn, id, None);
+            let balance = cash_balance(conn, id, None)?;
             let balance_aud = fx_rate_on(conn, &currency, &today).map(|rate| balance * rate);
-            let transaction_count = conn
+            let transaction_count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM cash_transactions WHERE account_id = ?1",
                     params![id],
-                    |row| row.get::<_, i64>(0),
+                    |row| row.get(0),
                 )
-                .unwrap_or(0);
-            CashAccountRow {
+                .map_err(|err| format!("Counting transactions for cash account {}: {}", id, err))?;
+            Ok(CashAccountRow {
                 id,
                 name,
                 currency,
@@ -4778,9 +4791,9 @@ fn load_cash_accounts(conn: &Connection) -> Result<Vec<CashAccountRow>, String> 
                 balance,
                 balance_aud,
                 transaction_count,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[utoipa::path(get, path = "/api/v1/cash/accounts", tag = "cash", responses((status = 200, description = "List cash accounts with balances")))]
@@ -4862,13 +4875,23 @@ async fn update_cash_account(
         return err_not_found(format!("Cash account {} not found", id));
     };
     let currency = payload.currency.trim().to_uppercase();
-    if currency != existing_currency
-        && cash_balance(&conn, id, None) != 0.0
-    {
-        return err_bad_request(format!(
-            "Cannot change currency from {} to {} while the account has a non-zero balance",
-            existing_currency, currency
-        ));
+    if currency != existing_currency {
+        // Refuse rather than assume. A balance that cannot be read used to come
+        // back as 0.0, which read as "empty account" and let the change through
+        // — reinterpreting every amount already in the ledger.
+        let balance = match cash_balance(&conn, id, None) {
+            Ok(b) => b,
+            Err(err) => {
+                let _ = insert_event_log(&db_path, "error", "cash_account_update", "api", None, &err);
+                return err_internal(err);
+            }
+        };
+        if balance != 0.0 {
+            return err_bad_request(format!(
+                "Cannot change currency from {} to {} while the account has a non-zero balance",
+                existing_currency, currency
+            ));
+        }
     }
 
     let result = conn.execute(
@@ -4906,9 +4929,19 @@ async fn delete_cash_account(db_path: web::Data<PathBuf>, path: web::Path<i64>) 
 
     // Deleting an account with history would orphan its ledger, and SQLite's
     // foreign keys are not enforced here, so the check has to be explicit.
-    let count: i64 = conn
+    // Defaulting to zero here made the guard fail *open*: a failed count read as
+    // "no transactions" and the account was deleted anyway, orphaning the ledger
+    // this check exists to protect.
+    let count: i64 = match conn
         .query_row("SELECT COUNT(*) FROM cash_transactions WHERE account_id = ?1", params![id], |r| r.get(0))
-        .unwrap_or(0);
+    {
+        Ok(n) => n,
+        Err(err) => {
+            let message = format!("Could not check cash account {} for transactions: {}", id, err);
+            let _ = insert_event_log(&db_path, "error", "cash_account_delete", "api", None, &message);
+            return err_internal(message);
+        }
+    };
     if count > 0 {
         return err_bad_request(format!(
             "Cash account {} still has {} transaction(s); delete or reassign them first",
@@ -10474,6 +10507,79 @@ mod tests {
     // Cash ledger write paths
     // -------------------------------------------------------------------------
 
+    /// Break one table so the queries that read it fail, without disturbing the
+    /// rows the code under test is supposed to protect. This is what a transient
+    /// database error looks like from inside a handler.
+    fn drop_table(db_path: &PathBuf, table: &str) {
+        open_db(db_path).unwrap().execute(&format!("DROP TABLE {}", table), []).unwrap();
+    }
+
+    /// The balance is the input to two guards and one reported figure. Returning
+    /// a wrong zero instead of an error is what made all three unsafe.
+    #[test]
+    fn a_balance_that_cannot_be_read_is_an_error_not_a_zero() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Everyday", "AUD");
+        let conn = open_db(&db_path).unwrap();
+        // An empty ledger is a legitimate zero, and stays one.
+        assert_eq!(cash_balance(&conn, 1, None).unwrap(), 0.0);
+        drop(conn);
+
+        drop_table(&db_path, "cash_transactions");
+        let conn = open_db(&db_path).unwrap();
+        assert!(cash_balance(&conn, 1, None).is_err(), "a failed read must not look like an empty account");
+    }
+
+    /// The guard exists because SQLite's foreign keys are not enforced here, so
+    /// failing it open orphans the whole ledger.
+    #[actix_web::test]
+    async fn a_cash_account_is_kept_when_its_transaction_count_cannot_be_read() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Everyday", "AUD");
+        drop_table(&db_path, "cash_transactions");
+
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(delete_cash_account),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::delete().uri("/api/cash/accounts/1").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let still_there: i64 = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cash_accounts WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_there, 1, "the account must survive a check that could not run");
+    }
+
+    /// Changing the currency reinterprets every amount already in the ledger, so
+    /// an unreadable balance has to block the change rather than wave it through.
+    #[actix_web::test]
+    async fn a_currency_change_is_refused_when_the_balance_cannot_be_read() {
+        let (_file, db_path) = setup_test_db();
+        seed_cash_account(&db_path, 1, "Everyday", "AUD");
+        drop_table(&db_path, "cash_transactions");
+
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(update_cash_account),
+        )
+        .await;
+        let body = serde_json::json!({ "name": "Everyday", "currency": "USD", "include_in_portfolio": true });
+        let req = actix_web::test::TestRequest::put()
+            .uri("/api/cash/accounts/1")
+            .set_json(&body)
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let currency: String = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT currency FROM cash_accounts WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(currency, "AUD", "the amounts already recorded stay in the currency they were entered in");
+    }
+
     fn seed_cash_account(db_path: &PathBuf, id: i64, name: &str, currency: &str) {
         let conn = open_db(db_path).unwrap();
         conn.execute(
@@ -10535,7 +10641,7 @@ mod tests {
 
         // Balance is derived, never stored
         let conn = open_db(&db_path).unwrap();
-        assert!((cash_balance(&conn, 1, None) - (-419.0)).abs() < 1e-9);
+        assert!((cash_balance(&conn, 1, None).unwrap() - (-419.0)).abs() < 1e-9);
     }
 
     /// A trade naming no account leaves the ledger alone — which is every one
@@ -10585,7 +10691,7 @@ mod tests {
         assert!(remove_holding_transaction(&db_path, record.id).unwrap());
         assert!(cash_legs(&db_path, record.id).is_empty());
         let conn = open_db(&db_path).unwrap();
-        assert_eq!(cash_balance(&conn, 1, None), 0.0);
+        assert_eq!(cash_balance(&conn, 1, None).unwrap(), 0.0);
     }
 
     /// Brokerage is stored in AUD, so a foreign settlement has to convert it
@@ -11335,9 +11441,9 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(cash_balance(&conn, 1, Some("2026-01-15")), 1000.0);
-        assert_eq!(cash_balance(&conn, 1, Some("2026-02-01")), 2000.0);
-        assert!((cash_balance(&conn, 1, None) - 2004.10).abs() < 1e-9);
+        assert_eq!(cash_balance(&conn, 1, Some("2026-01-15")).unwrap(), 1000.0);
+        assert_eq!(cash_balance(&conn, 1, Some("2026-02-01")).unwrap(), 2000.0);
+        assert!((cash_balance(&conn, 1, None).unwrap() - 2004.10).abs() < 1e-9);
     }
 
     /// Editing is allowed for hand-entered rows, but not for the two kinds the
@@ -11828,6 +11934,53 @@ mod tests {
         let (status, resp) = call_write(&db_path, "DELETE", "/api/holdings/99999", None).await;
         assert_eq!(status, 404);
         assert_eq!(resp["error"]["code"], "not_found");
+    }
+
+    /// The normal path, so the fix is not just "never deletes anything": the
+    /// symbol row goes when its last membership goes, and stays while another
+    /// list still holds it.
+    #[test]
+    fn the_symbol_row_follows_its_last_membership() {
+        let (_file, db_path) = setup_test_db();
+        seed_watchlist_entry(&db_path, "TST.AX", &["BuyList", "Watching"]);
+        let ids: Vec<i64> = {
+            let conn = open_db(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id FROM watchlist_memberships WHERE symbol = 'TST.AX' ORDER BY id")
+                .unwrap();
+            let v = stmt.query_map([], |r| r.get(0)).unwrap().flatten().collect();
+            v
+        };
+
+        assert!(remove_watchlist_symbol(&db_path, ids[0]).unwrap());
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (1, 1), "one list left, so the symbol stays");
+
+        assert!(remove_watchlist_symbol(&db_path, ids[1]).unwrap());
+        assert_eq!(watchlist_rows(&db_path, "TST.AX"), (0, 0), "last one gone, so the symbol goes too");
+    }
+
+    /// The cleanup delete used to be `let _ = …`, so a failure to remove the
+    /// symbol row was reported as success. Dropping `watchlist_symbols` reaches
+    /// that exact line: everything before it succeeds, and only the final delete
+    /// fails.
+    ///
+    /// The sibling guard — the remaining-membership count, which used to default
+    /// to zero and so read a failed query as "none left" — cannot be isolated the
+    /// same way: every query before it reads the same table, so any fault that
+    /// reaches the count has already failed the function earlier. It is fixed and
+    /// covered by inspection rather than by this test.
+    #[test]
+    fn a_failed_cleanup_is_reported_rather_than_swallowed() {
+        let (_file, db_path) = setup_test_db();
+        seed_watchlist_entry(&db_path, "TST.AX", &["BuyList"]);
+        let id: i64 = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT id FROM watchlist_memberships WHERE symbol = 'TST.AX'", [], |r| r.get(0))
+            .unwrap();
+        drop_table(&db_path, "watchlist_symbols");
+
+        let result = remove_watchlist_symbol(&db_path, id);
+        assert!(result.is_err(), "a cleanup that could not run must not report success");
     }
 
     fn seed_watchlist_entry(db_path: &PathBuf, symbol: &str, lists: &[&str]) {
