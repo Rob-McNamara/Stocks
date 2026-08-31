@@ -4316,6 +4316,23 @@ fn manual_prices(conn: &Connection) -> HashMap<String, f64> {
         .unwrap_or_default()
 }
 
+/// Cached live quotes, keyed by symbol, in the symbol's own currency.
+///
+/// The daily bars stop at the last close the fetcher stored, which is often
+/// yesterday. Past that point the portfolio is worth what it is quoted at now —
+/// the same figure the Holdings screen and the Dashboard's Stock Value card
+/// report — so the value chart has to end on it too, or its last point
+/// disagrees with the headline beside it.
+fn cached_quote_prices(conn: &Connection) -> HashMap<String, f64> {
+    let mut stmt = match conn.prepare("SELECT symbol, price FROM cached_current_prices WHERE price > 0") {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
 /// The most recent stored bar for each symbol, as `(close, date)`.
 ///
 /// Used when the live feed has nothing to say — a delisted symbol keeps its
@@ -4479,6 +4496,11 @@ fn build_portfolio_history(
             .collect()
     };
     let manual = manual_prices(conn);
+    let quotes = cached_quote_prices(conn);
+    // A stored bar exists for today as soon as the fetcher has run, but it is
+    // the day's close-so-far, not the live quote the rest of the app shows. On
+    // today's point only, the quote wins; every earlier day stays on its bar.
+    let today = Utc::now().format("%Y-%m-%d").to_string();
     let mut prices: HashMap<String, SeriesCursor> = symbols
         .iter()
         .map(|s| (s.clone(), SeriesCursor::new(load_close_series(conn, s))))
@@ -4548,24 +4570,37 @@ fn build_portfolio_history(
             if *held <= 0.0 {
                 continue;
             }
-            // Past the last real bar, a manual valuation wins over a stale close.
+            // Past the last real bar there is no close for the day, so the
+            // live quote stands in, then a manual valuation, then the last
+            // stored close. That is the order the holdings endpoint uses, and
+            // matching it is what keeps the chart's final point equal to the
+            // Stock Value shown above it.
+            let latest = || quotes.get(symbol).copied().or_else(|| manual.get(symbol).copied());
             let close = match prices.get_mut(symbol) {
                 Some(cursor) => {
                     let stored = cursor.value_on(&day);
-                    if cursor.is_past_end(&day) {
-                        manual.get(symbol).copied().or(stored)
-                    } else {
-                        stored
-                    }
+                    if day == today || cursor.is_past_end(&day) { latest().or(stored) } else { stored }
                 }
-                None => manual.get(symbol).copied(),
+                None => latest(),
             };
             let Some(close) = close else { continue };
             let currency = symbol_currency.get(symbol).cloned().unwrap_or_else(|| "AUD".to_string());
+            // The FX bars stop with the price bars, and past that point the
+            // holdings endpoint converts at the live rate. Following it here is
+            // what makes the two agree: with a stale daily bar instead, every
+            // foreign holding lands a fraction out and the chart's last point
+            // drifts from the Stock Value beside it.
             let rate = if currency == "AUD" {
                 Some(1.0)
             } else {
-                rates.get_mut(&currency).and_then(|c| c.value_on(&day))
+                let live = || quotes.get(&fx_pair_symbol(&currency)).copied();
+                match rates.get_mut(&currency) {
+                    Some(cursor) => {
+                        let stored = cursor.value_on(&day);
+                        if day == today || cursor.is_past_end(&day) { live().or(stored) } else { stored }
+                    }
+                    None => live(),
+                }
             };
             let Some(rate) = rate else { continue };
             stocks += held * close * rate;
@@ -10176,6 +10211,65 @@ mod tests {
         // rather than fail — it has to be refused on the way in.
         assert!(validate_config_value(PORTFOLIO_HISTORY_START, "01/01/2025").is_err());
         assert!(validate_config_value(PORTFOLIO_HISTORY_START, "last year").is_err());
+    }
+
+    /// The chart's last point and the Stock Value beside it are the same
+    /// portfolio at the same moment, so they have to be the same number.
+    ///
+    /// They were not. A bar exists for today as soon as the fetcher runs, and
+    /// the history used it while the holdings endpoint used the live quote —
+    /// separately for the price and for the FX rate, so every foreign holding
+    /// landed a fraction out.
+    #[actix_web::test]
+    async fn the_charts_last_point_matches_the_holdings_total() {
+        let (_file, db_path) = setup_test_db();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+             VALUES (1, 'USX', 'purchase', '2026-01-05', 10.0, 150.0, 0.0, '2026-01-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('USX', 'USD', 'x')",
+            [],
+        )
+        .unwrap();
+
+        // A bar for today exists for both the stock and the rate — and both are
+        // stale relative to the quotes the holdings endpoint reads.
+        for (sym, close) in [("USX", 100.0), ("USDAUD=X", 1.5)] {
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, 'x')",
+                params![sym, today, close],
+            )
+            .unwrap();
+        }
+        for (sym, price) in [("USX", 110.0), ("USDAUD=X", 1.6)] {
+            conn.execute(
+                "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![sym, price, format!("{}T23:00:00Z", today), today],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let holdings = get_json(&db_path, "/api/portfolio/holdings").await;
+        let total: f64 = holdings["holdings"].as_array().unwrap()
+            .iter().map(|h| h["current_value"].as_f64().unwrap()).sum();
+
+        let history = history_json(&db_path, "/api/portfolio/history").await;
+        let last = history["series"].as_array().unwrap().last().unwrap();
+
+        // 10 × 110 × 1.6, not 10 × 100 × 1.5.
+        assert!((total - 1760.0).abs() < 0.01, "holdings should price at the quote, got {total}");
+        assert!(
+            (last["stocks"].as_f64().unwrap() - total).abs() < 0.01,
+            "chart ends at {}, holdings say {total}",
+            last["stocks"]
+        );
     }
 
     /// A weekly indicator crossed in days must use the last *completed* week.
