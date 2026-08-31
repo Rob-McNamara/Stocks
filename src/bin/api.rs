@@ -11661,12 +11661,12 @@ mod tests {
         assert_eq!(fx_rate_on(&conn, "GBP", "2026-08-07"), None);
     }
 
-    /// The EMA must match `calculateEMA` in the web client, or the Analysis
-    /// table and the chart's overlay would disagree for the same symbol.
-    #[test]
     /// A 40-week EMA is not a 200-day EMA. The weekly figure steps once a week
     /// from one close per week, so it is far less sensitive to a single day's
     /// move — using daily bars would quietly report a different indicator.
+    ///
+    /// It must also match `calculateEMA` in the web client, or the Analysis
+    /// table and the chart's overlay would disagree for the same symbol.
     #[test]
     fn weekly_ema_collapses_to_one_close_per_week() {
         let (_file, db_path) = setup_test_db();

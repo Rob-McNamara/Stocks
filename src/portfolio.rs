@@ -446,44 +446,6 @@ pub fn group_by_symbol(txs: &[PortfolioTx]) -> Vec<(String, Vec<PortfolioTx>)> {
     order.into_iter().map(|s| { let g = groups.remove(&s).unwrap_or_default(); (s, g) }).collect()
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct PortfolioPl {
-    pub holdings_pl: f64,
-    pub sold_pl: f64,
-    pub total_pl: f64,
-    pub total_value: f64,
-    pub stock_count: usize,
-}
-
-/// Portfolio-level P/L matching what Holdings + Sold Stocks screens show
-/// combined. `price_map` holds the current AUD price per symbol (None when
-/// unavailable — the position then contributes zero value).
-pub fn calc_portfolio_pl(transactions: &[PortfolioTx], price_map: &HashMap<String, Option<f64>>) -> PortfolioPl {
-    let mut holdings_pl = 0.0;
-    let mut sold_pl = 0.0;
-    let mut total_value = 0.0;
-    let mut stock_count = 0;
-
-    for (symbol, txs) in group_by_symbol(transactions) {
-        let pos = calc_symbol_position(&txs);
-
-        if pos.remaining_shares > 0.0 {
-            stock_count += 1;
-            let price = price_map.get(&symbol).copied().flatten();
-            let current_value = match price {
-                Some(p) if p != 0.0 => pos.remaining_shares * p,
-                _ => 0.0,
-            };
-            total_value += current_value;
-            holdings_pl += current_value - pos.remaining_cost + pos.dividends;
-        }
-
-        sold_pl += pos.sold_pl();
-    }
-
-    PortfolioPl { holdings_pl, sold_pl, total_pl: holdings_pl + sold_pl, total_value, stock_count }
-}
-
 /// For each purchase transaction, how many of its shares remain unsold after
 /// FIFO matching. Keyed by transaction id; 0 means fully consumed by sales.
 pub fn calc_remaining_by_lot(transactions: &[PortfolioTx]) -> HashMap<i64, f64> {
@@ -920,10 +882,6 @@ mod tests {
         tx
     }
 
-    fn price_map(pairs: &[(&str, Option<f64>)]) -> HashMap<String, Option<f64>> {
-        pairs.iter().map(|(s, p)| (s.to_string(), *p)).collect()
-    }
-
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.005
     }
@@ -1081,92 +1039,101 @@ mod tests {
     // -- calcPortfolioPL ----------------------------------------------------
 
     #[test]
-    fn portfolio_active_holding_with_price() {
+    fn an_open_position_carries_its_cost_and_nothing_realised() {
         let txs = vec![make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0))];
-        let result = calc_portfolio_pl(&txs, &price_map(&[("TST.AX", Some(15.0))]));
-        assert!(close(result.holdings_pl, 500.0));
-        assert_eq!(result.sold_pl, 0.0);
-        assert!(close(result.total_pl, 500.0));
-        assert!(close(result.total_value, 1500.0));
-        assert_eq!(result.stock_count, 1);
+        let pos = calc_symbol_position(&txs);
+        assert_eq!(pos.remaining_shares, 100.0);
+        assert!(close(pos.remaining_cost, 1000.0));
+        assert_eq!(pos.sold_pl(), 0.0);
+        // What the portfolio total then makes of it: 100 × 15 − 1000.
+        assert!(close(pos.remaining_shares * 15.0 - pos.remaining_cost + pos.dividends, 500.0));
+    }
+
+    /// An unpriced holding is valued at zero by the caller, so its whole cost
+    /// shows as a loss. The position still reports that cost in full.
+    #[test]
+    fn an_unpriced_position_still_reports_its_cost() {
+        let txs = vec![make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0))];
+        let pos = calc_symbol_position(&txs);
+        assert!(close(pos.remaining_cost, 1000.0));
+        assert!(close(0.0 - pos.remaining_cost + pos.dividends, -1000.0));
     }
 
     #[test]
-    fn portfolio_no_price_contributes_zero_value() {
-        let txs = vec![make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0))];
-        let result = calc_portfolio_pl(&txs, &price_map(&[("TST.AX", None)]));
-        assert_eq!(result.total_value, 0.0);
-        assert!(close(result.holdings_pl, -1000.0));
-    }
-
-    #[test]
-    fn portfolio_fully_sold_adds_to_sold_pl() {
+    fn a_closed_position_is_all_realised_and_holds_nothing() {
         let txs = vec![
             make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)),
             make_tx(2, "sale", "2024-06-01", Some(100.0), Some(15.0)),
         ];
-        let result = calc_portfolio_pl(&txs, &HashMap::new());
-        assert!(close(result.sold_pl, 500.0));
-        assert_eq!(result.holdings_pl, 0.0);
-        assert_eq!(result.stock_count, 0);
+        let pos = calc_symbol_position(&txs);
+        assert!(close(pos.sold_pl(), 500.0));
+        assert_eq!(pos.remaining_shares, 0.0, "nothing left to count toward holdings");
+        assert_eq!(pos.remaining_cost, 0.0);
     }
 
     #[test]
-    fn portfolio_partial_sale_splits_realised_unrealised() {
+    fn a_partial_sale_splits_realised_from_unrealised() {
         let txs = vec![
             make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)),
             make_tx(2, "sale", "2024-06-01", Some(40.0), Some(15.0)),
         ];
-        // 60 remain @ cost $600, price $18 → unrealised = 60*18 - 600 = 480
-        // 40 sold: proceeds 600, cost 400 → realised = 200
-        let result = calc_portfolio_pl(&txs, &price_map(&[("TST.AX", Some(18.0))]));
-        assert!(close(result.holdings_pl, 480.0));
-        assert!(close(result.sold_pl, 200.0));
-        assert!(close(result.total_pl, 680.0));
+        let pos = calc_symbol_position(&txs);
+        // 60 remain at a $600 cost; the 40 sold returned 600 against a 400 cost.
+        assert_eq!(pos.remaining_shares, 60.0);
+        assert!(close(pos.remaining_cost, 600.0));
+        assert!(close(pos.sold_pl(), 200.0));
+        // At $18 the two sides come to 480 + 200.
+        assert!(close(pos.remaining_shares * 18.0 - pos.remaining_cost + pos.sold_pl(), 680.0));
     }
 
     #[test]
-    fn portfolio_dividends_to_holdings_for_active_position() {
+    fn dividends_belong_to_the_holding_while_it_is_open() {
         let txs = vec![with_dividends_total(make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)), 50.0)];
-        let result = calc_portfolio_pl(&txs, &price_map(&[("TST.AX", Some(10.0))]));
-        // price = cost, so unrealised = 0; P/L = dividends = 50
-        assert!(close(result.holdings_pl, 50.0));
+        let pos = calc_symbol_position(&txs);
+        assert!(close(pos.dividends, 50.0));
+        assert_eq!(pos.sold_dividends, 0.0, "nothing has been sold, so nothing is attributed to the sold side");
     }
 
     #[test]
-    fn portfolio_dividends_to_sold_when_fully_closed() {
+    fn dividends_move_to_the_sold_side_once_the_position_closes() {
         let txs = vec![
             with_dividends_total(make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)), 60.0),
             make_tx(2, "sale", "2024-06-01", Some(100.0), Some(10.0)), // sold at cost
         ];
-        let result = calc_portfolio_pl(&txs, &HashMap::new());
-        assert!(close(result.sold_pl, 60.0));
+        let pos = calc_symbol_position(&txs);
+        assert!(close(pos.sold_dividends, 60.0));
+        assert!(close(pos.sold_pl(), 60.0), "sold at cost, so the dividends are the whole return");
     }
 
+    /// The double-count trap: a partly sold holding must not have its dividends
+    /// attributed to both sides.
     #[test]
-    fn portfolio_partial_sale_dividends_counted_once() {
+    fn a_partial_sale_does_not_count_dividends_twice() {
         let txs = vec![
             with_dividends_total(make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)), 50.0),
             make_tx(2, "sale", "2024-06-01", Some(40.0), Some(10.0)), // sold at cost
         ];
-        // 60 remain at price == cost → unrealised 0 + dividends 50; sold at cost → 0.
-        // Total P/L must be exactly $50, not $100.
-        let result = calc_portfolio_pl(&txs, &price_map(&[("TST.AX", Some(10.0))]));
-        assert!(close(result.holdings_pl, 50.0));
-        assert!(close(result.sold_pl, 0.0));
-        assert!(close(result.total_pl, 50.0));
+        let pos = calc_symbol_position(&txs);
+        assert!(close(pos.dividends, 50.0));
+        assert_eq!(pos.sold_dividends, 0.0, "still open, so none of it is realised");
+        // Sold at cost and held at cost: the whole return is the $50, once.
+        assert!(close(pos.remaining_shares * 10.0 - pos.remaining_cost + pos.dividends + pos.sold_pl(), 50.0));
     }
 
+    /// Each symbol is positioned independently; the endpoint sums them. A gain
+    /// on one and a loss on the other must net, not cancel out inside a symbol.
     #[test]
-    fn portfolio_multiple_symbols_summed() {
-        let txs = vec![
-            with_symbol(make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)), "AAA.AX"),
-            with_symbol(make_tx(2, "purchase", "2024-01-01", Some(50.0), Some(20.0)), "BBB.AX"),
-        ];
-        let result = calc_portfolio_pl(&txs, &price_map(&[("AAA.AX", Some(12.0)), ("BBB.AX", Some(18.0))]));
-        // AAA: 100*(12-10) = 200; BBB: 50*(18-20) = -100
-        assert!(close(result.total_pl, 100.0));
-        assert_eq!(result.stock_count, 2);
+    fn positions_are_independent_per_symbol() {
+        let aaa = calc_symbol_position(&[with_symbol(
+            make_tx(1, "purchase", "2024-01-01", Some(100.0), Some(10.0)), "AAA.AX")]);
+        let bbb = calc_symbol_position(&[with_symbol(
+            make_tx(2, "purchase", "2024-01-01", Some(50.0), Some(20.0)), "BBB.AX")]);
+
+        let aaa_pl = aaa.remaining_shares * 12.0 - aaa.remaining_cost;
+        let bbb_pl = bbb.remaining_shares * 18.0 - bbb.remaining_cost;
+        assert!(close(aaa_pl, 200.0));
+        assert!(close(bbb_pl, -100.0));
+        assert!(close(aaa_pl + bbb_pl, 100.0));
     }
 
     // -- calcRemainingByLot -------------------------------------------------
@@ -1283,24 +1250,26 @@ mod tests {
     }
 
     #[test]
-    fn usd_active_holding_counted_in_portfolio() {
-        let txs = vec![spcx_purchase(1, "2026-01-15", 50.0, 2.244, 1.50)];
-        let result = calc_portfolio_pl(&txs, &price_map(&[("SPCX", Some(2.80))]));
-        assert_eq!(result.stock_count, 1);
-        assert!(close(result.total_value, 50.0 * 2.80));
-        assert!(close(result.holdings_pl, 27.80));
+    fn a_usd_holding_positions_on_its_aud_cost() {
+        let pos = calc_symbol_position(&[spcx_purchase(1, "2026-01-15", 50.0, 2.244, 1.50)]);
+        assert_eq!(pos.remaining_shares, 50.0);
+        assert!(close(pos.remaining_cost, 50.0 * 2.244), "cost is the AUD figure, not the USD one");
+        assert!(close(pos.remaining_shares * 2.80 - pos.remaining_cost, 27.80));
     }
 
+    /// A foreign and a domestic holding are positioned the same way, because
+    /// both arrive already converted to AUD.
     #[test]
-    fn usd_and_aud_stocks_coexist() {
-        let txs = vec![
-            spcx_purchase(1, "2026-01-15", 50.0, 2.244, 1.50),
-            with_symbol(make_tx(2, "purchase", "2026-02-01", Some(100.0), Some(45.0)), "CBA.AX"),
-        ];
-        let result = calc_portfolio_pl(&txs, &price_map(&[("SPCX", Some(2.80)), ("CBA.AX", Some(48.0))]));
-        assert_eq!(result.stock_count, 2);
-        // SPCX: 50*(2.80-2.244)=27.80  CBA: 100*(48-45)=300
-        assert!(close(result.holdings_pl, 327.80));
+    fn usd_and_aud_positions_are_measured_alike() {
+        let spcx = calc_symbol_position(&[spcx_purchase(1, "2026-01-15", 50.0, 2.244, 1.50)]);
+        let cba = calc_symbol_position(&[with_symbol(
+            make_tx(2, "purchase", "2026-02-01", Some(100.0), Some(45.0)), "CBA.AX")]);
+
+        let spcx_pl = spcx.remaining_shares * 2.80 - spcx.remaining_cost;
+        let cba_pl = cba.remaining_shares * 48.0 - cba.remaining_cost;
+        assert!(close(spcx_pl, 27.80));
+        assert!(close(cba_pl, 300.0));
+        assert!(close(spcx_pl + cba_pl, 327.80));
     }
 
     // -- Full-dataset regression (SPCX missing from Active Holdings) ---------
