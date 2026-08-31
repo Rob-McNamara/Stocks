@@ -17,6 +17,9 @@ interface ConfigPanelProps {
 }
 
 
+/** Used when the model field is cleared, and as its placeholder. */
+const AI_MODEL_FALLBACK = 'claude-sonnet-4-20250514'
+
 export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelProps) {
   const [config, setConfig] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
@@ -48,21 +51,59 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   // missing value as 'price', so the editor shows the same default.
   const [newDashListCompare, setNewDashListCompare] = useState<'price' | 'volume'>('price')
 
-  // The API validates these definitions and can refuse the write. Without the
-  // rollback the panel would keep showing a list the server never stored, and
-  // without the banner the refusal would vanish entirely.
-  const saveDashboardLists = async (next: typeof dashboardLists) => {
-    const previous = dashboardLists
-    setDashboardLists(next)
+  /**
+   * Save one of the JSON config lists.
+   *
+   * The API validates all three of these keys and can refuse the write, so the
+   * panel shows the change straight away and puts it back if the server says
+   * no. Without the rollback it would keep displaying a list that was never
+   * stored; without the banner the refusal would vanish into an unhandled
+   * rejection, and the change would simply be gone on the next reload.
+   */
+  const saveConfigList = async <T,>(
+    key: string,
+    next: T,
+    previous: T,
+    apply: (value: T) => void,
+    describe: string,
+  ) => {
+    apply(next)
     try {
       setError(null)
-      await apiClient.updateConfig('dashboard_custom_lists', JSON.stringify(next))
+      await apiClient.updateConfig(key, JSON.stringify(next))
       onConfigChanged?.()
     } catch (err) {
-      setDashboardLists(previous)
-      setError(err instanceof Error ? err.message : 'Failed to save dashboard lists')
+      apply(previous)
+      setError(err instanceof Error ? err.message : `Failed to save ${describe}`)
     }
   }
+
+  /**
+   * Save a single scalar setting. The local copy is updated only once the
+   * server has accepted it, so the panel never shows a value that was not
+   * stored — and a refusal reaches the banner rather than being lost to an
+   * unhandled rejection.
+   */
+  const saveSetting = async (key: string, value: string, describe: string, after?: () => void) => {
+    try {
+      setError(null)
+      await apiClient.updateConfig(key, value)
+      setConfig((c) => ({ ...c, [key]: value }))
+      onConfigChanged?.()
+      after?.()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to save ${describe}`)
+    }
+  }
+
+  const saveDashboardLists = (next: typeof dashboardLists) =>
+    saveConfigList('dashboard_custom_lists', next, dashboardLists, setDashboardLists, 'the dashboard lists')
+
+  const saveWatchlistFields = (next: typeof customFieldDefs) =>
+    saveConfigList('watchlist_custom_fields', next, customFieldDefs, setCustomFieldDefs, 'the watchlist fields')
+
+  const saveHoldingsFields = (next: typeof holdingsFieldDefs) =>
+    saveConfigList('holdings_custom_fields', next, holdingsFieldDefs, setHoldingsFieldDefs, 'the holdings fields')
   const [newDashListLimit, setNewDashListLimit] = useState('15')
   const [newDashListSort, setNewDashListSort] = useState<'asc' | 'desc'>('asc')
   const [editingDashListIndex, setEditingDashListIndex] = useState<number | null>(null)
@@ -459,10 +500,8 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                           className="btn btn-danger btn-small"
                           onClick={async () => {
                             const next = customFieldDefs.filter((_, j) => j !== i)
-                            setCustomFieldDefs(next)
                             setEditingWatchlistFieldIndex(null)
-                            await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
-                            onConfigChanged?.()
+                            await saveWatchlistFields(next)
                           }}
                         >
                           Remove
@@ -505,19 +544,15 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     const next = customFieldDefs.map((d, j) =>
                       j === editingWatchlistFieldIndex ? { ...d, label: newFieldLabel.trim(), type: newFieldType } : d
                     )
-                    setCustomFieldDefs(next)
                     setEditingWatchlistFieldIndex(null)
                     setNewFieldLabel('')
-                    await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
-                    onConfigChanged?.()
+                    await saveWatchlistFields(next)
                   } else {
                     const key = newFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
                     if (!key || customFieldDefs.some((d) => d.key === key) || builtInWatchlistKeys.includes(key)) return
                     const next = [...customFieldDefs, { key, label: newFieldLabel.trim(), type: newFieldType }]
-                    setCustomFieldDefs(next)
                     setNewFieldLabel('')
-                    await apiClient.updateConfig('watchlist_custom_fields', JSON.stringify(next))
-                    onConfigChanged?.()
+                    await saveWatchlistFields(next)
                   }
                 }}
               >
@@ -571,10 +606,8 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                           className="btn btn-danger btn-small"
                           onClick={async () => {
                             const next = holdingsFieldDefs.filter((_, j) => j !== i)
-                            setHoldingsFieldDefs(next)
                             setEditingHoldingsFieldIndex(null)
-                            await apiClient.updateConfig('holdings_custom_fields', JSON.stringify(next))
-                            onConfigChanged?.()
+                            await saveHoldingsFields(next)
                           }}
                         >
                           Remove
@@ -638,21 +671,17 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     const next = holdingsFieldDefs.map((d, j) =>
                       j === editingHoldingsFieldIndex ? { ...d, label: newHoldingsFieldLabel.trim(), type: newHoldingsFieldType, actions: [...newHoldingsFieldActions] } : d
                     )
-                    setHoldingsFieldDefs(next)
                     setEditingHoldingsFieldIndex(null)
                     setNewHoldingsFieldLabel('')
                     setNewHoldingsFieldActions(['purchase'])
-                    await apiClient.updateConfig('holdings_custom_fields', JSON.stringify(next))
-                    onConfigChanged?.()
+                    await saveHoldingsFields(next)
                   } else {
                     const key = newHoldingsFieldLabel.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
                     if (!key || holdingsFieldDefs.some((d) => d.key === key) || builtInHoldingsKeys.includes(key)) return
                     const next = [...holdingsFieldDefs, { key, label: newHoldingsFieldLabel.trim(), type: newHoldingsFieldType, actions: [...newHoldingsFieldActions] }]
-                    setHoldingsFieldDefs(next)
                     setNewHoldingsFieldLabel('')
                     setNewHoldingsFieldActions(['purchase'])
-                    await apiClient.updateConfig('holdings_custom_fields', JSON.stringify(next))
-                    onConfigChanged?.()
+                    await saveHoldingsFields(next)
                   }
                 }}
               >
@@ -1054,11 +1083,7 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                   <label style={{ fontSize: 12, color: '#666' }}>Provider</label>
                   <select
                     value={config['ai_provider'] ?? 'anthropic'}
-                    onChange={async (e) => {
-                      await apiClient.updateConfig('ai_provider', e.target.value)
-                      setConfig((c) => ({ ...c, ai_provider: e.target.value }))
-                      onConfigChanged?.()
-                    }}
+                    onChange={(e) => void saveSetting('ai_provider', e.target.value, 'the AI provider')}
                     className="config-input"
                   >
                     <option value="anthropic">Anthropic (Claude)</option>
@@ -1071,14 +1096,13 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                     type="password"
                     value={config['ai_api_key'] ?? ''}
                     onChange={(e) => setConfig((c) => ({ ...c, ai_api_key: e.target.value }))}
-                    onBlur={async (e) => {
-                      if (e.target.value) {
-                        await apiClient.updateConfig('ai_api_key', e.target.value)
+                    onBlur={(e) => {
+                      if (!e.target.value) return
+                      void saveSetting('ai_api_key', e.target.value, 'the API key', () => {
                         setConfig((c) => ({ ...c, ai_api_key_configured: 'true' }))
-                        onConfigChanged?.()
                         setSuccess('API key saved')
                         setTimeout(() => setSuccess(null), 3000)
-                      }
+                      })
                     }}
                     placeholder={config['ai_api_key_configured'] === 'true' ? '•••••••• (configured — enter to replace)' : 'Enter API key...'}
                     className="config-input"
@@ -1088,13 +1112,12 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                   <label style={{ fontSize: 12, color: '#666' }}>Model</label>
                   <input
                     type="text"
-                    value={config['ai_model'] ?? 'claude-sonnet-4-20250514'}
+                    value={config['ai_model'] ?? AI_MODEL_FALLBACK}
                     onChange={(e) => setConfig((c) => ({ ...c, ai_model: e.target.value }))}
-                    onBlur={async (e) => {
-                      await apiClient.updateConfig('ai_model', e.target.value || 'claude-sonnet-4-20250514')
-                      onConfigChanged?.()
-                    }}
-                    placeholder="claude-sonnet-4-20250514"
+                    onBlur={(e) =>
+                      void saveSetting('ai_model', e.target.value || AI_MODEL_FALLBACK, 'the AI model')
+                    }
+                    placeholder={AI_MODEL_FALLBACK}
                     className="config-input"
                     style={{ width: 250 }}
                   />
