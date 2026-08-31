@@ -33,6 +33,24 @@ Deliberate exclusions — do **not** add triggers to these:
 
 The test for whether something needs auditing: **if a user typed it, it must be audited.** Machine-fetched data that can be re-derived from an external source does not.
 
+### Tables that are not part of the schema
+
+The rule above covers the tables `init_db()` creates. One more may exist in a
+database and is **not** one of them:
+
+- `watchlist_prices` — daily OHLC bars, superseded by `prices`. `init_db()` has
+  not created it for some time and nothing writes to it, so a database created
+  today has 18 tables and no such table; one carried forward from an older
+  version still has it, holding whatever it held when writes stopped.
+
+It needs no triggers, and adding them would be wrong: a fresh database would
+never run them. It is listed in `SYMBOL_KEYED_TABLES` so a symbol rename still
+migrates rows in the databases that have it, and that loop skips any table
+`sqlite_master` does not report — which is why its absence is harmless.
+
+Do not read its lack of triggers as the drift this section warns about. If it is
+ever dropped for good, remove it from `SYMBOL_KEYED_TABLES` at the same time.
+
 ## Error and Warning Logging
 
 Any error or warning condition in the backend **must** be recorded in the `event_log` table via `insert_event_log()`. This applies to:
