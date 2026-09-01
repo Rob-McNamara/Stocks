@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { apiClient, type HindsightRow, type HindsightPoint, type HindsightStatus } from '../services/api'
 
 // Thin client: every figure here is computed by the API (GET /api/hindsight),
@@ -42,6 +42,9 @@ function outcomeColor(delta: number | null): string {
   if (delta === null || delta === 0) return '#666'
   return delta > 0 ? '#f44336' : '#4caf50'
 }
+
+/** Never squeeze the table smaller than this, however short the window. */
+const MIN_TABLE_HEIGHT = 240
 
 type WindowKey = (typeof WINDOWS)[number]['key']
 type SortState = { key: WindowKey; dir: 'desc' | 'asc' }
@@ -124,8 +127,66 @@ export default function Hindsight({
 }) {
   const [rows, setRows] = useState<HindsightRow[]>([])
   const [sort, setSort] = useState<SortState | null>(null)
+  const wrapperRef = useRef<HTMLDivElement>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  /**
+   * Bound the table so it scrolls inside its own box instead of scrolling the
+   * screen out from under its header.
+   *
+   * A sticky header sticks to its scroll container, and the wrapper is already
+   * one — `overflow-x: auto` makes `overflow-y` compute to `auto` as well.
+   * Left unbounded it never actually scrolls, so the header never sticks;
+   * `.app-content` scrolls instead and carries the header away with the card.
+   *
+   * Measured against `.app-content` rather than the window because that is the
+   * element that actually scrolls here — the page itself never does. Its bottom
+   * edge is the only honest limit, and it already accounts for the header, the
+   * tab bar and the footer without this having to know their heights. A CSS
+   * calc would have to guess at all three, and at the caption, which rewraps as
+   * the window narrows.
+   */
+  const fit = useCallback(() => {
+    const el = wrapperRef.current
+    if (!el) return
+    // No box at all while the screen sits behind an inactive tab, where the
+    // panel is display:none and there is nothing to measure.
+    if (el.getBoundingClientRect().top <= 0) return
+    const scroller = el.closest('.app-content')
+    if (!scroller) return
+
+    // Derived from the overflow rather than from the heights of the app header,
+    // the tab bar, the card padding and the caption — four numbers this has no
+    // business knowing, one of which changes as the caption rewraps.
+    //
+    // The constraint is released before measuring, so every call starts from
+    // the table's natural height. Measuring the constrained element instead
+    // only ever shrinks it: `scrollHeight - clientHeight` cannot go negative,
+    // so a table once squeezed to the floor by a small window would stay there
+    // when the window grew again. Releasing first is what lets it grow back.
+    //
+    // Both reads happen inside a layout effect, so the reflow is synchronous
+    // and resolved before the browser paints — the released state is never seen.
+    el.style.maxHeight = ''
+    const natural = el.clientHeight
+    const overrun = scroller.scrollHeight - scroller.clientHeight
+    el.style.maxHeight = `${Math.max(MIN_TABLE_HEIGHT, natural - overrun)}px`
+  }, [])
+
+  // Deliberately no dependency array: this has to run after *every* render,
+  // because switching to this tab re-renders the parent without changing
+  // anything this component owns. That render is the moment the panel stops
+  // being display:none and there is finally a box to measure. An
+  // IntersectionObserver would be the tidier trigger, but it does not fire
+  // reliably everywhere, and a measurement that silently never runs leaves the
+  // table unbounded — the exact bug this is fixing.
+  useLayoutEffect(fit)
+
+  useEffect(() => {
+    window.addEventListener('resize', fit)
+    return () => window.removeEventListener('resize', fit)
+  }, [fit])
 
   useEffect(() => {
     const load = async () => {
@@ -223,7 +284,7 @@ export default function Hindsight({
         ) : rows.length === 0 ? (
           <p className="empty-text">No sales recorded yet — nothing to second-guess.</p>
         ) : (
-          <div className="holdings-table-wrapper">
+          <div className="holdings-table-wrapper" ref={wrapperRef}>
             <table className="holdings-table">
               <thead>
                 <tr>
