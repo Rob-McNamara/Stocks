@@ -1574,6 +1574,36 @@ fn store_dividend_events_for_symbol(db_path: &PathBuf, symbol: &str, events: &[D
     Ok(())
 }
 
+/// Symbols sold out of entirely — nothing held, but at least one sale.
+///
+/// Price collection otherwise follows what is held and what is watched, so an
+/// exited position stops being priced the day it leaves the watchlist. The
+/// Hindsight screen's whole question is what the stock did *after* the sale, so
+/// these have to keep being fetched: the quote answers "current price", and the
+/// daily bar each fetch also writes is what lets the +1 week, +6 week, +3 month
+/// and peak-since windows fill in as time passes.
+fn load_exited_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
+    let conn = open_db(db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT symbol,
+                    SUM(CASE WHEN transaction_type='purchase' THEN quantity ELSE -quantity END) AS net_qty,
+                    SUM(CASE WHEN transaction_type='sale' THEN 1 ELSE 0 END) AS sales
+             FROM holdings_transactions
+             WHERE transaction_type IN ('purchase', 'sale')
+             GROUP BY symbol
+             HAVING net_qty <= 0 AND sales > 0
+             ORDER BY symbol",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 fn load_holding_symbols(db_path: &PathBuf) -> Result<Vec<String>, String> {
     let conn = open_db(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn
@@ -2207,6 +2237,28 @@ async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<RefreshQuery
         }
     };
 
+    // Sold positions, so the Hindsight windows keep filling. Their own stamp:
+    // a stale quote on something sold last year is far less urgent than one on
+    // a holding, and separating them makes that visible rather than assumed.
+    let mut exited_ok = 0;
+    let exited_symbols = load_exited_symbols(&db_path).unwrap_or_default();
+    let exited_count = if exited_symbols.is_empty() {
+        0
+    } else {
+        match fetch_and_cache_current_prices(&db_path, &exited_symbols, "sold_prices_updated_at").await {
+            Ok(prices) => {
+                exited_ok = prices.iter().filter(|p| p.error.is_none()).count();
+                // A delisted symbol errors on every run for good reason, so its
+                // failure does not belong in the banner the user sees.
+                prices.len()
+            }
+            Err(err) => {
+                errors.push(err);
+                0
+            }
+        }
+    };
+
     let dividends = refresh_dividends_for_symbols(&db_path, holding_symbols).await;
     errors.extend(dividends.errors.clone());
 
@@ -2218,12 +2270,13 @@ async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<RefreshQuery
         }
     REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, dividends for {} symbols ({} error(s))", watchlist_ok, holdings_ok, dividends.updated, errors.len()));
+    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, {} sold prices, dividends for {} symbols ({} error(s))", watchlist_ok, holdings_ok, exited_ok, dividends.updated, errors.len()));
 
     HttpResponse::Ok().json(serde_json::json!({
         "skipped": false,
         "watchlist_prices": watchlist_count,
         "holdings_prices": holdings_count,
+        "sold_prices": exited_count,
         "dividends_updated": dividends.updated,
         "errors": errors,
     }))
@@ -7169,6 +7222,7 @@ async fn get_sync_state(db_path: web::Data<PathBuf>) -> impl Responder {
         "watchlist_prices_updated_at": config.get("watchlist_prices_updated_at"),
         "holdings_prices_updated_at": config.get("holdings_prices_updated_at"),
         "daily_prices_updated_at": config.get("daily_prices_updated_at"),
+        "sold_prices_updated_at": config.get("sold_prices_updated_at"),
         "last_full_refresh_at": config.get("last_full_refresh_at"),
         "server_time": Utc::now().to_rfc3339(),
     }))
@@ -7679,6 +7733,44 @@ mod tests {
 
         let symbols = load_holding_symbols(&db_path).unwrap();
         assert!(!symbols.contains(&"TST.AX".to_string()), "fully sold symbol should be excluded");
+    }
+
+    /// The two sets have to partition the symbols between them: a symbol priced
+    /// by neither stops being fetched, and one priced by both is fetched twice
+    /// every refresh.
+    #[test]
+    fn exited_and_held_symbols_do_not_overlap() {
+        let (_file, db_path) = setup_test_db();
+        // Fully sold.
+        insert_tx(&db_path, 1, "purchase", "2024-01-01", 100.0, 10.0, 0.0);
+        insert_tx(&db_path, 2, "sale", "2024-06-01", 100.0, 12.0, 0.0);
+
+        let exited = load_exited_symbols(&db_path).unwrap();
+        let held = load_holding_symbols(&db_path).unwrap();
+        assert_eq!(exited, vec!["TST.AX".to_string()]);
+        assert!(held.is_empty());
+        assert!(exited.iter().all(|s| !held.contains(s)));
+    }
+
+    /// A part-sold position is still held, so the holdings refresh already
+    /// prices it. Counting it as exited too would fetch it twice.
+    #[test]
+    fn a_partly_sold_holding_is_not_treated_as_exited() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2024-01-01", 100.0, 10.0, 0.0);
+        insert_tx(&db_path, 2, "sale", "2024-06-01", 40.0, 12.0, 0.0);
+
+        assert!(load_exited_symbols(&db_path).unwrap().is_empty());
+        assert_eq!(load_holding_symbols(&db_path).unwrap(), vec!["TST.AX".to_string()]);
+    }
+
+    /// A holding that was never sold is not exited — the sale is what makes it
+    /// interesting to Hindsight, not the absence of shares.
+    #[test]
+    fn a_never_sold_symbol_is_not_exited() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2024-01-01", 100.0, 10.0, 0.0);
+        assert!(load_exited_symbols(&db_path).unwrap().is_empty());
     }
 
     #[test]

@@ -400,6 +400,8 @@ export interface SyncState {
   config: string | null
   watchlist_prices_updated_at: string | null
   holdings_prices_updated_at: string | null
+  /** Sold positions are priced on their own schedule; Hindsight reads this. */
+  sold_prices_updated_at?: string | null
   /** Stamped by the price daemon's daily close run */
   daily_prices_updated_at: string | null
   last_full_refresh_at: string | null
@@ -753,7 +755,7 @@ export const apiClient = {
   },
 
   /** Server-debounced full data refresh (watchlist + holdings prices, dividends). */
-  async refreshAll(force = false): Promise<{ skipped: boolean; watchlist_prices?: number; holdings_prices?: number; dividends_updated?: number; errors?: string[] }> {
+  async refreshAll(force = false): Promise<{ skipped: boolean; watchlist_prices?: number; holdings_prices?: number; sold_prices?: number; dividends_updated?: number; errors?: string[] }> {
     const response = await apiFetch(`${API_BASE_URL}/refresh${force ? '?force=true' : ''}`, { method: 'POST' })
     if (!response.ok) {
       const message = await apiErrorMessage(response)
