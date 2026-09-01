@@ -43,6 +43,20 @@ function outcomeColor(delta: number | null): string {
   return delta > 0 ? '#f44336' : '#4caf50'
 }
 
+type WindowKey = (typeof WINDOWS)[number]['key']
+type SortState = { key: WindowKey; dir: 'desc' | 'asc' }
+
+/**
+ * Cycle a header: unsorted → biggest first → smallest first → back to the
+ * default. The third step matters because the default order is meaningful
+ * rather than arbitrary — most recent sale first — so there has to be a way
+ * back to it short of reloading the screen.
+ */
+function nextSort(current: SortState | null, key: WindowKey): SortState | null {
+  if (current?.key !== key) return { key, dir: 'desc' }
+  return current.dir === 'desc' ? { key, dir: 'asc' } : null
+}
+
 function money(value: number, currency: string): string {
   // Currency-aware rather than a bare $, because the rows are native and an
   // AUD figure sitting beside a USD one with the same glyph invites addition.
@@ -109,6 +123,7 @@ export default function Hindsight({
   holdingsVersion?: number
 }) {
   const [rows, setRows] = useState<HindsightRow[]>([])
+  const [sort, setSort] = useState<SortState | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -128,6 +143,30 @@ export default function Hindsight({
     }
     load()
   }, [holdingsVersion])
+
+  /**
+   * Sorted on the percentage, never the cash figure. The rows are native by
+   * design, so ranking a USD amount against an AUD one would be ordering the
+   * table by numbers that cannot be compared. The percentage is
+   * currency-neutral, and it is also the figure the cell shows first.
+   */
+  const sortedRows = useMemo(() => {
+    if (!sort) return rows
+    const pctOf = (r: HindsightRow) => r.points?.[sort.key]?.pct ?? null
+    return [...rows].sort((a, b) => {
+      const av = pctOf(a)
+      const bv = pctOf(b)
+      // A window still to come, or one the symbol never reached, has no figure
+      // at all. Those sink to the bottom whichever way the column is pointing —
+      // an absent value is not a small one.
+      if (av === null && bv === null) return b.sale_date.localeCompare(a.sale_date)
+      if (av === null) return 1
+      if (bv === null) return -1
+      if (av !== bv) return sort.dir === 'desc' ? bv - av : av - bv
+      // Ties fall back to the default order so the sort is deterministic.
+      return b.sale_date.localeCompare(a.sale_date)
+    })
+  }, [rows, sort])
 
   /**
    * Totalled per currency and never across them. The rows are native by
@@ -194,13 +233,46 @@ export default function Hindsight({
                   <th>Sale</th>
                   <th title="FIFO cost of the shares this sale consumed, brokerage included">Cost</th>
                   <th title="What the trade itself made, measured from the purchase">Trade</th>
-                  {WINDOWS.map((w) => (
-                    <th key={w.key}>{w.label}</th>
-                  ))}
+                  {WINDOWS.map((w) => {
+                    const active = sort?.key === w.key
+                    return (
+                      <th
+                        key={w.key}
+                        aria-sort={active ? (sort.dir === 'desc' ? 'descending' : 'ascending') : 'none'}
+                        style={{ padding: 0 }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setSort((prev) => nextSort(prev, w.key))}
+                          title={`Sort by ${w.label}${active && sort.dir === 'asc' ? ' — click again for the default order' : ''}`}
+                          style={{
+                            // A plain button so the column is reachable by
+                            // keyboard and shows focus, without looking like one.
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 4,
+                            width: '100%',
+                            padding: '12px 14px',
+                            background: 'none',
+                            border: 'none',
+                            font: 'inherit',
+                            color: 'inherit',
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                          }}
+                        >
+                          {w.label}
+                          <span style={{ fontSize: 10, color: active ? '#444' : '#bbb' }}>
+                            {active ? (sort.dir === 'desc' ? '▼' : '▲') : '⇅'}
+                          </span>
+                        </button>
+                      </th>
+                    )
+                  })}
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row, i) => (
+                {sortedRows.map((row, i) => (
                   <tr key={`${row.symbol}-${row.sale_date}-${i}`}>
                     <td>
                       <strong>{row.symbol}</strong>

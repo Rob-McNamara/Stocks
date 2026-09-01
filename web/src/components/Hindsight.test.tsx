@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor, cleanup, within } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
 import Hindsight from './Hindsight'
 import type { HindsightRow, HindsightPoint } from '../services/api'
 
@@ -177,5 +177,104 @@ describe('Hindsight', () => {
     getHindsight.mockRejectedValue(new Error('backend is down'))
     await renderScreen()
     expect(screen.getByText(/backend is down/)).toBeTruthy()
+  })
+})
+
+describe('sorting the window columns', () => {
+  /** Three sales whose +1 week outcomes rank C > A > B. */
+  const ranked = () => [
+    row({ symbol: 'A.AX', sale_date: '2025-03-01', points: { ...row().points, week1: point({ pct: 5, delta: 50 }) } }),
+    row({ symbol: 'B.AX', sale_date: '2025-02-01', points: { ...row().points, week1: point({ pct: -12, delta: -120 }) } }),
+    row({ symbol: 'C.AX', sale_date: '2025-01-01', points: { ...row().points, week1: point({ pct: 30, delta: 300 }) } }),
+  ]
+
+  const symbolOrder = () =>
+    [...document.querySelectorAll('.hindsight tbody tr')].map(
+      (r) => r.querySelector('strong')?.textContent ?? '',
+    )
+
+  const header = (label: string) => screen.getByRole('button', { name: new RegExp(label.replace('+', '\\+')) })
+
+  it('orders by the column, then reverses, then returns to the default', async () => {
+    getHindsight.mockResolvedValue(ranked())
+    await renderScreen()
+    // Default is whatever the server sent — most recent sale first.
+    expect(symbolOrder()).toEqual(['A.AX', 'B.AX', 'C.AX'])
+
+    fireEvent.click(header('+1 week'))
+    expect(symbolOrder()).toEqual(['C.AX', 'A.AX', 'B.AX'])
+
+    fireEvent.click(header('+1 week'))
+    expect(symbolOrder()).toEqual(['B.AX', 'A.AX', 'C.AX'])
+
+    // The default order is meaningful, so there is a way back to it.
+    fireEvent.click(header('+1 week'))
+    expect(symbolOrder()).toEqual(['A.AX', 'B.AX', 'C.AX'])
+  })
+
+  /**
+   * A window still to come has no figure at all. Treating it as zero would
+   * float it into the middle of the ranking as though it had been measured.
+   */
+  it('sinks rows with no figure to the bottom in both directions', async () => {
+    getHindsight.mockResolvedValue([
+      row({ symbol: 'HAS.AX', points: { ...row().points, week6: point({ pct: 4, delta: 40 }) } }),
+      row({
+        symbol: 'PENDING.AX',
+        points: { ...row().points, week6: point({ value: null, pct: null, delta: null, status: 'pending' }) },
+      }),
+      row({ symbol: 'NEG.AX', points: { ...row().points, week6: point({ pct: -9, delta: -90 }) } }),
+    ])
+    await renderScreen()
+
+    fireEvent.click(header('+6 weeks'))
+    expect(symbolOrder()).toEqual(['HAS.AX', 'NEG.AX', 'PENDING.AX'])
+
+    fireEvent.click(header('+6 weeks'))
+    expect(symbolOrder()).toEqual(['NEG.AX', 'HAS.AX', 'PENDING.AX'])
+  })
+
+  /**
+   * The rows are native currency, so ordering by the cash figure would rank a
+   * USD amount against an AUD one. Percentage is the only comparable measure,
+   * and here the two disagree: the AUD row moved further in percentage terms
+   * while the USD row moved more in raw dollars.
+   */
+  it('ranks on percentage, not on cash amounts from different currencies', async () => {
+    getHindsight.mockResolvedValue([
+      row({ symbol: 'BIGCASH', currency: 'USD', points: { ...row().points, current: point({ pct: 3, delta: 9000 }) } }),
+      row({ symbol: 'BIGPCT.AX', currency: 'AUD', points: { ...row().points, current: point({ pct: 40, delta: 120 }) } }),
+    ])
+    await renderScreen()
+
+    fireEvent.click(header('Now'))
+    expect(symbolOrder()).toEqual(['BIGPCT.AX', 'BIGCASH'])
+  })
+
+  it('switches cleanly from one column to another', async () => {
+    getHindsight.mockResolvedValue([
+      row({ symbol: 'X.AX', points: { ...row().points, week1: point({ pct: 1 }), month3: point({ pct: 99 }) } }),
+      row({ symbol: 'Y.AX', points: { ...row().points, week1: point({ pct: 50 }), month3: point({ pct: 2 }) } }),
+    ])
+    await renderScreen()
+
+    fireEvent.click(header('+1 week'))
+    expect(symbolOrder()).toEqual(['Y.AX', 'X.AX'])
+    // A different column starts fresh at biggest-first rather than inheriting
+    // the previous direction.
+    fireEvent.click(header('+3 months'))
+    expect(symbolOrder()).toEqual(['X.AX', 'Y.AX'])
+  })
+
+  it('marks the sorted column for assistive technology', async () => {
+    getHindsight.mockResolvedValue(ranked())
+    await renderScreen()
+    const th = () => header('+1 week').closest('th') as HTMLElement
+
+    expect(th().getAttribute('aria-sort')).toBe('none')
+    fireEvent.click(header('+1 week'))
+    expect(th().getAttribute('aria-sort')).toBe('descending')
+    fireEvent.click(header('+1 week'))
+    expect(th().getAttribute('aria-sort')).toBe('ascending')
   })
 })
