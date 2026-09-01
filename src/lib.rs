@@ -3,5 +3,6 @@
 //! calculation engine lives here so the API server is the single source of
 //! truth for money math.
 
+pub mod hindsight;
 pub mod indicators;
 pub mod portfolio;

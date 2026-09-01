@@ -218,6 +218,59 @@ pub fn calc_symbol_summary(txs: &[PortfolioTx]) -> SymbolSummary {
     SymbolSummary { symbol, lots, remaining_shares, remaining_cost, native_remaining_cost, total_sold_qty, realised_pl, dividends_total }
 }
 
+/// One sale, with the cost of the shares it actually consumed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaleCost {
+    pub date: String,
+    pub quantity: f64,
+    /// Sale price per share, in the symbol's own currency.
+    pub native_price: f64,
+    /// What those particular shares cost, per share and native, brokerage
+    /// included. `None` when the sale consumed no lot — a transaction recorded
+    /// without its matching purchase.
+    pub native_cost_per_share: Option<f64>,
+    pub brokerage: Option<f64>,
+}
+
+/// Walk a symbol's transactions and cost each sale against the lots it consumed.
+///
+/// The FIFO queue is stateful, so which shares a sale consumes depends on every
+/// sale before it. That makes per-sale cost something only a full walk can
+/// answer, and the walk has to be this one — a second implementation would be
+/// free to disagree with the holdings screens about the same trade.
+///
+/// Native throughout: a sale and the purchase behind it are the same instrument
+/// on the same exchange, and converting either through a moving rate would put
+/// a currency move inside a comparison meant to isolate the stock's own.
+pub fn sale_costs(txs: &[PortfolioTx]) -> Vec<SaleCost> {
+    let sorted = sort_transactions(txs);
+    let mut native_lots: Vec<Lot> = Vec::new();
+    let mut sales = Vec::new();
+
+    for tx in &sorted {
+        match (tx.tx_type, tx.quantity, tx.price) {
+            (TxType::Purchase, Some(qty), Some(price)) => {
+                let (_, native_lot) = purchase_lots(tx, qty, price);
+                native_lots.push(native_lot);
+            }
+            (TxType::Sale, Some(qty), Some(price)) if qty > 0.0 => {
+                let cost = apply_fifo_sale(&mut native_lots, qty);
+                sales.push(SaleCost {
+                    date: tx.date.clone(),
+                    quantity: qty,
+                    native_price: tx.native_price.unwrap_or(price),
+                    // A sale with no lot behind it consumes nothing and costs
+                    // nothing, which is not the same as having cost zero.
+                    native_cost_per_share: if cost > 0.0 { Some(cost / qty) } else { None },
+                    brokerage: tx.brokerage,
+                });
+            }
+            _ => {}
+        }
+    }
+    sales
+}
+
 /// Effective dividends for a symbol: the API-computed dividends_total when
 /// positive, otherwise the sum of manually recorded dividend transactions.
 /// Cost basis and dividends measured from a baseline date rather than from the
@@ -642,6 +695,61 @@ mod tests {
             brokerage: None,
             dividends_total: 0.0,
         }
+    }
+
+    /// Each sale is costed against the lots it actually consumed, so a symbol
+    /// bought twice at different prices and sold twice reports two different
+    /// costs rather than one blended average.
+    #[test]
+    fn sale_costs_follow_the_fifo_queue() {
+        let txs = vec![
+            tx(1, "purchase", "2025-01-01", 100.0, 10.0, None),
+            tx(2, "purchase", "2025-02-01", 100.0, 20.0, None),
+            tx(3, "sale", "2025-03-01", 100.0, 15.0, None), // eats the $10 lot
+            tx(4, "sale", "2025-04-01", 100.0, 25.0, None), // eats the $20 lot
+        ];
+        let sales = sale_costs(&txs);
+
+        assert_eq!(sales.len(), 2);
+        assert_eq!(sales[0].date, "2025-03-01");
+        assert_eq!(sales[0].native_cost_per_share, Some(10.0));
+        assert_eq!(sales[0].native_price, 15.0);
+        assert_eq!(sales[1].native_cost_per_share, Some(20.0), "not the 15.0 blended average");
+    }
+
+    /// A sale spanning two lots is costed on the weighted blend of both, which
+    /// is what FIFO actually consumed.
+    #[test]
+    fn a_sale_spanning_two_lots_blends_them() {
+        let txs = vec![
+            tx(1, "purchase", "2025-01-01", 100.0, 10.0, None),
+            tx(2, "purchase", "2025-02-01", 100.0, 20.0, None),
+            tx(3, "sale", "2025-03-01", 150.0, 30.0, None),
+        ];
+        let sales = sale_costs(&txs);
+        // 100 × $10 + 50 × $20 = $2,000 over 150 shares.
+        assert!((sales[0].native_cost_per_share.unwrap() - 13.333_333_333).abs() < 1e-6);
+    }
+
+    /// Brokerage on the buy is part of what the shares cost, so it has to reach
+    /// the per-sale figure the same way it reaches the holdings screens.
+    #[test]
+    fn sale_costs_include_purchase_brokerage() {
+        let mut buy = tx(1, "purchase", "2025-01-01", 100.0, 10.0, None);
+        buy.brokerage = Some(50.0);
+        let sales = sale_costs(&[buy, tx(2, "sale", "2025-03-01", 100.0, 15.0, None)]);
+
+        assert_eq!(sales[0].native_cost_per_share, Some(10.5), "$10 plus 50c a share of fee");
+    }
+
+    /// A sale recorded without its purchase consumes no lot. That is a gap in
+    /// the records, not a free acquisition, so it must not read as zero cost.
+    #[test]
+    fn a_sale_with_no_matching_purchase_has_no_cost() {
+        let sales = sale_costs(&[tx(1, "sale", "2025-03-01", 100.0, 15.0, None)]);
+
+        assert_eq!(sales.len(), 1);
+        assert_eq!(sales[0].native_cost_per_share, None);
     }
 
     /// Brokerage on a buy is part of what the shares cost. Leaving it out

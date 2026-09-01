@@ -5,6 +5,7 @@ use reqwest::Client;
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, path::PathBuf};
+use stocks::hindsight;
 use stocks::portfolio::{self, PortfolioTx, TxType};
 
 mod market;
@@ -2674,7 +2675,7 @@ impl utoipa::Modify for SecurityAddon {
     paths(
         health, get_meta, get_sync_state, openapi_spec,
         get_portfolio_holdings, get_portfolio_overview, get_portfolio_lots,
-        get_portfolio_sold, get_portfolio_risk,
+        get_portfolio_sold, get_portfolio_risk, get_hindsight,
         get_watchlist, get_watchlist_lists, get_watchlist_enriched,
         add_watchlist_symbol, update_watchlist_symbol, delete_watchlist_symbol,
         rename_watchlist_list, update_watchlist_symbol_lists,
@@ -2837,6 +2838,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_portfolio_lots)
             .service(get_portfolio_sold)
             .service(get_portfolio_risk)
+            .service(get_hindsight)
             .service(get_meta)
             .service(get_sync_state)
             .service(openapi_spec)
@@ -6310,6 +6312,145 @@ async fn build_portfolio_context(db_path: &PathBuf) -> Result<PortfolioContext, 
     Ok(PortfolioContext { groups, prices, info, fields, intl, etf, all_aud: all_aud_map, fx_rates })
 }
 
+/// Daily bars for one symbol from `from` onward, shaped for the hindsight
+/// engine. The floor keeps the query to the span actually being measured
+/// instead of every bar the symbol has ever had.
+fn load_bars_since(conn: &Connection, symbol: &str, from: &str) -> Vec<hindsight::Bar> {
+    let mut stmt = match conn.prepare(
+        "SELECT date, high, low, close FROM prices
+          WHERE symbol = ?1 AND date >= ?2 AND close IS NOT NULL
+          ORDER BY date",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![symbol, from], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<f64>>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, f64>(3)?,
+        ))
+    })
+    .map(|rows| {
+        rows.flatten()
+            .filter_map(|(date, high, low, close)| {
+                Some(hindsight::Bar {
+                    date: NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?,
+                    high,
+                    low,
+                    close,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// One sale, and what the shares did afterwards.
+#[derive(Serialize)]
+struct HindsightRow {
+    symbol: String,
+    /// Native throughout — the row never converts, so the client must not
+    /// assume AUD when rendering it.
+    currency: String,
+    sale_date: String,
+    quantity: f64,
+    sale_price: f64,
+    /// FIFO cost of the shares this sale consumed, brokerage included. `None`
+    /// where the matching purchase was never recorded.
+    purchase_price: Option<f64>,
+    /// What the trade itself made, per share, as a percentage. The six points
+    /// are measured against the sale price; this is the only figure looking
+    /// backward to the purchase.
+    realised_pct: Option<f64>,
+    delisted_on: Option<String>,
+    points: hindsight::Points,
+}
+
+/// Every sale, priced at six later moments.
+///
+/// Built on `build_portfolio_context` rather than its own price lookup so the
+/// "current" column is literally the same number the Holdings screen shows. A
+/// second resolver would be free to drift, and a screen whose whole purpose is
+/// comparison cannot afford to disagree with the one it is compared against.
+#[utoipa::path(get, path = "/api/v1/hindsight", tag = "portfolio", responses((status = 200, description = "Sold positions priced at six later moments")))]
+#[get("/api/hindsight")]
+async fn get_hindsight(db_path: web::Data<PathBuf>) -> impl Responder {
+    let ctx = match build_portfolio_context(&db_path).await {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "hindsight", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "hindsight", "api", None, &err.to_string());
+            return err_internal(err.to_string());
+        }
+    };
+    let dead = dead_symbols(&conn);
+    let today = Utc::now().date_naive();
+
+    let mut rows: Vec<HindsightRow> = Vec::new();
+    for (symbol, txs) in &ctx.groups {
+        let sales = portfolio::sale_costs(txs);
+        if sales.is_empty() {
+            continue;
+        }
+        // One read per symbol, floored at its earliest sale less the lookback
+        // window, so a weekend target still finds the Friday before it.
+        let floor = sales
+            .iter()
+            .map(|s| s.date.as_str())
+            .min()
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .and_then(|d| d.checked_sub_days(chrono::Days::new(7)))
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let bars = load_bars_since(&conn, symbol, &floor);
+
+        let current = ctx.prices.get(symbol).and_then(|p| p.native);
+        let delisted_on = dead
+            .get(symbol)
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+
+        for sale in sales {
+            let Ok(sale_date) = NaiveDate::parse_from_str(&sale.date, "%Y-%m-%d") else {
+                let _ = insert_event_log(&db_path, "warn", "hindsight", "api", Some(symbol),
+                    &format!("Sale dated '{}' is not a usable date and was skipped", sale.date));
+                continue;
+            };
+            let s = hindsight::Sale {
+                date: sale_date,
+                price: sale.native_price,
+                quantity: sale.quantity,
+            };
+            rows.push(HindsightRow {
+                symbol: symbol.clone(),
+                currency: ctx.currency_of(symbol),
+                sale_date: sale.date.clone(),
+                quantity: sale.quantity,
+                sale_price: sale.native_price,
+                purchase_price: sale.native_cost_per_share,
+                realised_pct: sale
+                    .native_cost_per_share
+                    .filter(|c| *c > 0.0)
+                    .map(|cost| (sale.native_price - cost) / cost * 100.0),
+                delisted_on: delisted_on.map(|d| d.to_string()),
+                points: hindsight::price_points(&s, &bars, current, today, delisted_on),
+            });
+        }
+    }
+
+    // Most recent sale first: the trades still worth second-guessing are the
+    // ones whose windows are still filling in.
+    rows.sort_by(|a, b| b.sale_date.cmp(&a.sale_date).then_with(|| a.symbol.cmp(&b.symbol)));
+    HttpResponse::Ok().json(rows)
+}
+
 #[utoipa::path(get, path = "/api/v1/portfolio/holdings", tag = "portfolio", responses((status = 200, description = "Get portfolio holdings")))]
 #[get("/api/portfolio/holdings")]
 async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
@@ -7579,6 +7720,103 @@ mod tests {
              VALUES (?1, 'TST.AX', ?2, ?3, ?4, ?5, ?6, '2024-01-01T00:00:00Z')",
             rusqlite::params![id, tx_type, date, qty, price, brokerage],
         ).unwrap();
+    }
+
+    /// Drive the endpoint and hand back the parsed rows.
+    async fn hindsight_rows(db_path: &PathBuf) -> Vec<serde_json::Value> {
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(get_hindsight),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::get().uri("/api/hindsight").to_request();
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        body.as_array().cloned().unwrap_or_default()
+    }
+
+    /// The row carries both sides: what the trade made, and what the shares did
+    /// afterwards. The two are measured from different prices — the purchase
+    /// for the first, the sale for the rest — which is the point of the screen.
+    #[actix_web::test]
+    async fn hindsight_prices_a_sale_against_what_came_after() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2025-01-01", 100.0, 8.0, 0.0);
+        insert_tx(&db_path, 2, "sale", "2025-01-03", 100.0, 10.0, 0.0);
+        insert_price(&db_path, "TST.AX", "2025-01-10", 11.0); // +1 week
+        insert_price(&db_path, "TST.AX", "2025-02-14", 12.0); // +6 weeks
+        insert_price(&db_path, "TST.AX", "2025-04-03", 9.0);  // +3 months
+
+        let rows = hindsight_rows(&db_path).await;
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["symbol"], "TST.AX");
+        assert_eq!(r["sale_price"], 10.0);
+        assert_eq!(r["purchase_price"], 8.0);
+        assert_eq!(r["quantity"], 100.0);
+        assert_eq!(r["currency"], "AUD", "native only, and AUD is the default");
+        assert_eq!(r["realised_pct"], 25.0, "the trade itself, measured from the purchase");
+
+        assert_eq!(r["points"]["week1"]["value"], 11.0);
+        assert_eq!(r["points"]["week1"]["status"], "ok");
+        // 100 shares × $1 left on the table.
+        assert_eq!(r["points"]["week1"]["delta"], 100.0);
+        assert_eq!(r["points"]["week6"]["value"], 12.0);
+        assert_eq!(r["points"]["month3"]["value"], 9.0);
+        assert_eq!(r["points"]["peak"]["value"], 12.0);
+        assert_eq!(r["points"]["low"]["value"], 9.0);
+    }
+
+    /// A stock bought and sold more than once gets a row per sale, each costed
+    /// against the lots that sale actually consumed.
+    #[actix_web::test]
+    async fn hindsight_reports_every_sale_separately() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2025-01-01", 100.0, 10.0, 0.0);
+        insert_tx(&db_path, 2, "sale", "2025-02-01", 100.0, 15.0, 0.0);
+        insert_tx(&db_path, 3, "purchase", "2025-03-01", 100.0, 20.0, 0.0);
+        insert_tx(&db_path, 4, "sale", "2025-04-01", 100.0, 25.0, 0.0);
+        insert_price(&db_path, "TST.AX", "2025-05-01", 30.0);
+
+        let rows = hindsight_rows(&db_path).await;
+        assert_eq!(rows.len(), 2);
+        // Most recent first.
+        assert_eq!(rows[0]["sale_date"], "2025-04-01");
+        assert_eq!(rows[0]["purchase_price"], 20.0);
+        assert_eq!(rows[1]["sale_date"], "2025-02-01");
+        assert_eq!(rows[1]["purchase_price"], 10.0, "the first sale ate the cheaper lot");
+    }
+
+    /// A delisted symbol's windows never arrive. Reporting them as missing data
+    /// would send the reader looking for a backfill that cannot exist.
+    #[actix_web::test]
+    async fn hindsight_marks_a_delisted_symbols_windows_as_delisted() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2025-03-28", 700.0, 2.25, 0.0);
+        insert_tx(&db_path, 2, "sale", "2025-08-01", 700.0, 3.91, 0.0);
+        open_db(&db_path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO app_config (key, value) VALUES ('dead_symbol_TST.AX', '2025-08-01')",
+            )
+            .unwrap();
+
+        let rows = hindsight_rows(&db_path).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["delisted_on"], "2025-08-01");
+        for point in ["week1", "week6", "month3", "peak", "low", "current"] {
+            assert_eq!(rows[0]["points"][point]["status"], "delisted", "{point}");
+        }
+    }
+
+    /// Only sales are second-guessed. A position still held belongs to the
+    /// holdings screens, and listing it here would be asking about a decision
+    /// that has not been made.
+    #[actix_web::test]
+    async fn hindsight_ignores_a_position_still_held() {
+        let (_file, db_path) = setup_test_db();
+        insert_tx(&db_path, 1, "purchase", "2025-01-01", 100.0, 10.0, 0.0);
+        insert_price(&db_path, "TST.AX", "2025-06-01", 20.0);
+
+        assert!(hindsight_rows(&db_path).await.is_empty());
     }
 
     /// A refresh has to converge on what Yahoo now reports. Upserting alone let
