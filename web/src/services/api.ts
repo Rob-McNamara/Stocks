@@ -358,6 +358,43 @@ export interface PortfolioLot {
   unrealised_pl: number | null
 }
 
+/**
+ * Why a hindsight price point has no number. The three empty cases mean
+ * different things: `pending` fills in on its own, `delisted` never will, and
+ * `no_data` is a gap in the price history.
+ */
+export type HindsightStatus = 'ok' | 'pending' | 'delisted' | 'no_data'
+
+export interface HindsightPoint {
+  value: number | null
+  /** The bar actually used, which for a weekend target is the trading day before it. */
+  date: string | null
+  status: HindsightStatus
+  /** Native-currency difference against the sale, across the shares sold. */
+  delta: number | null
+  pct: number | null
+}
+
+/** One sale, priced at six later moments. All figures native — never AUD. */
+export interface HindsightRow {
+  symbol: string
+  currency: string
+  sale_date: string
+  quantity: number
+  sale_price: number
+  purchase_price: number | null
+  realised_pct: number | null
+  delisted_on: string | null
+  points: {
+    week1: HindsightPoint
+    week6: HindsightPoint
+    month3: HindsightPoint
+    peak: HindsightPoint
+    low: HindsightPoint
+    current: HindsightPoint
+  }
+}
+
 export interface SoldEntry {
   symbol: string
   date: string
@@ -686,6 +723,15 @@ export const apiClient = {
     if (!response.ok) {
       const message = await apiErrorMessage(response)
       throw new Error(message || 'Failed to fetch portfolio risk analysis')
+    }
+    return response.json()
+  },
+
+  async getHindsight(): Promise<HindsightRow[]> {
+    const response = await apiFetch(`${API_BASE_URL}/hindsight`)
+    if (!response.ok) {
+      const message = await apiErrorMessage(response)
+      throw new Error(message || 'Failed to fetch hindsight')
     }
     return response.json()
   },

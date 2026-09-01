@@ -8,11 +8,12 @@ import HoldingsManager from './components/HoldingsManager'
 import EventLogViewer from './components/EventLogViewer'
 import Dashboard from './components/Dashboard'
 import SoldStocks from './components/SoldStocks'
+import Hindsight from './components/Hindsight'
 import Transactions from './components/Transactions'
 import CashManager from './components/CashManager'
 import Analysis from './components/Analysis'
 
-type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'analysis' | 'sold' | 'cash' | 'transactions' | 'events' | 'config'
+type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'analysis' | 'sold' | 'hindsight' | 'cash' | 'transactions' | 'events' | 'config'
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
@@ -121,6 +122,13 @@ function App() {
           Sold Stocks
         </button>
         <button
+          className={`tab-button ${activeTab === 'hindsight' ? 'active' : ''}`}
+          onClick={() => setActiveTab('hindsight')}
+          disabled={loading}
+        >
+          Hindsight
+        </button>
+        <button
           className={`tab-button ${activeTab === 'cash' ? 'active' : ''}`}
           onClick={() => setActiveTab('cash')}
           disabled={loading}
@@ -165,6 +173,9 @@ function App() {
         </div>
         <div style={{ display: activeTab === 'sold' ? 'block' : 'none' }}>
           <SoldStocks onLoading={setLoading} holdingsVersion={holdingsVersion} />
+        </div>
+        <div style={{ display: activeTab === 'hindsight' ? 'block' : 'none' }}>
+          <Hindsight onLoading={setLoading} holdingsVersion={holdingsVersion} />
         </div>
         <div style={{ display: activeTab === 'cash' ? 'block' : 'none' }}>
           <CashManager onLoading={setLoading} onCashChanged={() => setHoldingsVersion((v) => v + 1)} />

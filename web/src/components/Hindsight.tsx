@@ -1,0 +1,251 @@
+import { useEffect, useMemo, useState } from 'react'
+import { apiClient, type HindsightRow, type HindsightPoint, type HindsightStatus } from '../services/api'
+
+// Thin client: every figure here is computed by the API (GET /api/hindsight),
+// including the FIFO cost of each sale and the six later prices, so this screen
+// and the Holdings screen cannot disagree about the same trade.
+
+const WINDOWS = [
+  { key: 'week1', label: '+1 week' },
+  { key: 'week6', label: '+6 weeks' },
+  { key: 'month3', label: '+3 months' },
+  { key: 'peak', label: 'Peak since' },
+  { key: 'low', label: 'Low since' },
+  { key: 'current', label: 'Now' },
+] as const
+
+/**
+ * What an empty cell means. Kept as words rather than symbols because the whole
+ * point of the three statuses is that they are *different* — a reader who
+ * cannot tell "not yet" from "never" learns nothing from either.
+ */
+const EMPTY_LABEL: Record<HindsightStatus, string> = {
+  ok: '',
+  pending: 'to come',
+  delisted: 'delisted',
+  no_data: 'no data',
+}
+
+const EMPTY_HINT: Record<HindsightStatus, string> = {
+  ok: '',
+  pending: 'This date has not arrived yet — it will fill in on its own.',
+  delisted: 'The symbol stopped trading before this point could be reached.',
+  no_data: 'The date has passed but no price bar is close enough to answer for it.',
+}
+
+/**
+ * Green means the decision worked out. For the six windows that inverts the
+ * usual convention on purpose: a price that *fell* after you sold is money you
+ * kept, so it is the good outcome and reads green.
+ */
+function outcomeColor(delta: number | null): string {
+  if (delta === null || delta === 0) return '#666'
+  return delta > 0 ? '#f44336' : '#4caf50'
+}
+
+function money(value: number, currency: string): string {
+  // Currency-aware rather than a bare $, because the rows are native and an
+  // AUD figure sitting beside a USD one with the same glyph invites addition.
+  try {
+    return new Intl.NumberFormat('en-AU', {
+      style: 'currency',
+      currency,
+      currencyDisplay: 'narrowSymbol',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value)
+  } catch {
+    // An unknown or malformed currency code must not take the screen down.
+    return `${value.toFixed(2)} ${currency}`
+  }
+}
+
+function signed(value: number, currency: string): string {
+  return `${value > 0 ? '+' : value < 0 ? '−' : ''}${money(Math.abs(value), currency)}`
+}
+
+function PointCell({ point, currency }: { point: HindsightPoint | undefined; currency: string }) {
+  // Defensive: a backend that predates a field must degrade to an empty cell
+  // rather than taking the whole screen down.
+  const status = point?.status ?? 'no_data'
+  if (!point || point.value === null || point.value === undefined) {
+    return (
+      <td style={{ color: '#999', fontStyle: 'italic', fontSize: 12 }} title={EMPTY_HINT[status] ?? ''}>
+        {EMPTY_LABEL[status] ?? 'no data'}
+      </td>
+    )
+  }
+
+  const delta = point.delta ?? null
+  const hint = [
+    `${money(point.value, currency)} on ${point.date ?? 'an unknown date'}`,
+    status === 'delisted' ? 'Final price — the symbol no longer trades.' : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+  return (
+    <td title={hint} style={{ whiteSpace: 'nowrap' }}>
+      <div style={{ color: outcomeColor(delta), fontWeight: 600 }}>
+        {point.pct === null || point.pct === undefined
+          ? money(point.value, currency)
+          : `${point.pct > 0 ? '+' : point.pct < 0 ? '−' : ''}${Math.abs(point.pct).toFixed(1)}%`}
+      </div>
+      {delta !== null && (
+        <div style={{ fontSize: 12, color: '#777' }}>{signed(delta, currency)}</div>
+      )}
+      {status === 'delisted' && (
+        <div style={{ fontSize: 11, color: '#999', fontStyle: 'italic' }}>final</div>
+      )}
+    </td>
+  )
+}
+
+export default function Hindsight({
+  onLoading,
+  holdingsVersion,
+}: {
+  onLoading: (loading: boolean) => void
+  holdingsVersion?: number
+}) {
+  const [rows, setRows] = useState<HindsightRow[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setLoading(true)
+        setError(null)
+        onLoading(true)
+        setRows(await apiClient.getHindsight())
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load hindsight')
+      } finally {
+        setLoading(false)
+        onLoading(false)
+      }
+    }
+    load()
+  }, [holdingsVersion])
+
+  /**
+   * Totalled per currency and never across them. The rows are native by
+   * design, so one sum over a mixed list would be a number with no meaning.
+   */
+  const totals = useMemo(() => {
+    const byCurrency = new Map<string, { held: number; counted: number }>()
+    for (const row of rows) {
+      const delta = row.points?.current?.delta
+      if (delta === null || delta === undefined) continue
+      const entry = byCurrency.get(row.currency) ?? { held: 0, counted: 0 }
+      entry.held += delta
+      entry.counted += 1
+      byCurrency.set(row.currency, entry)
+    }
+    return [...byCurrency.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+  }, [rows])
+
+  return (
+    <div className="hindsight">
+      <div className="manager-card">
+        <div className="card-header">
+          <h2>Hindsight</h2>
+          {totals.length > 0 && (
+            <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, color: '#666' }}>Had you held everything to today:</span>
+              {totals.map(([currency, { held, counted }]) => (
+                <span
+                  key={currency}
+                  style={{ fontWeight: 600, fontSize: 15, color: outcomeColor(held) }}
+                  title={`Across ${counted} ${currency} sale${counted !== 1 ? 's' : ''} with a current price`}
+                >
+                  {currency} {signed(held, currency)}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+          Every sale, priced at six later moments. Each figure compares that moment
+          against what the shares actually fetched, so{' '}
+          <strong style={{ color: '#4caf50' }}>green means selling was the right call</strong> — the
+          price fell afterwards — and{' '}
+          <strong style={{ color: '#f44336' }}>red is money left on the table</strong>. Price only:
+          dividends belong to whoever held the shares, and are on the Sold Stocks screen. Figures are
+          in each stock&rsquo;s own currency and are never converted, so totals are kept apart.
+        </p>
+
+        {error && <div className="alert alert-error">❌ {error}</div>}
+
+        {loading ? (
+          <p className="loading-text">Loading hindsight...</p>
+        ) : rows.length === 0 ? (
+          <p className="empty-text">No sales recorded yet — nothing to second-guess.</p>
+        ) : (
+          <div className="holdings-table-wrapper">
+            <table className="holdings-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Sold</th>
+                  <th>Qty</th>
+                  <th>Sale</th>
+                  <th title="FIFO cost of the shares this sale consumed, brokerage included">Cost</th>
+                  <th title="What the trade itself made, measured from the purchase">Trade</th>
+                  {WINDOWS.map((w) => (
+                    <th key={w.key}>{w.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, i) => (
+                  <tr key={`${row.symbol}-${row.sale_date}-${i}`}>
+                    <td>
+                      <strong>{row.symbol}</strong>
+                      {row.delisted_on && (
+                        <span
+                          style={{ marginLeft: 6, fontSize: 11, color: '#999', fontStyle: 'italic' }}
+                          title={`Delisted ${row.delisted_on}`}
+                        >
+                          delisted
+                        </span>
+                      )}
+                      {row.currency !== 'AUD' && (
+                        <span style={{ marginLeft: 6, fontSize: 11, color: '#777' }}>{row.currency}</span>
+                      )}
+                    </td>
+                    <td style={{ whiteSpace: 'nowrap' }}>{row.sale_date}</td>
+                    <td>{row.quantity.toLocaleString('en-AU')}</td>
+                    <td style={{ whiteSpace: 'nowrap' }}>{money(row.sale_price, row.currency)}</td>
+                    <td style={{ whiteSpace: 'nowrap', color: row.purchase_price == null ? '#999' : undefined }}>
+                      {row.purchase_price == null ? '—' : money(row.purchase_price, row.currency)}
+                    </td>
+                    <td
+                      style={{
+                        whiteSpace: 'nowrap',
+                        fontWeight: 600,
+                        // The trade's own outcome keeps the ordinary reading:
+                        // a profit is green. Only the six windows invert.
+                        color:
+                          row.realised_pct == null ? '#999' : row.realised_pct >= 0 ? '#4caf50' : '#f44336',
+                      }}
+                    >
+                      {row.realised_pct == null
+                        ? '—'
+                        : `${row.realised_pct >= 0 ? '+' : '−'}${Math.abs(row.realised_pct).toFixed(1)}%`}
+                    </td>
+                    {WINDOWS.map((w) => (
+                      <PointCell key={w.key} point={row.points?.[w.key]} currency={row.currency} />
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
