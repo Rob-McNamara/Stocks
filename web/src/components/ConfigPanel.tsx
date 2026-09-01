@@ -26,6 +26,9 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [manualSymbol, setManualSymbol] = useState('')
+  const [deadSymbol, setDeadSymbol] = useState('')
+  const [deadDate, setDeadDate] = useState('')
+  const [editingDeadDates, setEditingDeadDates] = useState<Record<string, string>>({})
   const [manualPrice, setManualPrice] = useState('')
   const [editingPrices, setEditingPrices] = useState<Record<string, string>>({})
   const [historyStart, setHistoryStart] = useState('')
@@ -185,6 +188,12 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
     .filter(([k, v]) => k.startsWith('manual_price_') && v !== '')
     .map(([k, v]) => ({ symbol: k.replace('manual_price_', ''), price: v }))
 
+  // Sorted by symbol so the list does not reshuffle as marks are added.
+  const deadSymbols = Object.entries(config)
+    .filter(([k, v]) => k.startsWith('dead_symbol_') && v !== '')
+    .map(([k, v]) => ({ symbol: k.replace('dead_symbol_', ''), lastTraded: v }))
+    .sort((a, b) => a.symbol.localeCompare(b.symbol))
+
   const manualTypes = Object.entries(config)
     .filter(([k, v]) => k.startsWith('instrument_type_') && v !== '')
     .map(([k, v]) => ({ symbol: k.replace('instrument_type_', ''), type: v }))
@@ -207,6 +216,57 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       setError(err instanceof Error ? err.message : 'Failed to save manual price')
     } finally {
       setLoading(false)
+    }
+  }
+
+  // Writing the mark, editing it and clearing it are the same request; only the
+  // value differs, and an empty value is what the server reads as cleared.
+  const saveDeadSymbol = async (symbol: string, date: string, message: string) => {
+    try {
+      setLoading(true)
+      setError(null)
+      await apiClient.updateConfig(`dead_symbol_${symbol}`, date)
+      setConfig((c) => {
+        const next = { ...c }
+        if (date) next[`dead_symbol_${symbol}`] = date
+        else delete next[`dead_symbol_${symbol}`]
+        return next
+      })
+      setSuccess(message)
+      onConfigChanged?.()
+      setTimeout(() => setSuccess(null), 3000)
+      return true
+    } catch (err) {
+      // The server validates the date shape and can refuse, so a failure has to
+      // leave the panel showing what is actually stored.
+      setError(err instanceof Error ? err.message : 'Failed to save delisted symbol')
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleAddDeadSymbol = async () => {
+    const sym = deadSymbol.trim().toUpperCase()
+    const date = deadDate.trim()
+    if (!sym || !date) return
+    if (await saveDeadSymbol(sym, date, `${sym} marked as delisted`)) {
+      setDeadSymbol('')
+      setDeadDate('')
+    }
+  }
+
+  const handleUpdateDeadSymbol = async (symbol: string) => {
+    const date = (editingDeadDates[symbol] ?? '').trim()
+    if (!date) return
+    if (await saveDeadSymbol(symbol, date, `Last traded date updated for ${symbol}`)) {
+      setEditingDeadDates((d) => { const next = { ...d }; delete next[symbol]; return next })
+    }
+  }
+
+  const handleRemoveDeadSymbol = async (symbol: string) => {
+    if (await saveDeadSymbol(symbol, '', `${symbol} is no longer marked delisted`)) {
+      setEditingDeadDates((d) => { const next = { ...d }; delete next[symbol]; return next })
     }
   }
 
@@ -391,6 +451,109 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
                 disabled={loading || !manualSymbol || !manualPrice}
               >
                 Set Price
+              </button>
+            </div>
+          </div>
+
+          <div className="manager-card" style={{ marginTop: 24 }}>
+            <h2>Delisted Symbols</h2>
+            <p style={{ color: '#666', fontSize: 14, marginBottom: 16 }}>
+              Mark a symbol the market no longer trades, with the last date it did.
+              These are never fetched again — a delisted ticker answers 404 forever,
+              and each attempt writes an error that buries the failures worth reading.
+              The date also tells the Hindsight screen where the trail goes cold, so a
+              window past it reads as unavailable rather than a flat line.
+            </p>
+
+            {deadSymbols.length > 0 && (
+              <table className="holdings-table" style={{ marginBottom: 20 }}>
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Last traded</th>
+                    <th>Final price</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {deadSymbols.map(({ symbol, lastTraded }) => {
+                    const finalPrice = config[`manual_price_${symbol}`]
+                    return (
+                      <tr key={symbol}>
+                        <td><strong>{symbol}</strong></td>
+                        <td>
+                          <input
+                            type="date"
+                            value={editingDeadDates[symbol] ?? lastTraded}
+                            onChange={(e) => setEditingDeadDates((d) => ({ ...d, [symbol]: e.target.value }))}
+                            className="config-input"
+                            style={{ width: 150 }}
+                            disabled={loading}
+                          />
+                        </td>
+                        <td>
+                          {finalPrice ? (
+                            `$${finalPrice}`
+                          ) : (
+                            // Without one the symbol falls back to its last stored bar,
+                            // and a symbol with no bars at all values at nothing.
+                            <span style={{ color: '#999', fontStyle: 'italic' }}>
+                              not set — add one under Manual Prices
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ display: 'flex', gap: 6 }}>
+                          <button
+                            className="btn btn-primary btn-small"
+                            onClick={() => handleUpdateDeadSymbol(symbol)}
+                            disabled={loading || editingDeadDates[symbol] === undefined}
+                          >
+                            Update
+                          </button>
+                          <button
+                            className="btn btn-danger btn-small"
+                            onClick={() => handleRemoveDeadSymbol(symbol)}
+                            disabled={loading}
+                          >
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+
+            <div className="config-edit" style={{ alignItems: 'flex-end' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Symbol</label>
+                <input
+                  type="text"
+                  value={deadSymbol}
+                  onChange={(e) => setDeadSymbol(e.target.value.toUpperCase())}
+                  placeholder="e.g. JLG.AX"
+                  className="config-input"
+                  disabled={loading}
+                  maxLength={12}
+                />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 13, color: '#666' }}>Last traded</label>
+                <input
+                  type="date"
+                  value={deadDate}
+                  onChange={(e) => setDeadDate(e.target.value)}
+                  className="config-input"
+                  disabled={loading}
+                />
+              </div>
+              <button
+                className="btn btn-primary btn-small"
+                onClick={handleAddDeadSymbol}
+                disabled={loading || !deadSymbol || !deadDate}
+              >
+                Mark Delisted
               </button>
             </div>
           </div>

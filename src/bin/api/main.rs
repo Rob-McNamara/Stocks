@@ -281,6 +281,15 @@ const LIST_COMPARES: [&str; 2] = ["price", "volume"];
 const LIST_SORTS: [&str; 2] = ["asc", "desc"];
 const LIST_INDICATORS: [&str; 3] = ["sma50", "sma150", "ema40w"];
 
+/// Marks a symbol the market no longer trades. One key per symbol, holding the
+/// last date it traded; `manual_price_<symbol>` holds what it was worth.
+///
+/// Two keys rather than one because they answer different questions and are
+/// consumed in different places: the price feeds the existing valuation chain
+/// untouched, while the date bounds how far forward any "since" window can
+/// honestly be read.
+const DEAD_SYMBOL_PREFIX: &str = "dead_symbol_";
+
 /// Reject a config value the server would later fail to parse.
 ///
 /// These keys hold JSON that other endpoints read back. Without this a typo is
@@ -291,6 +300,9 @@ fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
         "dashboard_custom_lists" => validate_dashboard_custom_lists(value),
         "holdings_custom_fields" | "watchlist_custom_fields" => validate_custom_fields(value),
         PORTFOLIO_HISTORY_START => validate_optional_date(value),
+        // A delisting date is compared against bar dates as text, so a value in
+        // any other shape would order wrongly rather than fail.
+        key if key.starts_with(DEAD_SYMBOL_PREFIX) => validate_optional_date(value),
         _ => Ok(()),
     }
 }
@@ -708,11 +720,39 @@ async fn update_config(
     match upsert_config(&db_path, key, value) {
         Ok(()) => {
             let _ = insert_event_log(&db_path, "info", "config_update", "api", Some(key), &format!("Updated config {}", key));
+            if let Some(symbol) = key.strip_prefix(DEAD_SYMBOL_PREFIX).filter(|_| !value.is_empty()) {
+                drop_cached_quote(&db_path, symbol);
+            }
             HttpResponse::NoContent().finish()
         }
         Err(err) => {
             let _ = insert_event_log(&db_path, "error", "config_update", "api", Some(key), &err);
             err_internal(err)
+        }
+    }
+}
+
+/// Forget the last live quote for a symbol just marked dead.
+///
+/// Marking it dead stops the refresh fetching it, which also means nothing will
+/// ever overwrite the quote already cached. Left in place it would be served as
+/// the current price indefinitely — a delisted stock frozen at its final
+/// trading day but presented as though it were still quoted today. Deleting it
+/// drops the symbol onto the manual-price/last-close chain, which reports where
+/// the figure came from.
+fn drop_cached_quote(db_path: &PathBuf, symbol: &str) {
+    let removed = open_db(db_path).and_then(|conn| {
+        conn.execute("DELETE FROM cached_current_prices WHERE symbol = ?1", params![symbol])
+    });
+    match removed {
+        Ok(n) if n > 0 => {
+            let _ = insert_event_log(db_path, "info", "config_update", "api", Some(symbol),
+                "Marked dead; discarded the cached quote so it is not served as current");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            let _ = insert_event_log(db_path, "warn", "config_update", "api", Some(symbol),
+                &format!("Marked dead but its cached quote could not be discarded: {err}"));
         }
     }
 }
@@ -3487,6 +3527,34 @@ impl SeriesCursor {
     }
 }
 
+/// Symbols the market no longer trades, keyed by symbol, to the last date each
+/// one traded.
+///
+/// A delisted ticker is not a transient fetch failure: Yahoo answers 404 for it
+/// on every run, forever. Left unmarked it burns a request per refresh and
+/// writes an error to the event log each time — JLG.AX and CCLD.AX between them
+/// account for 639 such rows — which buries the failures that do mean something.
+fn dead_symbols(conn: &Connection) -> HashMap<String, String> {
+    let sql = format!("SELECT key, value FROM app_config WHERE key LIKE '{DEAD_SYMBOL_PREFIX}%'");
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map(|rows| {
+            rows.flatten()
+                .filter_map(|(key, value)| {
+                    let symbol = key.strip_prefix(DEAD_SYMBOL_PREFIX)?.to_string();
+                    // An empty value is how the UI clears the mark, so it must
+                    // not read back as a dead symbol with a blank date.
+                    let date = value.trim();
+                    if date.is_empty() { None } else { Some((symbol, date.to_string())) }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Manually entered prices, keyed by symbol, from `app_config`.
 ///
 /// Set for holdings the market no longer prices — a delisted ticker keeps its
@@ -5208,6 +5276,18 @@ async fn fetch_and_cache_current_prices(
     for s in symbols {
         if seen.insert(s.clone()) {
             unique.push(s.clone());
+        }
+    }
+
+    // Drop the symbols marked dead. Every fetch path — watchlist, holdings and
+    // sold — funnels through here, so this is the one place that has to know.
+    // Their prices still resolve through the manual/last-close chain; what stops
+    // is asking Yahoo a question it has already answered 404 to.
+    let dead = open_db(db_path).map(|c| dead_symbols(&c)).unwrap_or_default();
+    if !dead.is_empty() {
+        unique.retain(|s| !dead.contains_key(s));
+        if unique.is_empty() {
+            return Ok(Vec::new());
         }
     }
 
@@ -8693,6 +8773,122 @@ mod tests {
         assert!(validate_dashboard_custom_lists(dup).unwrap_err().contains("duplicate key 'a'"));
     }
 
+
+    /// A delisting date is compared against bar dates as text, so a value in
+    /// any other shape sorts wrongly instead of failing loudly.
+    #[test]
+    fn a_dead_symbol_mark_must_carry_a_real_date() {
+        assert_eq!(validate_config_value("dead_symbol_JLG.AX", "2025-08-01"), Ok(()));
+        assert_eq!(validate_config_value("dead_symbol_JLG.AX", ""), Ok(()), "clearing the mark is allowed");
+        assert!(validate_config_value("dead_symbol_JLG.AX", "01/08/2025").is_err());
+        assert!(validate_config_value("dead_symbol_JLG.AX", "delisted").is_err());
+    }
+
+    #[test]
+    fn dead_symbols_reads_the_marks_and_ignores_cleared_ones() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO app_config (key, value) VALUES
+                ('dead_symbol_JLG.AX', '2025-08-01'),
+                ('dead_symbol_CCLD.AX', '   '),
+                ('manual_price_JLG.AX', '3.91'),
+                ('portfolio_history_start', '2025-01-01')",
+        )
+        .unwrap();
+
+        let dead = dead_symbols(&conn);
+        assert_eq!(dead.get("JLG.AX"), Some(&"2025-08-01".to_string()));
+        // The UI clears a mark by writing an empty value rather than deleting
+        // the row, so a blank must not read back as a dead symbol.
+        assert!(!dead.contains_key("CCLD.AX"), "a cleared mark is not a dead symbol");
+        // The prefix match must not swallow neighbouring keys.
+        assert_eq!(dead.len(), 1);
+    }
+
+    /// The point of the mark: a delisted symbol is never sent to Yahoo again.
+    /// Returning early with no request is what stops the 404-per-refresh that
+    /// buries real failures in the event log.
+    #[actix_web::test]
+    async fn a_refresh_of_only_dead_symbols_asks_yahoo_nothing() {
+        let (_file, db_path) = setup_test_db();
+        open_db(&db_path)
+            .unwrap()
+            .execute_batch("INSERT INTO app_config (key, value) VALUES ('dead_symbol_JLG.AX', '2025-08-01')")
+            .unwrap();
+
+        let prices = fetch_and_cache_current_prices(
+            &db_path,
+            &["JLG.AX".to_string()],
+            "sold_prices_updated_at",
+        )
+        .await
+        .unwrap();
+
+        assert!(prices.is_empty(), "a dead symbol yields no quote and no request");
+    }
+
+    /// Marking a symbol dead stops the refresh overwriting its cached quote, so
+    /// whatever is cached at that moment would otherwise be served as the
+    /// current price forever.
+    #[actix_web::test]
+    async fn marking_a_symbol_dead_discards_its_stale_quote() {
+        let (_file, db_path) = setup_test_db();
+        open_db(&db_path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
+                 VALUES ('JLG.AX', 3.91, '2025-08-01T00:00:00Z', '2025-08-01')",
+            )
+            .unwrap();
+
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(update_config),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::put()
+            .uri("/api/config")
+            .set_json(&serde_json::json!({ "key": "dead_symbol_JLG.AX", "value": "2025-08-01" }))
+            .to_request();
+        assert!(actix_web::test::call_service(&app, req).await.status().is_success());
+
+        let cached: i64 = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cached_current_prices WHERE symbol='JLG.AX'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0, "the stale quote must not survive the mark");
+    }
+
+    /// Clearing the mark is how a symbol comes back — a wrong entry, or a
+    /// ticker that resumed trading. It must not also wipe the cache, which is
+    /// what the next refresh is about to refill.
+    #[actix_web::test]
+    async fn clearing_the_mark_leaves_the_cache_alone() {
+        let (_file, db_path) = setup_test_db();
+        open_db(&db_path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
+                 VALUES ('BACK.AX', 1.20, '2025-08-01T00:00:00Z', '2025-08-01')",
+            )
+            .unwrap();
+
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(db_path.clone())).service(update_config),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::put()
+            .uri("/api/config")
+            .set_json(&serde_json::json!({ "key": "dead_symbol_BACK.AX", "value": "" }))
+            .to_request();
+        assert!(actix_web::test::call_service(&app, req).await.status().is_success());
+
+        let cached: i64 = open_db(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cached_current_prices WHERE symbol='BACK.AX'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 1);
+    }
     #[test]
     fn config_validation_leaves_unrelated_keys_alone() {
         // Most config values are plain scalars and must not be parsed as JSON.
