@@ -7,6 +7,7 @@ import PriceChart from './PriceChart'
 import HoldingsHeatMap from './HoldingsHeatMap'
 import CollapsibleCard from './CollapsibleCard'
 import type { HoldingScope } from '../utils/holdingScope'
+import { priceParts } from '../utils/priceDisplay'
 
 /**
  * The sections each screen is organised by, in display order.
@@ -69,6 +70,7 @@ const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', '
 // custom-field plumbing.
 const BUILT_IN_HOLDINGS_KEYS = ['stop_loss', 'trailing_sell_pct', 'trailing_sell_date', 'sector', 'pl_basis_date', 'pl_basis_price']
 
+
 interface HoldingsPrefill {
   symbol: string
   price?: number
@@ -82,6 +84,8 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
    * loaders below reach for it before any of the derived lists exist.
    */
   const inScope = (h: { is_international: boolean }) => h.is_international === (scope === 'international')
+  /** International holdings read in their own currency; local ones in AUD. */
+  const nativeFirst = scope === 'international'
   const scopeSections = SECTIONS_BY_SCOPE[scope]
 
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
@@ -1107,6 +1111,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                 const symCurrency = item.currency
                 const isForeign = item.isInternational
                 const isSelected = selectedChartSymbol === item.symbol
+                const price = priceParts(item.currentPrice, item.nativePrice, symCurrency, nativeFirst && isForeign)
                 return (
                 <div
                   key={item.symbol}
@@ -1152,10 +1157,10 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                     <div style={{ fontSize: 11, color: '#5c6bc0', fontStyle: 'italic', marginBottom: 2 }}>{holdingsSymbolFields[item.symbol]['_notes']}</div>
                   )}
                   <div style={{ color: item.priceSource === 'manual' ? '#2196f3' : undefined }}>
-                    {item.shares % 1 === 0 ? item.shares.toFixed(0) : item.shares.toFixed(2)}@{item.currentPrice ? `$${item.currentPrice.toFixed(2)}` : '—'}
-                    {isForeign && item.nativePrice != null && (
+                    {item.shares % 1 === 0 ? item.shares.toFixed(0) : item.shares.toFixed(2)}@{price.main}
+                    {isForeign && price.aside && (
                       <span style={{ fontSize: 11, color: '#888', marginLeft: 6 }}>
-                        ({symCurrency} {item.nativePrice.toFixed(2)})
+                        {price.aside}
                       </span>
                     )}
                     {item.priceSource === 'manual' && <span style={{ fontSize: 11, marginLeft: 4 }}>(manual)</span>}
@@ -1259,7 +1264,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                     <th className="sortable-header" onClick={() => handleSort('symbol')}>Symbol{sortIndicator('symbol')}</th>
                     <th className="sortable-header" onClick={() => handleSort('date')}>Date{sortIndicator('date')}</th>
                     <th>Quantity</th>
-                    <th>Price (AUD)</th>
+                    <th>{nativeFirst ? 'Price' : 'Price (AUD)'}</th>
                     <th className="sortable-header" onClick={() => handleSort('currentValue')}>Current Value{sortIndicator('currentValue')}</th>
                     <th className="sortable-header" onClick={() => handleSort('profitLoss')}>Unrealised P/L{sortIndicator('profitLoss')}</th>
                     <th className="sortable-header" onClick={() => handleSort('dividends')}>Total Dividends{sortIndicator('dividends')}</th>
@@ -1292,12 +1297,20 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                         <td>{new Date(tx.date).toLocaleDateString()}</td>
                         <td>{(lot?.remaining ?? 0).toFixed(2)}</td>
                         <td>
-                          {tx.price !== null ? `$${tx.price.toFixed(2)}` : '—'}
-                          {tx.currency !== 'AUD' && tx.original_price !== null && (
-                            <span style={{ fontSize: 10, color: '#888', marginLeft: 4 }}>
-                              ({tx.currency} {tx.original_price.toFixed(2)})
-                            </span>
-                          )}
+                          {(() => {
+                            // The transaction's own currency, not the symbol's:
+                            // a foreign stock can have been bought in AUD.
+                            const paid = tx.currency !== 'AUD' ? tx.original_price : null
+                            const price = priceParts(tx.price, paid, tx.currency, nativeFirst)
+                            return (
+                              <>
+                                {price.main}
+                                {price.aside && (
+                                  <span style={{ fontSize: 10, color: '#888', marginLeft: 4 }}>{price.aside}</span>
+                                )}
+                              </>
+                            )
+                          })()}
                         </td>
                         <td>{currentValue !== null ? `$${currentValue.toFixed(2)}` : '—'}</td>
                         <td>

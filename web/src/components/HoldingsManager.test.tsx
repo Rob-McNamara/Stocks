@@ -225,6 +225,56 @@ describe('local vs international screens', () => {
   })
 })
 
+describe('which currency a price leads with', () => {
+  const EXPD = makePortfolioHolding({
+    symbol: 'EXPD', is_international: true, currency: 'USD',
+    current_price: 291.5, native_current_price: 190.92,
+  })
+  const BHP = makePortfolioHolding({ symbol: 'BHP.AX', current_price: 41.25, native_current_price: 41.25 })
+
+  async function renderScope(scope: 'local' | 'international', tx: Record<string, unknown>) {
+    mocked.getPortfolioHoldings.mockResolvedValue({ holdings: [EXPD, BHP], fx_rates: { USD: 1.527 } })
+    mocked.getHoldings.mockResolvedValue([makeTransaction(tx)])
+    mocked.getPortfolioLots.mockResolvedValue({
+      lots: [{ transaction_id: 1, remaining: 10, current_value: 2915, unrealised_pl: 5 }],
+    })
+    render(<HoldingsManager scope={scope} onLoading={() => {}} />)
+    await waitFor(() => expect((triggerButton() as HTMLButtonElement).disabled).toBe(false))
+  }
+
+  const usdPurchase = { id: 1, symbol: 'EXPD', currency: 'USD', price: 275.0, original_price: 180.1 }
+
+  it('leads with the traded currency on the international screen, AUD in brackets', async () => {
+    await renderScope('international', usdPurchase)
+    // Summary card: "10@USD 190.92 (A$291.50)"
+    const card = await screen.findByText(/10@USD 190\.92/)
+    expect(card.textContent).toContain('(A$291.50)')
+
+    const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
+    const price = within(table).getByText(/USD 180\.10/)
+    expect(price.textContent).toContain('(A$275.00)')
+    // The column no longer promises AUD.
+    expect(within(table).getByRole('columnheader', { name: 'Price' })).toBeTruthy()
+  })
+
+  it('keeps AUD leading on the local screen', async () => {
+    await renderScope('local', { id: 1, symbol: 'BHP.AX', price: 40.0 })
+    expect(await screen.findByText(/10@\$41\.25/)).toBeTruthy()
+    const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
+    expect(within(table).getByText(/\$40\.00/)).toBeTruthy()
+    expect(within(table).getByRole('columnheader', { name: 'Price (AUD)' })).toBeTruthy()
+  })
+
+  // A foreign stock bought in AUD has no native figure to lead with, and the
+  // transaction's own currency is what says so — not the symbol's.
+  it('shows a lone AUD price for a foreign holding bought in AUD', async () => {
+    await renderScope('international', { id: 1, symbol: 'EXPD', currency: 'AUD', price: 275.0, original_price: null })
+    const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
+    const cell = within(table).getByText('$275.00')
+    expect(cell.textContent).not.toContain('(')
+  })
+})
+
 describe('per-section heat maps', () => {
   const ONE_OF_EACH = [
     makePortfolioHolding({ symbol: 'BHP.AX' }),
