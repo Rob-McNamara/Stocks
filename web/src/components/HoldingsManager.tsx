@@ -86,6 +86,43 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
   const inScope = (h: { is_international: boolean }) => h.is_international === (scope === 'international')
   /** International holdings read in their own currency; local ones in AUD. */
   const nativeFirst = scope === 'international'
+  /**
+   * Marks a figure as AUD where the ones beside it are not. Every total on
+   * these screens is AUD — they add up across currencies — but on the
+   * International screen the prices they sit above are native, so a bare `$`
+   * would be read as the stock's own dollar.
+   */
+  const aud = nativeFirst ? 'A$' : '$'
+
+  const money = (value: number) =>
+    `${aud}${value.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+
+  /**
+   * Today's money across a set of holdings: each one's shares times its
+   * quote's change, already converted by the server.
+   *
+   * A holding whose quote carried no change — a stale or manual price — is
+   * left out rather than counted as a flat day, and when none of them has one
+   * there is no figure to show. The percentage is against what the same
+   * holdings were worth at yesterday's close, which is today's value less
+   * today's movement.
+   */
+  const daysPl = (items: typeof summary) => {
+    const moved = items.filter((i) => i.dayPl != null)
+    if (moved.length === 0) return null
+    const amount = moved.reduce((s, i) => s + (i.dayPl ?? 0), 0)
+    const opening = moved.reduce((s, i) => s + i.currentValue, 0) - amount
+    return (
+      <span style={{ fontSize: 13, color: amount >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
+        Today&apos;s P/L: {amount >= 0 ? '+' : '-'}{money(Math.abs(amount))}
+        {opening > 0 && (
+          <span style={{ fontWeight: 400, marginLeft: 4 }}>
+            ({amount >= 0 ? '+' : ''}{((amount / opening) * 100).toFixed(1)}%)
+          </span>
+        )}
+      </span>
+    )
+  }
   const scopeSections = SECTIONS_BY_SCOPE[scope]
 
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
@@ -614,8 +651,13 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     priceSource: h.price_source,
     change: h.change,
     changePercent: h.change_percent,
+    sma50: h.sma50,
+    nativeSma50: h.native_sma50,
     sma150: h.sma150,
     nativeSma150: h.native_sma150,
+    ema40w: h.ema40w,
+    nativeEma40w: h.native_ema40w,
+    dayPl: h.day_pl,
     currentValue: h.current_value,
     avgCost: h.avg_cost,
     nativeAvgCost: h.native_avg_cost,
@@ -1061,24 +1103,25 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
               return (
                 <>
                   <span style={{ fontSize: 13, color: '#666' }}>
-                    Net Invested: <strong>${totalInvested.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                    Net Invested: <strong>{aud}{totalInvested.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
                   </span>
                   <span style={{ fontSize: 13, color: totalValue < totalInvested ? '#f44336' : '#666' }}>
-                    Current Value: <strong>${totalValue.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                    Current Value: <strong>{aud}{totalValue.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
                   </span>
                   <span style={{ fontSize: 13, color: '#666' }}>
-                    Dividends: <strong>${totalDividends.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                    Dividends: <strong>{aud}{totalDividends.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
                   </span>
                   {(() => {
                     const totalPL = totalValue - totalInvested + totalDividends
                     const pct = totalInvested > 0 ? (totalPL / totalInvested) * 100 : null
                     return (
                       <span style={{ fontSize: 13, color: totalPL >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
-                        P/L: {totalPL >= 0 ? '+' : '-'}${Math.abs(totalPL).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        P/L: {totalPL >= 0 ? '+' : '-'}{aud}{Math.abs(totalPL).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
                       </span>
                     )
                   })()}
+                  {daysPl(summary)}
                 </>
               )
             })()}
@@ -1116,13 +1159,21 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                 // figures below it carry no code — only the AUD conversions
                 // are marked, and those wear A$.
                 const price = priceParts(item.currentPrice, item.nativePrice, null, nativeFirst && isForeign)
-                const sma = nativeFirst && isForeign && item.nativeSma150 != null
-                  ? { value: item.nativeSma150, text: item.nativeSma150.toFixed(2) }
-                  : { value: item.sma150, text: item.sma150 !== null ? `$${item.sma150.toFixed(2)}` : '' }
-                // `A$` only where it earns its keep: on the International
-                // screen the prices above these totals are in the stock's own
-                // currency, so a bare `$` would not say which is which.
-                const aud = nativeFirst ? 'A$' : '$'
+                // Each average is quoted like the price above it: the native
+                // figure on the International screen, AUD on the Local one.
+                // The colour compares the AUD pair either way, so it survives a
+                // missing native figure.
+                const averageLine = (label: string, audValue: number | null, nativeValue: number | null) => {
+                  const useNative = nativeFirst && isForeign && nativeValue != null
+                  const shown = useNative ? nativeValue.toFixed(2) : audValue !== null ? `$${audValue.toFixed(2)}` : null
+                  if (shown === null) return null
+                  const below = item.currentPrice !== null && audValue !== null && audValue > item.currentPrice
+                  return (
+                    <div key={label} style={{ color: below ? '#f44336' : undefined }}>
+                      {label}: {shown}
+                    </div>
+                  )
+                }
                 return (
                 <div
                   key={item.symbol}
@@ -1185,11 +1236,9 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                       quoted in whichever currency that price is in. Comparing
                       the two AUD figures keeps the colour right even when one
                       of the native ones is missing. */}
-                  {sma.value !== null && (
-                    <div style={{ color: item.currentPrice !== null && item.sma150 !== null && item.sma150 > item.currentPrice ? '#f44336' : undefined }}>
-                      150SMA: {sma.text}
-                    </div>
-                  )}
+                  {averageLine('50SMA', item.sma50, item.nativeSma50)}
+                  {averageLine('150SMA', item.sma150, item.nativeSma150)}
+                  {averageLine('40W EMA', item.ema40w, item.nativeEma40w)}
                   <div>Current value: {aud}{item.currentValue.toFixed(2)}</div>
                   <div>Dividends: {aud}{item.dividends.toFixed(2)}</div>
                   {holdingsSymbolFields[item.symbol]?.['stop_loss'] && (
@@ -1244,13 +1293,14 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                   <div key={label} style={{ marginBottom: 24 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 8, flexWrap: 'wrap' }}>
                       <h3 style={{ margin: 0, fontSize: 15 }}>{label}</h3>
-                      <span style={{ fontSize: 13, color: '#666' }}>Net Invested: <strong>${inv.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
-                      <span style={{ fontSize: 13, color: val < inv ? '#f44336' : '#666' }}>Current Value: <strong>${val.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
-                      <span style={{ fontSize: 13, color: '#666' }}>Dividends: <strong>${div.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                      <span style={{ fontSize: 13, color: '#666' }}>Net Invested: <strong>{aud}{inv.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                      <span style={{ fontSize: 13, color: val < inv ? '#f44336' : '#666' }}>Current Value: <strong>{aud}{val.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                      <span style={{ fontSize: 13, color: '#666' }}>Dividends: <strong>{aud}{div.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
                       <span style={{ fontSize: 13, color: pl >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
-                        P/L: {pl >= 0 ? '+' : '-'}${Math.abs(pl).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        P/L: {pl >= 0 ? '+' : '-'}{aud}{Math.abs(pl).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         {inv > 0 && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pl >= 0 ? '+' : ''}{((pl / inv) * 100).toFixed(1)}%)</span>}
                       </span>
+                      {daysPl(items)}
                     </div>
                     <div className="holdings-summary-grid">
                       {items.map(renderCard)}

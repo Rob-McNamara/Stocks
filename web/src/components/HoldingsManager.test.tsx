@@ -130,7 +130,8 @@ function makePortfolioHolding(over: Record<string, unknown> & { symbol: string }
     avg_cost: 90, native_avg_cost: 90, current_price: 100, native_current_price: 100,
     price_source: 'cache', price_date: '2026-09-17', change: 1, change_percent: 1,
     volume: 1000, current_value: 1000, dividends: 0, pl: 100, pl_pct: 11.1,
-    sma150: null, native_sma150: null, stop_loss: null, is_trailing_sell: false,
+    sma50: null, native_sma50: null, sma150: null, native_sma150: null,
+    ema40w: null, native_ema40w: null, day_pl: null, stop_loss: null, is_trailing_sell: false,
     ...over,
   }
 }
@@ -230,10 +231,12 @@ describe('which currency a price leads with', () => {
     symbol: 'EXPD', is_international: true, currency: 'USD',
     current_price: 291.5, native_current_price: 190.92,
     sma150: 282.5, native_sma150: 185.0, current_value: 2915, dividends: 0,
+    sma50: 305.0, native_sma50: 200.0, ema40w: 274.0, native_ema40w: 180.0, invested: 2000,
   })
   const BHP = makePortfolioHolding({
     symbol: 'BHP.AX', current_price: 41.25, native_current_price: 41.25,
     sma150: 38.0, native_sma150: 38.0, current_value: 1000,
+    sma50: 40.0, native_sma50: 40.0, ema40w: 36.0, native_ema40w: 36.0,
   })
 
   async function renderScope(scope: 'local' | 'international', tx: Record<string, unknown>) {
@@ -274,6 +277,8 @@ describe('which currency a price leads with', () => {
   it('reads the 150SMA in the stock\'s currency and marks every AUD total with A$', async () => {
     await renderScope('international', usdPurchase)
     expect(await screen.findByText(/150SMA: 185\.00/)).toBeTruthy()
+    expect(screen.getByText(/50SMA: 200\.00/)).toBeTruthy()
+    expect(screen.getByText(/40W EMA: 180\.00/)).toBeTruthy()
     expect(screen.getByText(/Current value: A\$2915\.00/)).toBeTruthy()
     expect(screen.getByText(/Dividends: A\$0\.00/)).toBeTruthy()
     // The P/L is an AUD figure too — current value less cost, plus income.
@@ -285,10 +290,30 @@ describe('which currency a price leads with', () => {
   it('leaves the local card in plain AUD, with no suffix', async () => {
     await renderScope('local', { id: 1, symbol: 'BHP.AX', price: 40.0 })
     expect(await screen.findByText(/150SMA: \$38\.00/)).toBeTruthy()
+    expect(screen.getByText(/50SMA: \$40\.00/)).toBeTruthy()
+    expect(screen.getByText(/40W EMA: \$36\.00/)).toBeTruthy()
     const value = screen.getByText(/Current value: \$1000\.00/)
     expect(value.textContent).not.toContain('A$')
     const card = value.closest('div')!.parentElement!
     expect(within(card).getByText(/P\/L: /).textContent).not.toContain('A$')
+  })
+
+  // Every total adds up across currencies, so all four are AUD — and say so
+  // on the screen where the figures beside them are not.
+  it('marks the Holdings Summary totals as AUD on the international screen', async () => {
+    await renderScope('international', usdPurchase)
+    const header = (await screen.findAllByText(/Net Invested:/))[0].parentElement!
+    expect(within(header).getByText(/Net Invested:/).textContent).toContain('A$2,000.00')
+    expect(within(header).getByText(/Current Value:/).textContent).toContain('A$2,915.00')
+    expect(within(header).getByText(/Dividends:/).textContent).toContain('A$0.00')
+    expect(within(header).getByText(/P\/L:/).textContent).toContain('A$915.00')
+  })
+
+  it('leaves the local screen\'s totals in a plain $', async () => {
+    await renderScope('local', { id: 1, symbol: 'BHP.AX', price: 40.0 })
+    const header = (await screen.findAllByText(/Net Invested:/))[0].parentElement!
+    expect(within(header).getByText(/Net Invested:/).textContent).not.toContain('A$')
+    expect(within(header).getByText(/P\/L:/).textContent).not.toContain('A$')
   })
 
   // A foreign stock bought in AUD has no native figure to lead with, and the
@@ -298,6 +323,49 @@ describe('which currency a price leads with', () => {
     const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
     const cell = within(table).getByText('$275.00')
     expect(cell.textContent).not.toContain('(')
+  })
+})
+
+describe("today's P/L", () => {
+  const holding = (over: Record<string, unknown> & { symbol: string }) =>
+    makePortfolioHolding({ is_international: true, currency: 'USD', ...over })
+
+  async function renderWith(holdings: unknown[]) {
+    mocked.getPortfolioHoldings.mockResolvedValue({ holdings, fx_rates: { USD: 1.5 } })
+    mocked.getHoldings.mockResolvedValue([makeTransaction({ id: 1, symbol: 'EXPD' })])
+    mocked.getPortfolioLots.mockResolvedValue({
+      lots: [{ transaction_id: 1, remaining: 10, current_value: 100, unrealised_pl: 5 }],
+    })
+    render(<HoldingsManager scope="international" onLoading={() => {}} />)
+    await waitFor(() => expect((triggerButton() as HTMLButtonElement).disabled).toBe(false))
+    return (await screen.findAllByText(/Net Invested:/))[0].parentElement!
+  }
+
+  it("totals the day's money across the screen's holdings", async () => {
+    const header = await renderWith([
+      holding({ symbol: 'EXPD', day_pl: 120, current_value: 2120 }),
+      holding({ symbol: 'IVV.AX', is_etf: true, day_pl: -20, current_value: 880 }),
+    ])
+    // 120 − 20 against an opening 3000 − 100.
+    expect(within(header).getByText(/Today's P\/L:/).textContent).toContain('+A$100.00')
+    expect(within(header).getByText(/Today's P\/L:/).textContent).toContain('+3.4%')
+  })
+
+  // A stale or manual price has no change behind it, so counting it as a flat
+  // day would quietly drag the percentage toward zero.
+  it('leaves out a holding whose quote carried no change', async () => {
+    const header = await renderWith([
+      holding({ symbol: 'EXPD', day_pl: 120, current_value: 2120 }),
+      holding({ symbol: 'IVV.AX', is_etf: true, day_pl: null, current_value: 5000 }),
+    ])
+    expect(within(header).getByText(/Today's P\/L:/).textContent).toContain('+A$120.00')
+    expect(within(header).getByText(/Today's P\/L:/).textContent).toContain('+6.0%')
+  })
+
+  it('shows nothing at all when no holding has a change', async () => {
+    const header = await renderWith([holding({ symbol: 'EXPD', day_pl: null })])
+    expect(within(header).queryByText(/Today's P\/L:/)).toBeNull()
+    expect(within(header).getByText(/Net Invested:/)).toBeTruthy()
   })
 })
 

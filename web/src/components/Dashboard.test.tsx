@@ -32,7 +32,8 @@ function holdingFixture(over: Partial<PortfolioHolding> & { symbol: string }): P
     avg_cost: 90, native_avg_cost: 90, current_price: 100, native_current_price: 100,
     price_source: 'cache', price_date: '2026-09-17', change: 1, change_percent: 1,
     volume: 1000, current_value: 1000, dividends: 0, pl: 100, pl_pct: 11.1,
-    sma150: null, native_sma150: null, stop_loss: null, is_trailing_sell: false,
+    sma50: null, native_sma50: null, sma150: null, native_sma150: null,
+    ema40w: null, native_ema40w: null, day_pl: null, stop_loss: null, is_trailing_sell: false,
     ...over,
   } as PortfolioHolding
 }

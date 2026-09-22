@@ -6577,10 +6577,14 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
         let fields: HashMap<&String, &String> = sym_fields
             .map(|f| f.iter().filter(|(k, _)| k.as_str() != "_notes").collect())
             .unwrap_or_default();
-        // Stored bars are native, so the SMA is too: reported both ways, like
-        // the price, so a holding can be read in the currency it trades in.
+        // Stored bars are native, so the averages are too: reported both ways,
+        // like the price, so a holding can be read in the currency it trades in.
+        let native_sma50 = stored_sma(&conn, symbol, 50);
+        let sma50 = native_sma50.map(|v| ctx.to_aud(symbol, v));
         let native_sma150 = stored_sma(&conn, symbol, 150);
         let sma150 = native_sma150.map(|v| ctx.to_aud(symbol, v));
+        let native_ema40w = stored_weekly_ema(&conn, symbol, 40);
+        let ema40w = native_ema40w.map(|v| ctx.to_aud(symbol, v));
         let itype = ctx.info.get(symbol).and_then(|i| i.0.clone());
         // Effective stop loss (manual field, or the trailing-sell trigger) in
         // the symbol's native currency, matching native_current_price.
@@ -6628,6 +6632,12 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             "price_date": ep.and_then(|p| p.price_date.clone()),
             "change": ep.and_then(|p| p.change),
             "change_percent": ep.and_then(|p| p.change_percent),
+            // The quote's change is per share in the stock's own currency, so
+            // the day's money is converted here — a screen totalling it adds
+            // up holdings in several currencies at once.
+            "day_pl": ep
+                .and_then(|p| p.change)
+                .map(|c| summary.remaining_shares * ctx.to_aud(symbol, c)),
             "volume": ep.and_then(|p| p.volume),
             "current_value": current_value,
             "dividends": dividends,
@@ -6637,8 +6647,12 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             // rather than from the purchase, so the client can say which.
             "basis_date": rebased.as_ref().map(|(date, _)| date.clone()),
             "basis_price": rebased.as_ref().map(|(_, native)| *native),
+            "sma50": sma50,
+            "native_sma50": native_sma50,
             "sma150": sma150,
             "native_sma150": native_sma150,
+            "ema40w": ema40w,
+            "native_ema40w": native_ema40w,
             "stop_loss": stop_loss,
             "is_trailing_sell": is_trailing_sell,
         }));
@@ -9615,7 +9629,7 @@ mod tests {
     /// average has to be available unconverted — the AUD one beside it is what
     /// the totals and the comparisons are built from.
     #[actix_web::test]
-    async fn the_150_day_average_is_reported_in_both_currencies() {
+    async fn the_card_averages_are_reported_in_both_currencies() {
         let (_file, db_path) = setup_test_db();
         let conn = open_db(&db_path).unwrap();
         conn.execute(
@@ -9634,9 +9648,10 @@ mod tests {
             params![Utc::now().to_rfc3339(), Utc::now().format("%Y-%m-%d").to_string()],
         )
         .unwrap();
-        // 150 closes at 100 USD make an average of exactly 100.
-        let start = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
-        for i in 0..150 {
+        // Two years of closes at 100 USD: enough daily bars for the 150-day
+        // averages, and enough weeks behind them for the 40-week EMA to settle.
+        let start = NaiveDate::from_ymd_opt(2024, 6, 3).unwrap();
+        for i in 0..730 {
             let date = (start + chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
             conn.execute(
                 "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('USX', ?1, 100.0, 'x')",
@@ -9655,6 +9670,45 @@ mod tests {
         let usx = find(&body["holdings"], "USX");
         assert!(close_to(&usx["native_sma150"], 100.0), "native average stays in USD, got {}", usx["native_sma150"]);
         assert!(close_to(&usx["sma150"], 150.0), "the AUD average is converted at 1.5, got {}", usx["sma150"]);
+        // The card shows all three averages, so all three come both ways.
+        assert!(close_to(&usx["native_sma50"], 100.0));
+        assert!(close_to(&usx["sma50"], 150.0));
+        assert!(close_to(&usx["native_ema40w"], 100.0), "a flat series settles the EMA on its own level");
+        assert!(close_to(&usx["ema40w"], 150.0));
+    }
+
+    /// The day's money, not the day's price move: shares × the quote's change,
+    /// converted, so a screen can total holdings that trade in different
+    /// currencies without adding a US dollar to an Australian one.
+    #[actix_web::test]
+    async fn the_days_pl_is_shares_times_the_change_in_aud() {
+        let (_file, db_path) = setup_test_db();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+               VALUES (1, 'USX', 'purchase', '2026-01-05', 10.0, 150.0, 0.0, '2026-01-05T00:00:00Z');
+             INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+               VALUES (2, 'LOC.AX', 'purchase', '2026-01-05', 100.0, 5.0, 0.0, '2026-01-05T00:00:00Z');
+             INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('USX', 'USD', 'x');
+             INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('LOC.AX', 'AUD', 'x');",
+        )
+        .unwrap();
+        for (sym, price, change) in [("USX", 110.0, 2.0), ("LOC.AX", 6.0, 0.25), ("USDAUD=X", 1.5, 0.0)] {
+            conn.execute(
+                "INSERT INTO cached_current_prices (symbol, price, change, last_updated, price_date)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![sym, price, change, Utc::now().to_rfc3339(), today],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let body = get_json(&db_path, "/api/portfolio/holdings").await;
+        // 10 shares × US$2.00 × 1.5
+        assert!(close_to(&find(&body["holdings"], "USX")["day_pl"], 30.0));
+        // Already AUD: 100 × 0.25, converted by nothing.
+        assert!(close_to(&find(&body["holdings"], "LOC.AX")["day_pl"], 25.0));
     }
 
     /// A weekly indicator crossed in days must use the last *completed* week.

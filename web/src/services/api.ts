@@ -237,9 +237,15 @@ export interface PortfolioHolding {
   dividends: number
   pl: number
   pl_pct: number | null
+  sma50: number | null
+  native_sma50: number | null
   sma150: number | null
   /** The same 150-day average in the symbol's own currency */
   native_sma150: number | null
+  ema40w: number | null
+  native_ema40w: number | null
+  /** Today's money for this holding: shares × the quote's change, in AUD */
+  day_pl: number | null
   /** Effective stop loss in native currency: manual field, or the trailing-sell trigger */
   stop_loss: number | null
   is_trailing_sell: boolean
