@@ -27,6 +27,20 @@ export const BREAKTHROUGH_COLOR = '#1565c0'
 export const STOP_LOSS_COLOR = '#e91e63'
 /** Purchase predates the chart range — pinned to the Y axis instead. */
 const PURCHASE_AXIS_COLOR = '#ff9800'
+/** A trendline's two anchors, oldest first — the order the API stores them in. */
+interface TrendAnchors {
+  startDate: string
+  startPrice: number
+  endDate: string
+  endPrice: number
+}
+
+/** Order two anchors oldest first, whichever one was dragged past the other. */
+function orderAnchors(a: { date: string; price: number }, b: { date: string; price: number }): TrendAnchors {
+  const [first, second] = a.date < b.date ? [a, b] : [b, a]
+  return { startDate: first.date, startPrice: first.price, endDate: second.date, endPrice: second.price }
+}
+
 /** User-drawn support/resistance levels. */
 /** Recessive grey: an annotation, deliberately outside the series hue space. */
 export const DRAWING_COLOR = '#5f6368'
@@ -146,12 +160,20 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const [drawError, setDrawError] = useState<string | null>(null)
   /** A level being dragged, at its native price under the cursor. */
   const [draggingLevel, setDraggingLevel] = useState<{ id: number; price: number } | null>(null)
+  /** A trendline with one end being dragged: both anchors, oldest first, native prices. */
+  const [draggingTrend, setDraggingTrend] = useState<({ id: number } & TrendAnchors) | null>(null)
   /**
-   * Set when a drag ends. The mouseup is followed by a click on the chart,
-   * which in level-draw mode would otherwise place a second level exactly
-   * where the moved one was dropped.
+   * Set when a handle is released. The mouseup is followed by a click on the
+   * chart, which in draw mode would otherwise place a new level, or start a
+   * new trendline, exactly where the handle was let go.
    */
   const swallowNextClick = useRef(false)
+  const swallowClickAfterRelease = () => {
+    swallowNextClick.current = true
+    // The click follows mouseup synchronously, so a release outside the chart
+    // (which sends no click) must not leave this set for the next real one.
+    setTimeout(() => { swallowNextClick.current = false }, 0)
+  }
   const [timeframe, setTimeframe] = useState<ChartTimeframe>(FALLBACK_CHART_DEFAULTS.timeframe)
   const [chartType, setChartType] = useState<'line' | 'candle'>(FALLBACK_CHART_DEFAULTS.chartType)
   const [barInterval, setBarInterval] = useState<'day' | 'week'>(FALLBACK_CHART_DEFAULTS.barInterval)
@@ -858,11 +880,8 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
       setDraggingLevel(null)
+      swallowClickAfterRelease()
       if (price === startPrice) return
-      swallowNextClick.current = true
-      // The click that follows mouseup fires synchronously after it, so a
-      // release outside the chart (no click) must not leave this set.
-      setTimeout(() => { swallowNextClick.current = false }, 0)
 
       const saved = Number(price.toFixed(4))
       setDrawings((rows) => rows.map((r) => (r.id === id ? { ...r, price: saved } : r)))
@@ -871,6 +890,60 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       } catch (err) {
         setDrawings((rows) => rows.map((r) => (r.id === id ? { ...r, price: startPrice } : r)))
         setDrawError(err instanceof Error ? err.message : 'Failed to move the price level')
+      }
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  /**
+   * Drag one end of a trendline. The end snaps to a trading day, as it did
+   * when the line was drawn, and the other end stays put. It may be dragged
+   * past the other end — the anchors are simply re-ordered — but not onto the
+   * same day, where the line would have no slope. Saved once, on release.
+   */
+  const handleAnchorDrag = (e: React.MouseEvent<SVGElement>, d: ChartDrawing, which: 'start' | 'end') => {
+    e.preventDefault()
+    e.stopPropagation()
+    const svg = svgRef.current
+    if (!svg || !d.start_date || !d.end_date || d.end_price == null) return
+    setDrawError(null)
+    const fixed = which === 'start'
+      ? { date: d.end_date, price: d.end_price }
+      : { date: d.start_date, price: d.price }
+    const original = which === 'start'
+      ? { date: d.start_date, price: d.price }
+      : { date: d.end_date, price: d.end_price }
+    let moved = original
+
+    const onMove = (move: MouseEvent) => {
+      const rect = svg.getBoundingClientRect()
+      const x = ((move.clientX - rect.left) / rect.width) * chartData.width
+      const y = ((move.clientY - rect.top) / rect.height) * chartData.height
+      const clampedY = Math.min(chartData.top + chartData.pricePlotHeight, Math.max(chartData.top, y))
+      const date = dateAtX(x)
+      const price = nativePriceAtY(clampedY)
+      if (!date || date === fixed.date || !isFinite(price) || price <= 0) return
+      moved = { date, price }
+      setDraggingTrend({ id: d.id, ...orderAnchors(moved, fixed) })
+    }
+    const onUp = async () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setDraggingTrend(null)
+      swallowClickAfterRelease()
+      if (moved === original) return
+
+      const line = orderAnchors({ date: moved.date, price: Number(moved.price.toFixed(4)) }, fixed)
+      const asRow = (r: ChartDrawing): ChartDrawing => ({
+        ...r, price: line.startPrice, start_date: line.startDate, end_date: line.endDate, end_price: line.endPrice,
+      })
+      setDrawings((rows) => rows.map((r) => (r.id === d.id ? asRow(r) : r)))
+      try {
+        setDrawings(await apiClient.moveTrendline(d.id, line))
+      } catch (err) {
+        setDrawings((rows) => rows.map((r) => (r.id === d.id ? d : r)))
+        setDrawError(err instanceof Error ? err.message : 'Failed to move the trendline')
       }
     }
     window.addEventListener('mousemove', onMove)
@@ -1134,7 +1207,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           <div style={{ fontSize: 12, color: '#546e7a', marginBottom: 4 }}>
             {pendingAnchor
               ? `Anchored at ${pendingAnchor.date} — click a second point to finish the line.`
-              : 'Click the first point of the trendline. Anchors snap to trading days.'}
+              : 'Click the first point of the trendline. Anchors snap to trading days. Drag either end of a line to move it.'}
           </div>
         )}
         {drawError && <div className="alert alert-error" style={{ marginBottom: 4 }}>{drawError}</div>}
@@ -1253,10 +1326,13 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
             const colour = d.colour ?? DRAWING_COLOR
 
             if (d.kind === 'trend' && d.start_date && d.end_date && d.end_price != null) {
-              const x1 = dateToX(d.start_date)
-              const y1 = chartData.toY(d.price * fxMultiplier)
-              const x2 = dateToX(d.end_date)
-              const y2 = chartData.toY(d.end_price * fxMultiplier)
+              const a: TrendAnchors = draggingTrend?.id === d.id
+                ? draggingTrend
+                : { startDate: d.start_date, startPrice: d.price, endDate: d.end_date, endPrice: d.end_price }
+              const x1 = dateToX(a.startDate)
+              const y1 = chartData.toY(a.startPrice * fxMultiplier)
+              const x2 = dateToX(a.endDate)
+              const y2 = chartData.toY(a.endPrice * fxMultiplier)
               if (x2 === x1) return null
               // Projected past the second anchor to the right edge — that is
               // the point of a trendline. The clip path keeps it inside the
@@ -1264,19 +1340,47 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
               const right = chartData.left + chartData.plotWidth
               const slope = (y2 - y1) / (x2 - x1)
               const yAtRight = y2 + slope * (right - x2)
+              // The × sits beside the end anchor, flipped inward when that end
+              // is on the latest bar, as it usually is, so it is never clipped.
+              const removeX = x2 + 16 <= right ? x2 + 16 : x2 - 16
+              const removeY = y2 - 16
               return (
-                <g key={d.id} clipPath={`url(#${clipId})`}>
+                <g key={d.id}>
+                <g clipPath={`url(#${clipId})`}>
                   <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={colour} strokeWidth="1.5" />
                   <line
                     x1={x2} y1={y2} x2={right} y2={yAtRight}
                     stroke={colour} strokeWidth="1.5" strokeDasharray="4 4" opacity="0.7"
                   />
-                  <circle cx={x1} cy={y1} r="4" fill={colour} stroke="#fff" strokeWidth="1.5" />
+                  {/* Both ends are handles. The visible dot is small; a wider
+                      transparent circle over it takes the grab. Which stored
+                      anchor an end is follows the drawn order, so a line
+                      dragged through itself still maps each dot to its row. */}
+                  {([['start', x1, y1], ['end', x2, y2]] as const).map(([which, cx, cy]) => (
+                    <g key={which}>
+                      <circle cx={cx} cy={cy} r="4.5" fill={colour} stroke="#fff" strokeWidth="1.5" />
+                      <circle
+                        className="trend-anchor"
+                        data-anchor={which}
+                        cx={cx} cy={cy} r="9"
+                        fill="transparent"
+                        style={{ cursor: 'move' }}
+                        onMouseDown={(e) => handleAnchorDrag(e, d, which)}
+                      >
+                        <title>Drag to move this end of the trendline</title>
+                      </circle>
+                    </g>
+                  ))}
+                </g>
+                {/* Offset from the end anchor so the anchor stays free to grab;
+                    hidden with it when that end is off the price panel. */}
+                {x2 >= chartData.left && x2 <= right && y2 >= chartData.top && y2 <= chartData.top + chartData.pricePlotHeight && (
                   <g style={{ cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); void removeDrawing(d.id) }}>
                     <title>Remove this trendline</title>
-                    <circle cx={x2} cy={y2} r="6" fill="#fff" stroke={colour} strokeWidth="1.5" />
-                    <text x={x2} y={y2 + 4} fontSize="10" fill={colour} textAnchor="middle" fontFamily="inherit">×</text>
+                    <circle cx={removeX} cy={removeY} r="6" fill="#fff" stroke={colour} strokeWidth="1.5" />
+                    <text x={removeX} y={removeY + 4} fontSize="10" fill={colour} textAnchor="middle" fontFamily="inherit">×</text>
                   </g>
+                )}
                 </g>
               )
             }

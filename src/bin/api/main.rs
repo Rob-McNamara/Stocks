@@ -4445,12 +4445,18 @@ async fn add_chart_drawing(
 
 #[derive(Deserialize)]
 struct MovedChartDrawing {
+    /// A level's price, or a trendline's first anchor.
     price: f64,
+    /// Trendlines only, and then all three are required: the line is moved by
+    /// restating both anchors.
+    start_date: Option<String>,
+    end_date: Option<String>,
+    end_price: Option<f64>,
 }
 
 #[utoipa::path(patch, path = "/api/v1/chart-drawings/id/{id}", tag = "charts",
     params(("id" = i64, Path, description = "id")),
-    responses((status = 200, description = "Move a horizontal level to a new price")))]
+    responses((status = 200, description = "Move a level to a new price, or a trendline to new anchors")))]
 #[patch("/api/chart-drawings/id/{id}")]
 async fn move_chart_drawing(
     db_path: web::Data<PathBuf>,
@@ -4458,7 +4464,8 @@ async fn move_chart_drawing(
     payload: web::Json<MovedChartDrawing>,
 ) -> impl Responder {
     let id = path.into_inner();
-    let price = payload.into_inner().price;
+    let payload = payload.into_inner();
+    let price = payload.price;
     // Same rule as drawing one: a level at or below zero can never be seen.
     if !price.is_finite() || price <= 0.0 {
         return err_bad_request("Price level must be a positive number".to_string());
@@ -4484,17 +4491,44 @@ async fn move_chart_drawing(
     let Some((symbol, kind, old_price)) = found else {
         return err_not_found(format!("Drawing {} not found", id));
     };
-    // A trendline's `price` is only its first anchor; moving that alone would
-    // silently change the line's slope.
-    if kind != "horizontal" {
-        return err_bad_request("Only a horizontal level can be moved to a new price".to_string());
-    }
-    if let Err(err) = conn.execute("UPDATE chart_drawings SET price = ?1 WHERE id = ?2", params![price, id]) {
-        let _ = insert_event_log(&db_path, "error", "chart_drawings", "api", Some(&symbol), &format!("Failed to move level {}: {}", id, err));
+    let has_anchors = payload.start_date.is_some() || payload.end_date.is_some() || payload.end_price.is_some();
+    let (result, moved) = if kind == "trend" {
+        // A trendline's `price` is only its first anchor; moving that alone
+        // would silently change the line's slope, so both anchors are restated.
+        let (Some(start_date), Some(end_date), Some(end_price)) =
+            (payload.start_date.as_deref(), payload.end_date.as_deref(), payload.end_price)
+        else {
+            return err_bad_request(
+                "Moving a trendline needs both anchors: start_date, end_date and end_price".to_string(),
+            );
+        };
+        if !end_price.is_finite() || end_price <= 0.0 {
+            return err_bad_request("A trendline's end_price must be a positive number".to_string());
+        }
+        if start_date == end_date {
+            return err_bad_request("A trendline's two anchors must be on different dates".to_string());
+        }
+        (
+            conn.execute(
+                "UPDATE chart_drawings SET price = ?1, start_date = ?2, end_date = ?3, end_price = ?4 WHERE id = ?5",
+                params![price, start_date, end_date, end_price, id],
+            ),
+            format!("Moved trendline {} to {} {} → {} {}", id, start_date, price, end_date, end_price),
+        )
+    } else {
+        if has_anchors {
+            return err_bad_request("A horizontal level has only a price to move".to_string());
+        }
+        (
+            conn.execute("UPDATE chart_drawings SET price = ?1 WHERE id = ?2", params![price, id]),
+            format!("Moved level {} from {} to {}", id, old_price, price),
+        )
+    };
+    if let Err(err) = result {
+        let _ = insert_event_log(&db_path, "error", "chart_drawings", "api", Some(&symbol), &format!("Failed to move drawing {}: {}", id, err));
         return err_internal(err.to_string());
     }
-    let _ = insert_event_log(&db_path, "info", "chart_drawings", "api", Some(&symbol),
-        &format!("Moved level {} from {} to {}", id, old_price, price));
+    let _ = insert_event_log(&db_path, "info", "chart_drawings", "api", Some(&symbol), &moved);
     match load_chart_drawings(&conn, &symbol) {
         Ok(rows) => HttpResponse::Ok().json(serde_json::json!({ "drawings": rows })),
         Err(err) => {
@@ -12059,7 +12093,7 @@ mod tests {
     /// Dragging a level saves its new price in place: same row, same symbol,
     /// and the audit log records both prices so a mis-drag can be undone.
     #[actix_web::test]
-    async fn a_level_moves_to_a_new_price_and_a_trendline_does_not() {
+    async fn a_level_moves_to_a_new_price_but_a_trendline_needs_its_anchors() {
         let (_file, db_path) = setup_test_db();
         let app = actix_web::test::init_service(
             App::new()
@@ -12108,7 +12142,73 @@ mod tests {
         }))).await;
         let trend_id = body["drawings"].as_array().unwrap().iter()
             .find(|d| d["kind"] == "trend").unwrap()["id"].as_i64().unwrap();
+        // Moving only the first anchor's price would tilt the line.
         assert_eq!(actix_web::test::call_service(&app, mv(trend_id, 31.0)).await.status(), 400);
+
+        let level_with_anchors = actix_web::test::TestRequest::patch()
+            .uri(&format!("/api/chart-drawings/id/{id}"))
+            .set_json(serde_json::json!({ "price": 40.0, "end_date": "2026-03-05" }))
+            .to_request();
+        assert_eq!(actix_web::test::call_service(&app, level_with_anchors).await.status(), 400);
+    }
+
+    /// Dragging either end of a trendline restates both anchors; a move that
+    /// would leave it with no slope or no end is refused like a new one.
+    #[actix_web::test]
+    async fn a_trendline_moves_by_restating_both_anchors() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(add_chart_drawing)
+                .service(move_chart_drawing),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/api/chart-drawings/BHP.AX")
+            .set_json(serde_json::json!({
+                "kind": "trend", "price": 30.0, "label": "uptrend",
+                "start_date": "2026-01-05", "end_date": "2026-03-05", "end_price": 42.5
+            }))
+            .to_request();
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        let id = body["drawings"][0]["id"].as_i64().unwrap();
+
+        let mv = |body: serde_json::Value| {
+            actix_web::test::TestRequest::patch()
+                .uri(&format!("/api/chart-drawings/id/{id}"))
+                .set_json(body)
+                .to_request()
+        };
+        for (case, body) in [
+            ("no end anchor", serde_json::json!({ "price": 31.0, "start_date": "2026-01-05" })),
+            ("zero end price", serde_json::json!({ "price": 31.0, "start_date": "2026-01-05", "end_date": "2026-03-05", "end_price": 0.0 })),
+            ("same date twice", serde_json::json!({ "price": 31.0, "start_date": "2026-03-05", "end_date": "2026-03-05", "end_price": 40.0 })),
+        ] {
+            assert_eq!(actix_web::test::call_service(&app, mv(body)).await.status(), 400, "{case} should be refused");
+        }
+
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, mv(serde_json::json!({
+            "price": 29.0, "start_date": "2026-01-12", "end_date": "2026-04-01", "end_price": 45.0
+        }))).await;
+        let rows = body["drawings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let d = &rows[0];
+        assert_eq!(d["id"], id);
+        assert_eq!(d["kind"], "trend");
+        assert_eq!(d["label"], "uptrend");
+        assert_eq!((d["price"].as_f64(), d["start_date"].as_str()), (Some(29.0), Some("2026-01-12")));
+        assert_eq!((d["end_price"].as_f64(), d["end_date"].as_str()), (Some(45.0), Some("2026-04-01")));
+
+        let audited: String = open_db(&db_path).unwrap()
+            .query_row(
+                "SELECT json_extract(old_values, '$.end_date') || ' -> ' || json_extract(new_values, '$.end_date')
+                   FROM audit_log WHERE table_name = 'chart_drawings' AND action = 'UPDATE'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, "2026-03-05 -> 2026-04-01");
     }
 
     /// A stray drag must not write a level that can never be seen.

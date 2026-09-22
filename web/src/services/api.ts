@@ -624,6 +624,24 @@ export const apiClient = {
     return (await response.json()).drawings ?? []
   },
 
+  /** Move a trendline by restating both anchors (native prices, oldest first). */
+  async moveTrendline(id: number, line: Omit<NewTrendline, 'label'>): Promise<ChartDrawing[]> {
+    const response = await apiFetch(`${API_BASE_URL}/chart-drawings/id/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        price: line.startPrice,
+        start_date: line.startDate,
+        end_date: line.endDate,
+        end_price: line.endPrice,
+      }),
+    })
+    if (!response.ok) {
+      throw new Error((await apiErrorMessage(response)) || 'Failed to move the trendline')
+    }
+    return (await response.json()).drawings ?? []
+  },
+
   async deleteChartDrawing(id: number): Promise<void> {
     const response = await apiFetch(`${API_BASE_URL}/chart-drawings/id/${id}`, { method: 'DELETE' })
     if (!response.ok) {

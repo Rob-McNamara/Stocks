@@ -17,6 +17,7 @@ vi.mock('../services/api', async (importOriginal) => {
       addTrendline: vi.fn(),
       deleteChartDrawing: vi.fn(),
       moveChartDrawing: vi.fn(),
+      moveTrendline: vi.fn(),
       getSymbolInfo: vi.fn(),
       getFxRateForDate: vi.fn(),
     },
@@ -31,6 +32,7 @@ const addChartDrawing = apiClient.addChartDrawing as ReturnType<typeof vi.fn>
 const addTrendline = apiClient.addTrendline as ReturnType<typeof vi.fn>
 const deleteChartDrawing = apiClient.deleteChartDrawing as ReturnType<typeof vi.fn>
 const moveChartDrawing = apiClient.moveChartDrawing as ReturnType<typeof vi.fn>
+const moveTrendline = apiClient.moveTrendline as ReturnType<typeof vi.fn>
 
 // Chart geometry constants from PriceChart's chartData
 // jsdom has no ResizeObserver, so the chart keeps its unmeasured fallback
@@ -85,6 +87,7 @@ beforeEach(() => {
   addTrendline.mockReset().mockResolvedValue([])
   deleteChartDrawing.mockReset().mockResolvedValue(undefined)
   moveChartDrawing.mockReset().mockResolvedValue([])
+  moveTrendline.mockReset().mockResolvedValue([])
 })
 
 afterEach(() => {
@@ -899,6 +902,119 @@ describe('trendlines', () => {
     expect(line.startDate < line.endDate).toBe(true)
     expect(line.startPrice).toBeGreaterThan(0)
     expect(line.endPrice).toBeGreaterThan(0)
+  })
+})
+
+describe('moving a trendline', () => {
+  const trend = (over: Record<string, unknown> = {}) => ({
+    id: 5, symbol: 'TST.AX', kind: 'trend' as const,
+    price: 9, label: null, colour: null,
+    start_date: DATES[5], end_date: DATES[20], end_price: 11,
+    created_at: 'x', ...over,
+  })
+  /** x of bar `i` in the unmeasured 1100-wide fallback frame. */
+  const barX = (i: number) => LEFT + (PLOT_WIDTH * i) / (DATES.length - 1)
+
+  const setRect = (container: HTMLElement) => {
+    const svg = container.querySelector('svg')!
+    const [, , w, h] = svg.getAttribute('viewBox')!.split(' ').map(Number)
+    svg.getBoundingClientRect = () => ({
+      top: 0, left: 0, width: w, height: h, right: w, bottom: h, x: 0, y: 0, toJSON: () => {},
+    }) as DOMRect
+    return svg
+  }
+
+  const dragAnchor = (container: HTMLElement, which: 'start' | 'end', toX: number, toY: number) => {
+    const svg = setRect(container)
+    const handle = container.querySelector(`circle.trend-anchor[data-anchor="${which}"]`)!
+    fireEvent.mouseDown(handle)
+    fireEvent.mouseMove(window, { clientX: toX, clientY: toY })
+    fireEvent.mouseUp(window)
+    fireEvent.click(svg, { clientX: toX, clientY: toY })
+  }
+
+  const anchor = (container: HTMLElement, which: 'start' | 'end') => {
+    const c = container.querySelector(`circle.trend-anchor[data-anchor="${which}"]`)!
+    return { x: parseFloat(c.getAttribute('cx')!), y: parseFloat(c.getAttribute('cy')!) }
+  }
+
+  it('moves the dragged end to the trading day and price it was dropped on, leaving the other', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    moveTrendline.mockImplementation(async (id: number, l: { startDate: string; startPrice: number; endDate: string; endPrice: number }) =>
+      [trend({ id, price: l.startPrice, start_date: l.startDate, end_date: l.endDate, end_price: l.endPrice })])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('circle.trend-anchor')).toBeTruthy())
+    const endBefore = anchor(container, 'end')
+
+    // A hair off bar 30, higher up the screen: it must snap to the bar.
+    dragAnchor(container, 'end', barX(30) + 3, endBefore.y - 40)
+
+    await waitFor(() => expect(moveTrendline).toHaveBeenCalled())
+    const [id, line] = moveTrendline.mock.calls[0]
+    expect(id).toBe(5)
+    expect(line.startDate).toBe(DATES[5])
+    expect(line.startPrice).toBe(9)
+    expect(line.endDate).toBe(DATES[30])
+    expect(line.endPrice).toBeGreaterThan(11)
+    expect(Math.abs(anchor(container, 'end').x - barX(30))).toBeLessThan(0.5)
+  })
+
+  // Dragging the start past the end is a natural gesture; the API stores the
+  // older anchor first, so the two are swapped rather than refused.
+  it('re-orders the anchors when one end is dragged past the other', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('circle.trend-anchor')).toBeTruthy())
+    dragAnchor(container, 'start', barX(30), anchor(container, 'start').y)
+
+    await waitFor(() => expect(moveTrendline).toHaveBeenCalled())
+    const [, line] = moveTrendline.mock.calls[0]
+    expect(line.startDate).toBe(DATES[20])
+    expect(line.startPrice).toBe(11)
+    expect(line.endDate).toBe(DATES[30])
+  })
+
+  // Both anchors on one day is a line with no slope, which the API refuses.
+  it('will not drop an end onto the other end\'s day', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('circle.trend-anchor')).toBeTruthy())
+    dragAnchor(container, 'end', barX(5), 100)
+    expect(moveTrendline).not.toHaveBeenCalled()
+  })
+
+  // In trend-draw mode the click after mouseup would otherwise start a new line.
+  it('does not start a new trendline when a drag ends in draw mode', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('circle.trend-anchor')).toBeTruthy())
+    fireEvent.click(screen.getByTitle(/Draw a trendline/))
+    dragAnchor(container, 'end', barX(30), 150)
+
+    await waitFor(() => expect(moveTrendline).toHaveBeenCalled())
+    expect(screen.queryByText(/Anchored at/)).toBeNull()
+  })
+
+  it('puts the line back and says so when the save fails', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    moveTrendline.mockRejectedValue(new Error('database is locked'))
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('circle.trend-anchor')).toBeTruthy())
+    const before = anchor(container, 'end')
+    dragAnchor(container, 'end', barX(30), before.y - 40)
+
+    await waitFor(() => expect(screen.getByText(/database is locked/)).toBeTruthy())
+    expect(anchor(container, 'end')).toEqual(before)
+  })
+
+  it('still removes the line from its × beside the end anchor', async () => {
+    getChartDrawings.mockResolvedValue([trend()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('circle.trend-anchor')).toBeTruthy())
+    const title = [...container.querySelectorAll('title')].find((t) => t.textContent === 'Remove this trendline')!
+    fireEvent.click(title.parentElement!)
+    await waitFor(() => expect(deleteChartDrawing).toHaveBeenCalledWith(5))
+    expect(moveTrendline).not.toHaveBeenCalled()
   })
 })
 
