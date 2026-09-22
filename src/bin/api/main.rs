@@ -10344,6 +10344,46 @@ mod tests {
         assert!(dividend_rows(&db_path, "NSC").is_empty());
     }
 
+    /// USDAUD=X 2025-01-20 exactly as Yahoo's daily bars carry it: the close
+    /// sits above the high. Stored as-is it draws a candle body past its wick,
+    /// and every history re-fetch would undo `backfill_ohlc --repair`.
+    #[test]
+    fn stored_history_bars_contain_their_own_open_and_close() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        // A bar already filled, which a close-only refresh must not blank.
+        conn.execute(
+            "INSERT INTO prices (symbol, date, open, high, low, close, fetched_at)
+             VALUES ('USDAUD=X', '2025-01-21', 1.60, 1.62, 1.59, 1.61, 'x')",
+            [],
+        )
+        .unwrap();
+        let bar = |date: &str, open, high, low, close| PriceHistoryPoint {
+            date: date.to_string(), open, high, low, close, volume: None,
+        };
+        persist_price_history(&conn, "USDAUD=X", &[
+            bar("2025-01-20", Some(1.61335003376007), Some(1.61363196372986), Some(1.59096300601959), Some(1.61409997940063)),
+            bar("2025-01-21", None, None, None, Some(1.615)),
+            bar("2025-01-22", None, None, None, Some(1.62)),
+        ]);
+
+        let row = |date: &str| -> (Option<f64>, Option<f64>, Option<f64>, f64) {
+            conn.query_row(
+                "SELECT open, high, low, close FROM prices WHERE symbol = 'USDAUD=X' AND date = ?1",
+                params![date],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        let (open, high, low, close) = row("2025-01-20");
+        assert_eq!(high, Some(1.61409997940063), "high widened to the close");
+        assert_eq!(low, Some(1.59096300601959), "low already contained the body");
+        assert_eq!((open, close), (Some(1.61335003376007), 1.61409997940063), "open and close are never altered");
+
+        assert_eq!(row("2025-01-21"), (Some(1.60), Some(1.62), Some(1.59), 1.615), "a close-only refresh keeps the stored range");
+        assert_eq!(row("2025-01-22"), (None, None, None, 1.62), "a close alone is not a range");
+    }
+
     /// EXPD 2026-09-17: the bar opened at its high of 190.92, but the chart
     /// meta reported a day high of 190.255. Taking high from meta and open from
     /// the bar stored an open above its own high.

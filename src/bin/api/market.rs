@@ -48,9 +48,21 @@ pub(crate) fn mark_history_checked(symbol: &str) {
     }
 }
 
+/// Widen a bar's high/low to contain its own open and close.
+///
+/// Yahoo's daily bars are not always self-consistent: its FX bars in
+/// particular (USDAUD=X) carry a close a hair outside the high/low, and a bar
+/// like that draws a candle body past its own wick. The open and close are
+/// trades in the session, so the true range contains them. A side with no
+/// high or low stays empty — see `session_range`.
+pub(crate) fn widen_bar_to_body(bar: &PriceHistoryPoint) -> PriceHistoryPoint {
+    let (high, low) = session_range([bar.high, None], [bar.low, None], [bar.open, bar.close]);
+    PriceHistoryPoint { date: bar.date.clone(), open: bar.open, high, low, close: bar.close, volume: bar.volume }
+}
+
 pub(crate) fn persist_price_history(conn: &Connection, symbol: &str, records: &[PriceHistoryPoint]) {
     let now = Utc::now().to_rfc3339();
-    for r in records {
+    for r in records.iter().map(widen_bar_to_body) {
         // COALESCE on the OHLC columns so a close-only refresh can never blank
         // out bars the backfill already filled.
         if let Some(close) = r.close
@@ -365,7 +377,9 @@ pub(crate) async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str
         let low = quote.low.as_ref().and_then(|v| v.get(index).cloned().flatten());
 
         if close.is_some() {
-            records.push(PriceHistoryPoint { date, open, high, low, close, volume });
+            // Widened here as well as on persist, so a first load that serves
+            // these records straight to the chart matches what is stored.
+            records.push(widen_bar_to_body(&PriceHistoryPoint { date, open, high, low, close, volume }));
         }
     }
 
