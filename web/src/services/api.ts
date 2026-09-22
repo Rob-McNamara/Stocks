@@ -611,6 +611,19 @@ export const apiClient = {
     return (await response.json()).drawings ?? []
   },
 
+  /** Move a horizontal level to a new native price; returns the symbol's drawings. */
+  async moveChartDrawing(id: number, price: number): Promise<ChartDrawing[]> {
+    const response = await apiFetch(`${API_BASE_URL}/chart-drawings/id/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ price }),
+    })
+    if (!response.ok) {
+      throw new Error((await apiErrorMessage(response)) || 'Failed to move the price level')
+    }
+    return (await response.json()).drawings ?? []
+  },
+
   async deleteChartDrawing(id: number): Promise<void> {
     const response = await apiFetch(`${API_BASE_URL}/chart-drawings/id/${id}`, { method: 'DELETE' })
     if (!response.ok) {

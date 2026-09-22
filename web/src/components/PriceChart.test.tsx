@@ -16,6 +16,7 @@ vi.mock('../services/api', async (importOriginal) => {
       addChartDrawing: vi.fn(),
       addTrendline: vi.fn(),
       deleteChartDrawing: vi.fn(),
+      moveChartDrawing: vi.fn(),
       getSymbolInfo: vi.fn(),
       getFxRateForDate: vi.fn(),
     },
@@ -29,6 +30,7 @@ const getChartDrawings = apiClient.getChartDrawings as ReturnType<typeof vi.fn>
 const addChartDrawing = apiClient.addChartDrawing as ReturnType<typeof vi.fn>
 const addTrendline = apiClient.addTrendline as ReturnType<typeof vi.fn>
 const deleteChartDrawing = apiClient.deleteChartDrawing as ReturnType<typeof vi.fn>
+const moveChartDrawing = apiClient.moveChartDrawing as ReturnType<typeof vi.fn>
 
 // Chart geometry constants from PriceChart's chartData
 // jsdom has no ResizeObserver, so the chart keeps its unmeasured fallback
@@ -82,6 +84,7 @@ beforeEach(() => {
   addChartDrawing.mockReset().mockResolvedValue([])
   addTrendline.mockReset().mockResolvedValue([])
   deleteChartDrawing.mockReset().mockResolvedValue(undefined)
+  moveChartDrawing.mockReset().mockResolvedValue([])
 })
 
 afterEach(() => {
@@ -541,6 +544,84 @@ describe('drawn price levels', () => {
       .find((t) => t.textContent === 'Remove this level')!
     fireEvent.click(title.parentElement!)
     await waitFor(() => expect(deleteChartDrawing).toHaveBeenCalledWith(7))
+  })
+})
+
+describe('moving a level', () => {
+  const level = (over: Record<string, unknown> = {}) => ({
+    id: 7, symbol: 'TST.AX', kind: 'horizontal' as const,
+    price: 10, label: null, colour: null,
+    start_date: null, end_date: null, end_price: null, created_at: 'x', ...over,
+  })
+
+  /** Grab the level's hit strip at its own height and drag it to `toY`. */
+  const dragLevel = (container: HTMLElement, toY: number) => {
+    const svg = container.querySelector('svg')!
+    // The chart's viewBox is 1040 wide; a 1:1 rect makes clientY a viewBox y.
+    svg.getBoundingClientRect = () => ({
+      top: 0, left: 0, width: 1040, height: Number(svg.getAttribute('viewBox')!.split(' ')[3]),
+      right: 1040, bottom: 460, x: 0, y: 0, toJSON: () => {},
+    }) as DOMRect
+    const grab = container.querySelector('line.level-grab')!
+    const fromY = parseFloat(grab.getAttribute('y1')!)
+    fireEvent.mouseDown(grab, { clientY: fromY })
+    fireEvent.mouseMove(window, { clientY: toY })
+    fireEvent.mouseUp(window, { clientY: toY })
+    fireEvent.click(svg, { clientY: toY })
+    return fromY
+  }
+
+  const levelY = (container: HTMLElement) =>
+    parseFloat(container.querySelector('line[stroke-dasharray="6 4"]')!.getAttribute('y1')!)
+
+  it('saves the level at the price it was dropped on', async () => {
+    getChartDrawings.mockResolvedValue([level()])
+    // The server answers with the symbol's drawings, the moved one included.
+    moveChartDrawing.mockImplementation(async (id: number, price: number) => [level({ id, price })])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('line.level-grab')).toBeTruthy())
+    const fromY = dragLevel(container, levelY(container) - 40)
+
+    await waitFor(() => expect(moveChartDrawing).toHaveBeenCalled())
+    const [id, price] = moveChartDrawing.mock.calls[0]
+    expect(id).toBe(7)
+    // Up the screen is up in price.
+    expect(price).toBeGreaterThan(10)
+    expect(levelY(container)).toBeLessThan(fromY)
+  })
+
+  // The mouseup is followed by a click on the chart; in draw mode that click
+  // would otherwise drop a second level where the first one landed.
+  it('does not place a new level when a drag ends in draw mode', async () => {
+    getChartDrawings.mockResolvedValue([level()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('line.level-grab')).toBeTruthy())
+    fireEvent.click(screen.getByTitle(/Draw a horizontal price level/))
+    dragLevel(container, levelY(container) + 30)
+
+    await waitFor(() => expect(moveChartDrawing).toHaveBeenCalled())
+    expect(addChartDrawing).not.toHaveBeenCalled()
+  })
+
+  it('puts the level back and says so when the save fails', async () => {
+    getChartDrawings.mockResolvedValue([level()])
+    moveChartDrawing.mockRejectedValue(new Error('database is locked'))
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('line.level-grab')).toBeTruthy())
+    const fromY = dragLevel(container, levelY(container) - 40)
+
+    await waitFor(() => expect(screen.getByText(/database is locked/)).toBeTruthy())
+    expect(levelY(container)).toBeCloseTo(fromY)
+  })
+
+  it('does not save a click that never moved the level', async () => {
+    getChartDrawings.mockResolvedValue([level()])
+    const { container } = await renderChart()
+    await waitFor(() => expect(container.querySelector('line.level-grab')).toBeTruthy())
+    const grab = container.querySelector('line.level-grab')!
+    fireEvent.mouseDown(grab)
+    fireEvent.mouseUp(window)
+    expect(moveChartDrawing).not.toHaveBeenCalled()
   })
 })
 
