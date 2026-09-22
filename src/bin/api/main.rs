@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{delete, get, patch, post, put, web, App, HttpResponse, HttpServer, Responder};
 use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use reqwest::Client;
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
@@ -2815,6 +2815,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_chart_drawings)
             .service(add_chart_drawing)
             .service(delete_chart_drawing)
+            .service(move_chart_drawing)
             .service(add_cash_account)
             .service(update_cash_account)
             .service(delete_cash_account)
@@ -4439,6 +4440,67 @@ async fn add_chart_drawing(
             }
         }
         Err(err) => err_internal(err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct MovedChartDrawing {
+    price: f64,
+}
+
+#[utoipa::path(patch, path = "/api/v1/chart-drawings/id/{id}", tag = "charts",
+    params(("id" = i64, Path, description = "id")),
+    responses((status = 200, description = "Move a horizontal level to a new price")))]
+#[patch("/api/chart-drawings/id/{id}")]
+async fn move_chart_drawing(
+    db_path: web::Data<PathBuf>,
+    path: web::Path<i64>,
+    payload: web::Json<MovedChartDrawing>,
+) -> impl Responder {
+    let id = path.into_inner();
+    let price = payload.into_inner().price;
+    // Same rule as drawing one: a level at or below zero can never be seen.
+    if !price.is_finite() || price <= 0.0 {
+        return err_bad_request("Price level must be a positive number".to_string());
+    }
+    let conn = match open_db(db_path.as_ref()) {
+        Ok(c) => c,
+        Err(err) => return err_internal(err.to_string()),
+    };
+    let found: Option<(String, String, f64)> = match conn
+        .query_row(
+            "SELECT symbol, kind, price FROM chart_drawings WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+    {
+        Ok(found) => found,
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "chart_drawings", "api", None, &format!("Failed to load drawing {}: {}", id, err));
+            return err_internal(err.to_string());
+        }
+    };
+    let Some((symbol, kind, old_price)) = found else {
+        return err_not_found(format!("Drawing {} not found", id));
+    };
+    // A trendline's `price` is only its first anchor; moving that alone would
+    // silently change the line's slope.
+    if kind != "horizontal" {
+        return err_bad_request("Only a horizontal level can be moved to a new price".to_string());
+    }
+    if let Err(err) = conn.execute("UPDATE chart_drawings SET price = ?1 WHERE id = ?2", params![price, id]) {
+        let _ = insert_event_log(&db_path, "error", "chart_drawings", "api", Some(&symbol), &format!("Failed to move level {}: {}", id, err));
+        return err_internal(err.to_string());
+    }
+    let _ = insert_event_log(&db_path, "info", "chart_drawings", "api", Some(&symbol),
+        &format!("Moved level {} from {} to {}", id, old_price, price));
+    match load_chart_drawings(&conn, &symbol) {
+        Ok(rows) => HttpResponse::Ok().json(serde_json::json!({ "drawings": rows })),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "chart_drawings", "api", Some(&symbol), &err);
+            err_internal(err)
+        }
     }
 }
 
@@ -11992,6 +12054,61 @@ mod tests {
         assert_eq!(d["kind"], "horizontal");
         assert!(d["start_date"].is_null());
         assert!(d["end_price"].is_null());
+    }
+
+    /// Dragging a level saves its new price in place: same row, same symbol,
+    /// and the audit log records both prices so a mis-drag can be undone.
+    #[actix_web::test]
+    async fn a_level_moves_to_a_new_price_and_a_trendline_does_not() {
+        let (_file, db_path) = setup_test_db();
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(db_path.clone()))
+                .service(add_chart_drawing)
+                .service(move_chart_drawing),
+        )
+        .await;
+        let add = |body: serde_json::Value| {
+            actix_web::test::TestRequest::post().uri("/api/chart-drawings/BHP.AX").set_json(body).to_request()
+        };
+        let body: serde_json::Value =
+            actix_web::test::call_and_read_body_json(&app, add(serde_json::json!({ "price": 38.5, "label": "support" }))).await;
+        let id = body["drawings"][0]["id"].as_i64().unwrap();
+
+        let mv = |id: i64, price: f64| {
+            actix_web::test::TestRequest::patch()
+                .uri(&format!("/api/chart-drawings/id/{id}"))
+                .set_json(serde_json::json!({ "price": price }))
+                .to_request()
+        };
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, mv(id, 41.25)).await;
+        let rows = body["drawings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "moving must not create a second level");
+        assert_eq!(rows[0]["id"], id);
+        assert_eq!(rows[0]["price"], 41.25);
+        assert_eq!(rows[0]["label"], "support", "the label travels with the line");
+
+        let audited: (String, String) = open_db(&db_path).unwrap()
+            .query_row(
+                "SELECT json_extract(old_values, '$.price'), json_extract(new_values, '$.price')
+                   FROM audit_log WHERE table_name = 'chart_drawings' AND action = 'UPDATE'",
+                [],
+                |r| Ok((r.get::<_, f64>(0)?.to_string(), r.get::<_, f64>(1)?.to_string())),
+            )
+            .unwrap();
+        assert_eq!(audited, ("38.5".to_string(), "41.25".to_string()));
+
+        for bad in [0.0, -1.0] {
+            assert_eq!(actix_web::test::call_service(&app, mv(id, bad)).await.status(), 400, "price {bad}");
+        }
+        assert_eq!(actix_web::test::call_service(&app, mv(9999, 40.0)).await.status(), 404);
+
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, add(serde_json::json!({
+            "kind": "trend", "price": 30.0, "start_date": "2026-01-05", "end_date": "2026-03-05", "end_price": 42.5
+        }))).await;
+        let trend_id = body["drawings"].as_array().unwrap().iter()
+            .find(|d| d["kind"] == "trend").unwrap()["id"].as_i64().unwrap();
+        assert_eq!(actix_web::test::call_service(&app, mv(trend_id, 31.0)).await.status(), 400);
     }
 
     /// A stray drag must not write a level that can never be seen.

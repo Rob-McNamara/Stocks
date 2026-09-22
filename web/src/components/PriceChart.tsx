@@ -144,6 +144,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   /** First anchor of a trendline, waiting for its second click. */
   const [pendingAnchor, setPendingAnchor] = useState<{ date: string; price: number } | null>(null)
   const [drawError, setDrawError] = useState<string | null>(null)
+  /** A level being dragged, at its native price under the cursor. */
+  const [draggingLevel, setDraggingLevel] = useState<{ id: number; price: number } | null>(null)
+  /**
+   * Set when a drag ends. The mouseup is followed by a click on the chart,
+   * which in level-draw mode would otherwise place a second level exactly
+   * where the moved one was dropped.
+   */
+  const swallowNextClick = useRef(false)
   const [timeframe, setTimeframe] = useState<ChartTimeframe>(FALLBACK_CHART_DEFAULTS.timeframe)
   const [chartType, setChartType] = useState<'line' | 'candle'>(FALLBACK_CHART_DEFAULTS.chartType)
   const [barInterval, setBarInterval] = useState<'day' | 'week'>(FALLBACK_CHART_DEFAULTS.barInterval)
@@ -792,7 +800,57 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     window.addEventListener('mouseup', onUp)
   }
 
+  /**
+   * Drag a level to a new price. The line follows the cursor, clamped to the
+   * price panel so it can't be lost off either edge, and is saved once on
+   * release rather than on every pixel of travel. The move is shown straight
+   * away and rolled back if the save fails.
+   */
+  const handleLevelDrag = (e: React.MouseEvent<SVGElement>, id: number, startPrice: number) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const svg = svgRef.current
+    if (!svg) return
+    setDrawError(null)
+    let price = startPrice
+
+    const onMove = (move: MouseEvent) => {
+      const rect = svg.getBoundingClientRect()
+      const y = ((move.clientY - rect.top) / rect.height) * chartData.height
+      const clamped = Math.min(chartData.top + chartData.pricePlotHeight, Math.max(chartData.top, y))
+      const next = nativePriceAtY(clamped)
+      if (!isFinite(next) || next <= 0) return
+      price = next
+      setDraggingLevel({ id, price })
+    }
+    const onUp = async () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setDraggingLevel(null)
+      if (price === startPrice) return
+      swallowNextClick.current = true
+      // The click that follows mouseup fires synchronously after it, so a
+      // release outside the chart (no click) must not leave this set.
+      setTimeout(() => { swallowNextClick.current = false }, 0)
+
+      const saved = Number(price.toFixed(4))
+      setDrawings((rows) => rows.map((r) => (r.id === id ? { ...r, price: saved } : r)))
+      try {
+        setDrawings(await apiClient.moveChartDrawing(id, saved))
+      } catch (err) {
+        setDrawings((rows) => rows.map((r) => (r.id === id ? { ...r, price: startPrice } : r)))
+        setDrawError(err instanceof Error ? err.message : 'Failed to move the price level')
+      }
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
   const handleChartClick = async (e: React.MouseEvent<SVGSVGElement>) => {
+    if (swallowNextClick.current) {
+      swallowNextClick.current = false
+      return
+    }
     if (!drawMode) return
     const svg = svgRef.current
     if (!svg) return
@@ -1038,7 +1096,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       <div className="chart-frame">
         {drawMode === 'level' && (
           <div style={{ fontSize: 12, color: '#546e7a', marginBottom: 4 }}>
-            Click anywhere on the price panel to place a level. Click × on a level to remove it.
+            Click anywhere on the price panel to place a level. Drag a level to move it; click × to remove it.
           </div>
         )}
         {drawMode === 'trend' && (
@@ -1192,18 +1250,32 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
               )
             }
 
-            const y = chartData.toY(d.price * fxMultiplier)
+            const dragging = draggingLevel?.id === d.id
+            const price = dragging ? draggingLevel.price : d.price
+            const y = chartData.toY(price * fxMultiplier)
             if (y < chartData.top || y > chartData.top + chartData.pricePlotHeight) return null
             return (
               <g key={d.id}>
                 <line
                   x1={chartData.left} y1={y}
                   x2={chartData.left + chartData.plotWidth} y2={y}
-                  stroke={colour} strokeWidth="1.5" strokeDasharray="6 4"
+                  stroke={colour} strokeWidth={dragging ? 2 : 1.5} strokeDasharray="6 4"
                 />
                 <text x={chartData.left + 4} y={y - 4} fontSize="11" fill={colour} fontFamily="inherit">
-                  {d.label ? `${d.label} ` : ''}{currSym}{(d.price * fxMultiplier).toFixed(2)}
+                  {d.label ? `${d.label} ` : ''}{currSym}{(price * fxMultiplier).toFixed(2)}
                 </text>
+                {/* A 1.5px line is too thin to grab, so an invisible wide
+                    stroke over it takes the drag. */}
+                <line
+                  className="level-grab"
+                  x1={chartData.left} y1={y}
+                  x2={chartData.left + chartData.plotWidth} y2={y}
+                  stroke="transparent" strokeWidth="10"
+                  style={{ cursor: 'ns-resize' }}
+                  onMouseDown={(e) => handleLevelDrag(e, d.id, d.price)}
+                >
+                  <title>Drag to move this level</title>
+                </line>
                 {/* Past the plot edge, so it never covers a bar. */}
                 <g style={{ cursor: 'pointer' }} onClick={(e) => { e.stopPropagation(); void removeDrawing(d.id) }}>
                   <title>Remove this level</title>
