@@ -14,6 +14,15 @@
 //!   cargo run --bin backfill_ohlc -- --dry-run
 //!   cargo run --bin backfill_ohlc -- --limit 50   # one batch; re-run to continue
 //!   cargo run --bin backfill_ohlc -- --all        # include already-complete symbols
+//!   cargo run --bin backfill_ohlc -- --repair     # re-fetch bars whose open/close lie outside high/low
+//!
+//! `--repair` is the one mode that overwrites existing OHL. Before
+//! `fetch_current_price` took the day's range from the bar, the live-price path
+//! paired the bar's open with the chart meta's high/low, which can miss the
+//! opening print, and stored bars whose open sat outside their own range. Repair
+//! touches only rows that are internally inconsistent, still never writes
+//! `close`, and widens the fetched range to contain the stored close so a
+//! repaired row cannot be flagged again.
 
 use chrono::{NaiveDate, TimeZone, Utc};
 use reqwest::Client;
@@ -83,12 +92,43 @@ struct YahooQuote {
     low: Option<Vec<Option<f64>>>,
 }
 
+/// Which stored rows a run works on.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    /// Rows with any of open/high/low still NULL — fill the gaps only.
+    Fill,
+    /// Rows whose open or close lies outside their own high/low.
+    Repair,
+}
+
+impl Mode {
+    fn row_filter(self) -> &'static str {
+        match self {
+            Mode::Fill => "(open IS NULL OR high IS NULL OR low IS NULL)",
+            Mode::Repair => "(open > high OR open < low OR close > high OR close < low)",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Mode::Fill => "filled",
+            Mode::Repair => "repaired",
+        }
+    }
+}
+
 /// One day's OHL, keyed by the exchange-local trading date.
 struct OhlBar {
     date: String,
     open: Option<f64>,
     high: Option<f64>,
     low: Option<f64>,
+}
+
+impl OhlBar {
+    fn is_complete(&self) -> bool {
+        self.open.is_some() && self.high.is_some() && self.low.is_some()
+    }
 }
 
 /// Convert a Yahoo bar timestamp to the exchange-local trading date. Yahoo
@@ -111,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let include_complete = args.iter().any(|a| a == "--all");
+    let mode = if args.iter().any(|a| a == "--repair") { Mode::Repair } else { Mode::Fill };
+    if mode == Mode::Repair && include_complete {
+        anyhow::bail!("--repair and --all cannot be combined: repair only rewrites inconsistent rows");
+    }
     let only_symbol = args
         .iter()
         .position(|a| a == "--symbol")
@@ -124,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<usize>().ok());
 
-    let mut symbols = load_symbols(&db_path, only_symbol.as_deref(), include_complete)?;
+    let mut symbols = load_symbols(&db_path, mode, only_symbol.as_deref(), include_complete)?;
     if let Some(limit) = limit {
         symbols.truncate(limit);
     }
@@ -133,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     log::info!(
-        "Backfilling OHLC for {} symbol(s){}",
+        "{} OHLC for {} symbol(s){}",
+        if mode == Mode::Repair { "Repairing" } else { "Backfilling" },
         symbols.len(),
         if dry_run { " (dry run — no writes)" } else { "" }
     );
@@ -147,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     for (index, symbol) in symbols.iter().enumerate() {
         // Only ask Yahoo for the window we actually store rows in — the backfill
         // fills existing bars, so anything outside that span is wasted payload.
-        let span = match fillable_span(&db_path, symbol, include_complete)? {
+        let span = match fillable_span(&db_path, mode, symbol, include_complete)? {
             Some(span) => span,
             None => {
                 log::info!("[{}/{}] {}: already complete, skipping", index + 1, symbols.len(), symbol);
@@ -157,9 +202,9 @@ async fn main() -> anyhow::Result<()> {
         match fetch_daily_history(&client, symbol, span.0, span.1).await {
             Ok(bars) => {
                 let updated = if dry_run {
-                    count_fillable(&db_path, symbol, &bars)?
+                    count_fillable(&db_path, mode, symbol, &bars)?
                 } else {
-                    apply_bars(&db_path, symbol, &bars)?
+                    apply_bars(&db_path, mode, symbol, &bars)?
                 };
                 total_updated += updated;
                 let span = match (bars.first(), bars.last()) {
@@ -174,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
                     bars.len(),
                     span,
                     updated,
-                    if dry_run { "fillable" } else { "filled" }
+                    if dry_run { "matching" } else { mode.verb() }
                 );
             }
             Err(err) => {
@@ -193,9 +238,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     log::info!(
-        "Backfill complete: {} row(s) {}, {} symbol(s) failed.",
+        "Backfill complete: {} row(s) {}{}, {} symbol(s) failed.",
         total_updated,
-        if dry_run { "would be filled" } else { "filled" },
+        if dry_run { "would be " } else { "" },
+        mode.verb(),
         failures
     );
     if failures > 0 {
@@ -210,10 +256,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Symbols to process. By default only those with at least one close-only row,
-/// so re-running after a partial failure skips the work already done.
+/// Symbols to process. By default only those with at least one row the mode
+/// applies to, so re-running after a partial failure skips the work already done.
 fn load_symbols(
     db_path: &PathBuf,
+    mode: Mode,
     only_symbol: Option<&str>,
     include_complete: bool,
 ) -> anyhow::Result<Vec<String>> {
@@ -222,13 +269,11 @@ fn load_symbols(
         return Ok(vec![symbol.to_string()]);
     }
     let sql = if include_complete {
-        "SELECT DISTINCT symbol FROM prices ORDER BY symbol"
+        "SELECT DISTINCT symbol FROM prices ORDER BY symbol".to_string()
     } else {
-        "SELECT DISTINCT symbol FROM prices
-         WHERE open IS NULL OR high IS NULL OR low IS NULL
-         ORDER BY symbol"
+        format!("SELECT DISTINCT symbol FROM prices WHERE {} ORDER BY symbol", mode.row_filter())
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
@@ -239,22 +284,22 @@ fn load_symbols(
 /// bars even with `interval=1d` (a 12-year span comes back as ~149 points),
 /// so almost nothing would match a stored trading day. Explicit `period1` /
 /// `period2` timestamps keep daily granularity.
-/// Earliest and latest stored date still missing OHLC for `symbol`, or `None`
-/// when there is nothing left to fill.
+/// Earliest and latest stored date the mode still applies to for `symbol`, or
+/// `None` when there is nothing left to do.
 fn fillable_span(
     db_path: &PathBuf,
+    mode: Mode,
     symbol: &str,
     include_complete: bool,
 ) -> anyhow::Result<Option<(NaiveDate, NaiveDate)>> {
     let conn = open_db(db_path)?;
     let sql = if include_complete {
-        "SELECT MIN(date), MAX(date) FROM prices WHERE symbol = ?1"
+        "SELECT MIN(date), MAX(date) FROM prices WHERE symbol = ?1".to_string()
     } else {
-        "SELECT MIN(date), MAX(date) FROM prices
-          WHERE symbol = ?1 AND (open IS NULL OR high IS NULL OR low IS NULL)"
+        format!("SELECT MIN(date), MAX(date) FROM prices WHERE symbol = ?1 AND {}", mode.row_filter())
     };
     let span: (Option<String>, Option<String>) =
-        conn.query_row(sql, params![symbol], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        conn.query_row(&sql, params![symbol], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let (Some(min), Some(max)) = span else {
         return Ok(None);
     };
@@ -344,24 +389,42 @@ async fn fetch_daily_history(
     Ok(bars)
 }
 
-/// Fill OHLC on existing rows only. `COALESCE` keeps any value already present,
-/// and the WHERE clause skips rows that are already complete, so re-running is
-/// a no-op. New dates are not inserted — this tool backfills, it does not extend
-/// the price series.
-fn apply_bars(db_path: &PathBuf, symbol: &str, bars: &[OhlBar]) -> anyhow::Result<usize> {
+/// Write OHL onto existing rows only. New dates are not inserted — this tool
+/// backfills, it does not extend the price series.
+///
+/// Fill: `COALESCE` keeps any value already present, and the WHERE clause skips
+/// rows that are already complete, so re-running is a no-op.
+///
+/// Repair: overwrites OHL on inconsistent rows with Yahoo's bar, widening high
+/// and low to the stored close. The bar's close and the stored close (from the
+/// live quote) can differ in the last float digit, and without the widening a
+/// repaired row could still fail the check and be rewritten on every run. Bars
+/// missing any of O/H/L are skipped, as SQLite's `MAX`/`MIN` return NULL on one.
+fn apply_bars(db_path: &PathBuf, mode: Mode, symbol: &str, bars: &[OhlBar]) -> anyhow::Result<usize> {
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction()?;
     let mut updated = 0usize;
     {
-        let mut stmt = tx.prepare(
-            "UPDATE prices
-                SET open = COALESCE(open, ?3),
-                    high = COALESCE(high, ?4),
-                    low  = COALESCE(low,  ?5)
-              WHERE symbol = ?1 AND date = ?2
-                AND (open IS NULL OR high IS NULL OR low IS NULL)",
-        )?;
-        for bar in bars {
+        let sql = match mode {
+            Mode::Fill => format!(
+                "UPDATE prices
+                    SET open = COALESCE(open, ?3),
+                        high = COALESCE(high, ?4),
+                        low  = COALESCE(low,  ?5)
+                  WHERE symbol = ?1 AND date = ?2 AND {}",
+                mode.row_filter()
+            ),
+            Mode::Repair => format!(
+                "UPDATE prices
+                    SET open = ?3,
+                        high = MAX(?4, ?3, close),
+                        low  = MIN(?5, ?3, close)
+                  WHERE symbol = ?1 AND date = ?2 AND {}",
+                mode.row_filter()
+            ),
+        };
+        let mut stmt = tx.prepare(&sql)?;
+        for bar in bars.iter().filter(|b| mode == Mode::Fill || b.is_complete()) {
             updated += stmt.execute(params![symbol, bar.date, bar.open, bar.high, bar.low])?;
         }
     }
@@ -371,15 +434,14 @@ fn apply_bars(db_path: &PathBuf, symbol: &str, bars: &[OhlBar]) -> anyhow::Resul
 
 /// Dry-run counterpart to `apply_bars` — how many stored rows the fetched bars
 /// would actually touch.
-fn count_fillable(db_path: &PathBuf, symbol: &str, bars: &[OhlBar]) -> anyhow::Result<usize> {
+fn count_fillable(db_path: &PathBuf, mode: Mode, symbol: &str, bars: &[OhlBar]) -> anyhow::Result<usize> {
     let conn = open_db(db_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM prices
-          WHERE symbol = ?1 AND date = ?2
-            AND (open IS NULL OR high IS NULL OR low IS NULL)",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT COUNT(*) FROM prices WHERE symbol = ?1 AND date = ?2 AND {}",
+        mode.row_filter()
+    ))?;
     let mut count = 0usize;
-    for bar in bars {
+    for bar in bars.iter().filter(|b| mode == Mode::Fill || b.is_complete()) {
         count += stmt.query_row(params![symbol, bar.date], |row| row.get::<_, i64>(0))? as usize;
     }
     Ok(count)
@@ -447,7 +509,7 @@ mod tests {
             // A date with no stored row must not be inserted
             OhlBar { date: "2026-01-07".into(), open: Some(50.0), high: Some(51.0), low: Some(49.0) },
         ];
-        let updated = apply_bars(&path, "BHP", &bars).unwrap();
+        let updated = apply_bars(&path, Mode::Fill, "BHP", &bars).unwrap();
         assert_eq!(updated, 1, "only the close-only row should be touched");
 
         let conn = open_db(&path).unwrap();
@@ -490,7 +552,73 @@ mod tests {
         drop(conn);
 
         let bars = vec![OhlBar { date: "2026-02-02".into(), open: Some(9.0), high: Some(11.0), low: Some(8.5) }];
-        assert_eq!(apply_bars(&path, "CBA", &bars).unwrap(), 1);
-        assert_eq!(apply_bars(&path, "CBA", &bars).unwrap(), 0, "second run must change nothing");
+        assert_eq!(apply_bars(&path, Mode::Fill, "CBA", &bars).unwrap(), 1);
+        assert_eq!(apply_bars(&path, Mode::Fill, "CBA", &bars).unwrap(), 0, "second run must change nothing");
+    }
+
+    /// EXPD 2026-09-17 as the live-price path stored it: the bar's open with the
+    /// chart meta's high, which missed the opening print.
+    #[test]
+    fn repair_rewrites_only_inconsistent_rows_and_keeps_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_db(&path).unwrap();
+        seed(&conn);
+        conn.execute_batch(
+            "INSERT INTO prices (symbol, date, open, high, low, close, fetched_at)
+               VALUES ('EXPD', '2026-09-17', 190.9199981689453, 190.255, 187.9, 189.08, 'x');
+             INSERT INTO prices (symbol, date, open, high, low, close, fetched_at)
+               VALUES ('EXPD', '2026-09-18', 189.19, 191.0, 186.72, 190.94, 'x');
+             INSERT INTO prices (symbol, date, close, fetched_at)
+               VALUES ('EXPD', '2026-09-19', 191.0, 'x');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let bars = vec![
+            OhlBar { date: "2026-09-17".into(), open: Some(190.9199981689453), high: Some(190.9199981689453), low: Some(187.89999389648438) },
+            OhlBar { date: "2026-09-18".into(), open: Some(1.0), high: Some(1.0), low: Some(1.0) },
+            OhlBar { date: "2026-09-19".into(), open: Some(1.0), high: Some(1.0), low: Some(1.0) },
+        ];
+        assert_eq!(count_fillable(&path, Mode::Repair, "EXPD", &bars).unwrap(), 1);
+        assert_eq!(apply_bars(&path, Mode::Repair, "EXPD", &bars).unwrap(), 1, "only the inconsistent row");
+
+        let conn = open_db(&path).unwrap();
+        let row = |date: &str| -> (Option<f64>, Option<f64>, Option<f64>, f64) {
+            conn.query_row(
+                "SELECT open, high, low, close FROM prices WHERE symbol='EXPD' AND date=?1",
+                params![date],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(row("2026-09-17"), (Some(190.9199981689453), Some(190.9199981689453), Some(187.89999389648438), 189.08));
+        assert_eq!(row("2026-09-18"), (Some(189.19), Some(191.0), Some(186.72), 190.94), "consistent rows are left alone");
+        assert_eq!(row("2026-09-19"), (None, None, None, 191.0), "repair does not fill gaps");
+        drop(conn);
+        assert_eq!(apply_bars(&path, Mode::Repair, "EXPD", &bars).unwrap(), 0, "second run must change nothing");
+    }
+
+    /// The stored close is the live quote (189.08) while Yahoo's bar carries the
+    /// f32 value; a bar low a hair above the close must not leave the row
+    /// inconsistent, or every run would rewrite it.
+    #[test]
+    fn repair_widens_the_range_to_the_stored_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_db(&path).unwrap();
+        seed(&conn);
+        conn.execute(
+            "INSERT INTO prices (symbol, date, open, high, low, close, fetched_at) VALUES ('X', '2026-09-17', 12.0, 11.0, 10.0, 10.0, 'x')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let bars = vec![OhlBar { date: "2026-09-17".into(), open: Some(12.0), high: Some(12.0), low: Some(10.0000002) }];
+        assert_eq!(apply_bars(&path, Mode::Repair, "X", &bars).unwrap(), 1);
+        assert_eq!(apply_bars(&path, Mode::Repair, "X", &bars).unwrap(), 0);
+        let conn = open_db(&path).unwrap();
+        let low: f64 = conn.query_row("SELECT low FROM prices WHERE symbol='X'", [], |r| r.get(0)).unwrap();
+        assert_eq!(low, 10.0);
     }
 }

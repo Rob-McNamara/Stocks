@@ -17,7 +17,8 @@ use market::{
 };
 #[cfg(test)]
 use market::{
-    history_recently_checked, mark_history_checked, HISTORY_CHECKED, HISTORY_CHECK_TTL_SECS,
+    history_recently_checked, mark_history_checked, session_range, HISTORY_CHECKED,
+    HISTORY_CHECK_TTL_SECS,
 };
 use schema::init_db;
 
@@ -10245,6 +10246,36 @@ mod tests {
         assert_eq!(result.recorded, 0);
         assert_eq!(result.unconfigured_currencies, vec!["USD".to_string()]);
         assert!(dividend_rows(&db_path, "NSC").is_empty());
+    }
+
+    /// EXPD 2026-09-17: the bar opened at its high of 190.92, but the chart
+    /// meta reported a day high of 190.255. Taking high from meta and open from
+    /// the bar stored an open above its own high.
+    #[test]
+    fn session_range_contains_the_open_when_meta_misses_the_opening_print() {
+        let (high, low) = session_range(
+            [Some(190.9199981689453), Some(190.255)],
+            [Some(187.89999389648438), Some(187.9)],
+            [Some(190.9199981689453), Some(189.08)],
+        );
+        let (high, low) = (high.unwrap(), low.unwrap());
+        assert_eq!(high, 190.9199981689453);
+        assert_eq!(low, 187.89999389648438);
+        for trade in [190.9199981689453, 189.08] {
+            assert!(low <= trade && trade <= high, "{trade} outside {low}..{high}");
+        }
+    }
+
+    #[test]
+    fn session_range_widens_to_a_price_past_a_lagging_bar() {
+        let (high, low) = session_range([Some(10.0), None], [Some(9.0), None], [Some(9.5), Some(10.2)]);
+        assert_eq!((high, low), (Some(10.2), Some(9.0)));
+    }
+
+    #[test]
+    fn session_range_without_highs_or_lows_invents_nothing() {
+        let (high, low) = session_range([None, None], [None, Some(0.0)], [Some(9.5), Some(10.2)]);
+        assert_eq!((high, low), (None, None), "open and price alone are not a range; zero is not a low");
     }
 
     /// Yahoo reports a delisted symbol as `regularMarketPrice: 0.0`, not null,

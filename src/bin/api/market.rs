@@ -410,23 +410,44 @@ pub(crate) async fn fetch_current_price(client: &Client, symbol: &str) -> Result
             .and_then(|vols| vols.iter().filter_map(|v| *v).next_back());
     }
     // range=1d returns a single daily bar, so the session's open is its first
-    // non-null open; high/low fall back to the bar when meta omits them.
+    // non-null open.
     if let Some(q) = day_quote {
         meta.day_open = q.open.as_ref().and_then(|v| v.iter().flatten().next().copied());
-        if meta.regular_market_day_high.is_none() {
-            meta.regular_market_day_high = q
-                .high
-                .as_ref()
-                .and_then(|v| v.iter().flatten().copied().reduce(f64::max));
-        }
-        if meta.regular_market_day_low.is_none() {
-            meta.regular_market_day_low = q
-                .low
-                .as_ref()
-                .and_then(|v| v.iter().flatten().copied().reduce(f64::min));
-        }
+        let bar_high = q.high.as_ref().and_then(|v| v.iter().flatten().copied().reduce(f64::max));
+        let bar_low = q.low.as_ref().and_then(|v| v.iter().flatten().copied().reduce(f64::min));
+        let (high, low) = session_range(
+            [bar_high, meta.regular_market_day_high],
+            [bar_low, meta.regular_market_day_low],
+            [meta.day_open, meta.regular_market_price],
+        );
+        meta.regular_market_day_high = high;
+        meta.regular_market_day_low = low;
     }
     Ok(meta)
+}
+
+/// The session's high/low as the envelope of every figure Yahoo gives for it.
+///
+/// `regularMarketDayHigh`/`Low` in the chart meta come from a different feed
+/// than the bar arrays and can leave out the opening print: EXPD on 2026-09-17
+/// opened at its high of 190.92, but meta reported a high of 190.255. Pairing
+/// that meta high with the bar's open stored a bar whose open sat above its
+/// own high, and the chart drew a candle body outside its wick. Every one of
+/// these figures is a real trade in the session, so the true range contains
+/// them all, including the open and the latest price.
+pub(crate) fn session_range(
+    highs: [Option<f64>; 2],
+    lows: [Option<f64>; 2],
+    trades: [Option<f64>; 2],
+) -> (Option<f64>, Option<f64>) {
+    let usable = |v: &Option<f64>| v.filter(|p| is_usable_quote(Some(*p)));
+    let high = highs.iter().chain(trades.iter()).filter_map(usable).reduce(f64::max);
+    let low = lows.iter().chain(trades.iter()).filter_map(usable).reduce(f64::min);
+    // With no high or low from either source, the open and price alone are not
+    // a range — leave the side empty rather than invent one.
+    let high = if highs.iter().any(|v| usable(v).is_some()) { high } else { None };
+    let low = if lows.iter().any(|v| usable(v).is_some()) { low } else { None };
+    (high, low)
 }
 
 /// AUD rate per currency, served from the price cache when fresh (<1h),
