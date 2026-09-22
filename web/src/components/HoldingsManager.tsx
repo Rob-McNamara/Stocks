@@ -5,6 +5,33 @@ import { settlementAccountsFor } from '../utils/cash'
 import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
 import HoldingsHeatMap from './HoldingsHeatMap'
+import CollapsibleCard from './CollapsibleCard'
+import type { HoldingScope } from '../utils/holdingScope'
+
+/**
+ * The sections each screen is organised by, in display order.
+ *
+ * Classification (ETF vs equity, domestic vs international) is computed
+ * server-side, including config overrides; this only names the combinations and
+ * says which screen each belongs to. It is the single source of truth for both:
+ * the per-section heat maps and the summary groups read the same list, and a
+ * holding that landed in one section's map but another's card grid would be a
+ * quietly wrong screen.
+ */
+const SECTIONS_BY_SCOPE = {
+  local: ['Equities', 'ETFs'],
+  international: ['International Equities', 'International ETFs'],
+} as const satisfies Record<HoldingScope, readonly string[]>
+
+type HoldingSection = (typeof SECTIONS_BY_SCOPE)[HoldingScope][number]
+
+/** How each screen names itself when it has nothing to show. */
+const SCOPE_NOUN: Record<HoldingScope, string> = { local: 'local', international: 'international' }
+
+const sectionOf = (isEtf: boolean, isInternational: boolean): HoldingSection =>
+  isEtf
+    ? isInternational ? 'International ETFs' : 'ETFs'
+    : isInternational ? 'International Equities' : 'Equities'
 
 // Thin client: FIFO, cost basis, dividends, FX conversion, manual-price and
 // instrument-type overrides, and SMA are all computed by the API server
@@ -49,7 +76,14 @@ interface HoldingsPrefill {
   customFields?: Record<string, string>
 }
 
-export default function HoldingsManager({ onLoading, onTransactionsChanged, configVersion, prefill, onPrefillConsumed, onPrefillSaved, focusSymbol, onFocusSymbolConsumed }: { onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number; prefill?: HoldingsPrefill | null; onPrefillConsumed?: () => void; onPrefillSaved?: (symbol: string) => void; focusSymbol?: string | null; onFocusSymbolConsumed?: () => void }) {
+export default function HoldingsManager({ scope, onLoading, onTransactionsChanged, configVersion, holdingsVersion, prefill, onPrefillConsumed, onPrefillSaved, focusSymbol, onFocusSymbolConsumed }: { scope: HoldingScope; onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number; holdingsVersion?: number; prefill?: HoldingsPrefill | null; onPrefillConsumed?: () => void; onPrefillSaved?: (symbol: string) => void; focusSymbol?: string | null; onFocusSymbolConsumed?: () => void }) {
+  /**
+   * Whether a holding belongs to this screen. Declared up here because the
+   * loaders below reach for it before any of the derived lists exist.
+   */
+  const inScope = (h: { is_international: boolean }) => h.is_international === (scope === 'international')
+  const scopeSections = SECTIONS_BY_SCOPE[scope]
+
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   /** Server-computed per-symbol summaries from /api/portfolio/holdings */
   const [serverHoldings, setServerHoldings] = useState<PortfolioHolding[]>([])
@@ -178,9 +212,12 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [showRecordDialog])
 
+  // holdingsVersion, not just configVersion: a holding recorded on the other
+  // screen belongs to this one whenever its currency says so, and that screen
+  // is already mounted behind this one rather than remounted on the way in.
   useEffect(() => {
     loadHoldings()
-  }, [configVersion])
+  }, [configVersion, holdingsVersion])
 
   // Pre-fill form when navigating from watchlist
   useEffect(() => {
@@ -285,7 +322,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     const lots: Record<number, PortfolioLot> = {}
     pl.lots.forEach((l) => { lots[l.transaction_id] = l })
     setLotMap(lots)
-    setSelectedChartSymbol((prev) => prev || ph.holdings[0]?.symbol || '')
+    setSelectedChartSymbol((prev) => prev || ph.holdings.find(inScope)?.symbol || '')
   }
 
   const loadHoldings = async () => {
@@ -557,8 +594,13 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   }
 
 
+  const scopedHoldings = useMemo(
+    () => serverHoldings.filter((h) => h.is_international === (scope === 'international')),
+    [serverHoldings, scope],
+  )
+
   // Card items adapted from the server response (all values pre-computed)
-  const summary = useMemo(() => serverHoldings.map((h) => ({
+  const summary = useMemo(() => scopedHoldings.map((h) => ({
     symbol: h.symbol,
     shares: h.shares,
     invested: h.invested,
@@ -580,7 +622,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
     isEtf: h.is_etf,
     isInternational: h.is_international,
     currency: h.currency,
-  })), [serverHoldings])
+  })), [scopedHoldings])
 
   const dividendTotalsBySymbol = useMemo(() => {
     const map: Record<string, number> = {}
@@ -614,8 +656,12 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
   }
 
   const activeTransactions = useMemo(() => {
+    const scopedSymbols = new Set(scopedHoldings.map((h) => h.symbol))
     const filtered = transactions.filter(
-      (tx) => tx.transaction_type === 'purchase' && (lotMap[tx.id]?.remaining ?? 0) > 0
+      (tx) =>
+        tx.transaction_type === 'purchase' &&
+        (lotMap[tx.id]?.remaining ?? 0) > 0 &&
+        scopedSymbols.has(tx.symbol)
     )
     if (!sortColumn) return filtered
     return [...filtered].sort((a, b) => {
@@ -644,7 +690,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       }
       return sortDirection === 'asc' ? (aVal as number) - (bVal as number) : (bVal as number) - (aVal as number)
     })
-  }, [transactions, sortColumn, sortDirection, lotMap, dividendTotalsBySymbol])
+  }, [transactions, sortColumn, sortDirection, lotMap, dividendTotalsBySymbol, scopedHoldings])
 
   return (
     <div className="holdings-manager">
@@ -938,16 +984,24 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
       {error && !showRecordDialog && <div className="alert alert-error">❌ {error}</div>}
       {success && <div className="alert alert-success">✓ {success}</div>}
 
-      {serverHoldings.length > 0 && (
-        <div className="manager-card">
-          <div className="card-header">
-            <h2>Heat Map</h2>
-          </div>
-          {/* Clicking a tile drives the chart card below rather than opening
-              anything of its own — the map is a way into a position. */}
-          <HoldingsHeatMap holdings={serverHoldings} onSelectSymbol={setSelectedChartSymbol} />
-        </div>
-      )}
+      {/* One map per section, so each is scaled to its own holdings: a single
+          map across the lot sizes every tile against the largest position in
+          the portfolio, which leaves a small section unreadable. The map of
+          everything lives on the Dashboard. An empty section is skipped rather
+          than shown as an empty frame. */}
+      {scopeSections.map((section) => {
+        const rows = scopedHoldings.filter((h) => sectionOf(h.is_etf, h.is_international) === section)
+        if (rows.length === 0) return null
+        return (
+          // The collapse id is the section name, not the heading, so rewording
+          // the heading cannot reopen a card the user had folded away.
+          <CollapsibleCard key={section} id={`heatmap-${section}`} title={`${section} Heat Map`}>
+            {/* Clicking a tile drives the chart card below rather than opening
+                anything of its own — the map is a way into a position. */}
+            <HoldingsHeatMap holdings={rows} onSelectSymbol={setSelectedChartSymbol} />
+          </CollapsibleCard>
+        )
+      })}
 
       {selectedChartSymbol && (
         <div className="manager-card chart-card">
@@ -1036,18 +1090,19 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
 
         {loading && transactions.length === 0 ? (
           <p className="loading-text">Loading holdings...</p>
-        ) : transactions.length === 0 ? (
-          <p className="empty-text">No holdings configured.</p>
+        ) : scopedHoldings.length === 0 ? (
+          // Scoped, not "no transactions at all": with the portfolio split over
+          // two screens, a full portfolio of the other kind would otherwise
+          // render this one as empty section groups above an empty table, with
+          // nothing saying why.
+          <p className="empty-text">
+            {transactions.length === 0
+              ? 'No holdings configured.'
+              : `No ${SCOPE_NOUN[scope]} holdings — the other Holdings screen has them.`}
+          </p>
         ) : (
           <div style={{ maxHeight: 600, overflowY: 'auto' }}>
             {(() => {
-              // Classification (ETF vs equity, domestic vs international) is
-              // computed server-side, including config overrides.
-              const domesticEquities = summary.filter((i) => !i.isEtf && !i.isInternational)
-              const intlEquities = summary.filter((i) => !i.isEtf && i.isInternational)
-              const domesticETFs = summary.filter((i) => i.isEtf && !i.isInternational)
-              const intlETFs = summary.filter((i) => i.isEtf && i.isInternational)
-
               const renderCard = (item: typeof summary[0]) => {
                 const symCurrency = item.currency
                 const isForeign = item.isInternational
@@ -1166,7 +1221,7 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
                 const div = items.reduce((s, i) => s + i.dividends, 0)
                 const pl = val - inv + div
                 return (
-                  <div style={{ marginBottom: 24 }}>
+                  <div key={label} style={{ marginBottom: 24 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 8, flexWrap: 'wrap' }}>
                       <h3 style={{ margin: 0, fontSize: 15 }}>{label}</h3>
                       <span style={{ fontSize: 13, color: '#666' }}>Net Invested: <strong>${inv.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
@@ -1186,10 +1241,12 @@ export default function HoldingsManager({ onLoading, onTransactionsChanged, conf
 
               return (
                 <>
-                  {renderGroup(domesticEquities, 'Equities')}
-                  {renderGroup(intlEquities, 'International Equities')}
-                  {renderGroup(domesticETFs, 'ETFs')}
-                  {renderGroup(intlETFs, 'International ETFs')}
+                  {scopeSections.map((section) =>
+                    renderGroup(
+                      summary.filter((i) => sectionOf(i.isEtf, i.isInternational) === section),
+                      section,
+                    ),
+                  )}
                 </>
               )
             })()}

@@ -262,6 +262,47 @@ describe('day / week interval', () => {
   })
 })
 
+describe('a new session arriving while the chart is open', () => {
+  // The bars load once per symbol, but the live price keeps polling. Before
+  // this, a chart drawn before the daily close landed kept the stale tail and
+  // drew the new day as a close-only point — the price readout moved on, the
+  // candle for that day never appeared.
+  it('reloads the bars when the live price reports a newer trading date', async () => {
+    const stale = OHLC_HISTORY.slice(0, -1)
+    getPriceHistory.mockResolvedValueOnce(stale).mockResolvedValue(OHLC_HISTORY)
+
+    const newest = OHLC_HISTORY[OHLC_HISTORY.length - 1]
+    const { container } = await renderChart({
+      currentPrice: newest.close,
+      currentPriceDate: newest.date,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Candles' }))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('rect.candle-body').length).toBe(OHLC_HISTORY.length)
+    })
+    expect(getPriceHistory).toHaveBeenCalledTimes(2)
+  })
+
+  it('leaves the bars alone when the live price is for the newest one held', async () => {
+    getPriceHistory.mockResolvedValue(OHLC_HISTORY)
+    const newest = OHLC_HISTORY[OHLC_HISTORY.length - 1]
+    await renderChart({ currentPrice: newest.close, currentPriceDate: newest.date })
+    expect(getPriceHistory).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not refetch in a loop when the reload comes back still stale', async () => {
+    const stale = OHLC_HISTORY.slice(0, -1)
+    getPriceHistory.mockResolvedValue(stale)
+    const newest = OHLC_HISTORY[OHLC_HISTORY.length - 1]
+    await renderChart({ currentPrice: newest.close, currentPriceDate: newest.date })
+    await waitFor(() => expect(getPriceHistory).toHaveBeenCalledTimes(2))
+    // Settle: a second attempt would show up here if the guard let it through.
+    await new Promise((r) => setTimeout(r, 30))
+    expect(getPriceHistory).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('candle / line toggle', () => {
   it('defaults to the close line and disables candles when no OHLC is stored', async () => {
     const { container } = await renderChart()

@@ -49,7 +49,7 @@ interface WatchlistManagerProps {
   onLoading: (loading: boolean) => void
   initialSymbol?: string | null
   onInitialSymbolConsumed?: () => void
-  onMoveToHoldings?: (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string> }) => void
+  onMoveToHoldings?: (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string>; currency?: string | null }) => void
   /** Symbol whose memberships should be removed — set by App once a "Move to Holdings" transaction is saved */
   removeSymbolRequest?: string | null
   onRemoveSymbolConsumed?: () => void
@@ -531,6 +531,10 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                 const priceData = listPrices.find((p) => p.symbol === symbol)
                 onMoveToHoldings({
                   symbol,
+                  // Routes the prefill to the local or international Holdings
+                  // screen: the symbol is not held yet, so there is no
+                  // server-side classification to read.
+                  currency: symbolInfo[symbol]?.currency,
                   price: priceData?.price ?? undefined,
                   notes: notes ?? undefined,
                   customFields: { ...custom_fields, ...(entry.stop_loss_price != null ? { stop_loss: String(entry.stop_loss_price) } : {}) },

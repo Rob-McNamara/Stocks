@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { apiClient, type CashAccount, type PortfolioOverview, type CustomListEntry, type CustomListResult, type PortfolioHistory } from '../services/api'
+import { apiClient, type CashAccount, type PortfolioOverview, type CustomListEntry, type CustomListResult, type PortfolioHistory, type PortfolioHolding } from '../services/api'
 import PortfolioHistoryChart from './PortfolioHistoryChart'
+import HoldingsHeatMap from './HoldingsHeatMap'
+import CollapsibleCard from './CollapsibleCard'
 
 // Thin client: every number on this screen — totals, breakdowns, sectors,
 // worst holdings, best watchlist and custom lists — comes pre-computed from
@@ -115,6 +117,12 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [historyRange, setHistoryRange] = useState<HistoryRange>('12m')
   const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
+  /**
+   * The whole portfolio, for the heat map. The overview this screen is built on
+   * carries only aggregates, so the per-holding rows the map needs come from
+   * their own endpoint — and a failure there empties the map alone.
+   */
+  const [heatMapHoldings, setHeatMapHoldings] = useState<PortfolioHolding[]>([])
 
   /**
    * A range starting at or before the configured floor returns exactly what
@@ -142,6 +150,15 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
     load()
   }, [holdingsVersion])
 
+  // Loaded separately from the overview: the overview carries only aggregates,
+  // and a failure here should empty the heat map rather than the whole screen.
+  useEffect(() => {
+    apiClient
+      .getPortfolioHoldings()
+      .then((r) => setHeatMapHoldings(r.holdings))
+      .catch(() => setHeatMapHoldings([]))
+  }, [holdingsVersion])
+
   // Loaded separately from the overview: it sweeps every day of history, so a
   // slow response should not hold up the rest of the dashboard.
   useEffect(() => {
@@ -166,6 +183,7 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       // Separate call, and a failure only empties the cash card: the rest of
       // the dashboard predates cash tracking and must not depend on it.
       apiClient.getCashAccounts?.().then(setCashAccounts).catch(() => setCashAccounts([]))
+      apiClient.getPortfolioHoldings().then((r) => setHeatMapHoldings(r.holdings)).catch(() => setHeatMapHoldings([]))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load dashboard')
     } finally {
@@ -337,6 +355,15 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
           </>
         )}
       </div>
+
+      {/* The portfolio as one map. Holdings breaks the same tiles out by
+          section; this is the view across all of them. Clicking a tile opens
+          that position on the Holdings screen. */}
+      {heatMapHoldings.length > 0 && (
+        <CollapsibleCard id="heatmap-overall" title="Heat Map">
+          <HoldingsHeatMap holdings={heatMapHoldings} onSelectSymbol={onNavigateToHoldings} />
+        </CollapsibleCard>
+      )}
 
       <div className="dashboard-breakdown">
         {[

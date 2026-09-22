@@ -5,6 +5,7 @@ import { initLayoutWidth } from './utils/layout'
 import WatchlistManager from './components/WatchlistManager'
 import ConfigPanel from './components/ConfigPanel'
 import HoldingsManager from './components/HoldingsManager'
+import { scopeForSymbol, type HoldingScope } from './utils/holdingScope'
 import EventLogViewer from './components/EventLogViewer'
 import Dashboard from './components/Dashboard'
 import SoldStocks from './components/SoldStocks'
@@ -13,7 +14,12 @@ import Transactions from './components/Transactions'
 import CashManager from './components/CashManager'
 import Analysis from './components/Analysis'
 
-type Tab = 'dashboard' | 'watchlist' | 'holdings' | 'analysis' | 'sold' | 'hindsight' | 'cash' | 'transactions' | 'events' | 'config'
+type Tab = 'dashboard' | 'watchlist' | 'holdings-local' | 'holdings-international' | 'analysis' | 'sold' | 'hindsight' | 'cash' | 'transactions' | 'events' | 'config'
+
+const HOLDINGS_TAB: Record<HoldingScope, Tab> = {
+  local: 'holdings-local',
+  international: 'holdings-international',
+}
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
@@ -23,11 +29,27 @@ function App() {
   const [configVersion, setConfigVersion] = useState(0)
   const [watchlistFocusSymbol, setWatchlistFocusSymbol] = useState<string | null>(null)
   const [holdingsFocusSymbol, setHoldingsFocusSymbol] = useState<string | null>(null)
-  const [holdingsPrefill, setHoldingsPrefill] = useState<{ symbol: string; price?: number; notes?: string; customFields?: Record<string, string> } | null>(null)
+  const [holdingsPrefill, setHoldingsPrefill] = useState<{ symbol: string; price?: number; notes?: string; customFields?: Record<string, string>; currency?: string | null } | null>(null)
   // Set when a "Move to Holdings" transaction is saved — tells the watchlist
   // it is now safe to remove the symbol's memberships.
   const [watchlistRemoveSymbol, setWatchlistRemoveSymbol] = useState<string | null>(null)
   const startupRefreshTriggered = useRef(false)
+
+  /**
+   * Which holdings are international, by symbol — the server's own ruling, and
+   * the only thing that can route a symbol to the right Holdings screen.
+   */
+  const [holdingIsInternational, setHoldingIsInternational] = useState<Record<string, boolean>>({})
+
+  useEffect(() => {
+    apiClient
+      .getPortfolioHoldings()
+      .then((r) => setHoldingIsInternational(Object.fromEntries(r.holdings.map((h) => [h.symbol, h.is_international]))))
+      .catch(() => { /* routing falls back to currency, then to the local screen */ })
+  }, [holdingsVersion])
+
+  const holdingsTabFor = (symbol: string, currency?: string | null): Tab =>
+    HOLDINGS_TAB[scopeForSymbol(symbol, holdingIsInternational, currency)]
 
   const handleNavigateToWatchlist = (symbol: string) => {
     setWatchlistFocusSymbol(symbol)
@@ -36,12 +58,12 @@ function App() {
 
   const handleNavigateToHoldings = (symbol: string) => {
     setHoldingsFocusSymbol(symbol)
-    setActiveTab('holdings')
+    setActiveTab(holdingsTabFor(symbol))
   }
 
-  const handleMoveToHoldings = (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string> }) => {
+  const handleMoveToHoldings = (data: { symbol: string; price?: number; notes?: string; customFields?: Record<string, string>; currency?: string | null }) => {
     setHoldingsPrefill(data)
-    setActiveTab('holdings')
+    setActiveTab(holdingsTabFor(data.symbol, data.currency))
   }
 
   useEffect(() => {
@@ -101,11 +123,18 @@ function App() {
           Watchlist
         </button>
         <button
-          className={`tab-button ${activeTab === 'holdings' ? 'active' : ''}`}
-          onClick={() => setActiveTab('holdings')}
+          className={`tab-button ${activeTab === 'holdings-local' ? 'active' : ''}`}
+          onClick={() => setActiveTab('holdings-local')}
           disabled={loading}
         >
-          Holdings
+          Local Holdings
+        </button>
+        <button
+          className={`tab-button ${activeTab === 'holdings-international' ? 'active' : ''}`}
+          onClick={() => setActiveTab('holdings-international')}
+          disabled={loading}
+        >
+          International Holdings
         </button>
         <button
           className={`tab-button ${activeTab === 'analysis' ? 'active' : ''}`}
@@ -165,9 +194,30 @@ function App() {
         <div style={{ display: activeTab === 'watchlist' ? 'block' : 'none' }}>
           <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} onMoveToHoldings={handleMoveToHoldings} removeSymbolRequest={watchlistRemoveSymbol} onRemoveSymbolConsumed={() => setWatchlistRemoveSymbol(null)} />
         </div>
-        <div style={{ display: activeTab === 'holdings' ? 'block' : 'none' }}>
-          <HoldingsManager onLoading={setLoading} onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)} configVersion={configVersion} prefill={holdingsPrefill} onPrefillConsumed={() => setHoldingsPrefill(null)} onPrefillSaved={(symbol) => setWatchlistRemoveSymbol(symbol)} focusSymbol={holdingsFocusSymbol} onFocusSymbolConsumed={() => setHoldingsFocusSymbol(null)} />
-        </div>
+        {/* Both screens stay mounted, so the focus symbol and the watchlist
+            prefill are handed only to the one that owns the symbol — passing
+            them to both would open two dialogs and select two charts. */}
+        {(['local', 'international'] as const).map((scope) => {
+          const tab = HOLDINGS_TAB[scope]
+          const focusTab = holdingsFocusSymbol ? holdingsTabFor(holdingsFocusSymbol) : null
+          const prefillTab = holdingsPrefill ? holdingsTabFor(holdingsPrefill.symbol, holdingsPrefill.currency) : null
+          return (
+            <div key={scope} style={{ display: activeTab === tab ? 'block' : 'none' }}>
+              <HoldingsManager
+                scope={scope}
+                onLoading={setLoading}
+                onTransactionsChanged={() => setHoldingsVersion((v) => v + 1)}
+                configVersion={configVersion}
+                holdingsVersion={holdingsVersion}
+                prefill={prefillTab === tab ? holdingsPrefill : null}
+                onPrefillConsumed={() => setHoldingsPrefill(null)}
+                onPrefillSaved={(symbol) => setWatchlistRemoveSymbol(symbol)}
+                focusSymbol={focusTab === tab ? holdingsFocusSymbol : null}
+                onFocusSymbolConsumed={() => setHoldingsFocusSymbol(null)}
+              />
+            </div>
+          )
+        })}
         <div style={{ display: activeTab === 'analysis' ? 'block' : 'none' }}>
           <Analysis onLoading={setLoading} holdingsVersion={holdingsVersion} />
         </div>

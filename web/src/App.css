@@ -369,6 +369,37 @@
   margin: 0;
 }
 
+/* The whole heading is the disclosure control, so it inherits the heading's
+   type rather than looking like a button parked next to it. */
+.card-collapse-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.card-collapse-toggle:hover {
+  color: #1976d2;
+}
+
+.card-collapse-toggle:focus-visible {
+  outline: 2px solid #1976d2;
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+/* Fixed width so the title does not shift sideways as the caret turns. */
+.card-collapse-caret {
+  width: 14px;
+  font-size: 14px;
+  color: #8a94a6;
+}
+
 .info-card {
   background: linear-gradient(135deg, #e0f4ff 0%, #f0e6ff 100%);
   border-left: 4px solid #667eea;

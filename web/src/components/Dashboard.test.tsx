@@ -2,7 +2,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor, within, cleanup, fireEvent } from '@testing-library/react'
 import Dashboard from './Dashboard'
-import type { CustomListEntry, PortfolioOverview } from '../services/api'
+import type { CustomListEntry, PortfolioHolding, PortfolioOverview } from '../services/api'
+import { invalidateAppConfig } from '../utils/appConfig'
+import { COLLAPSED_CARDS_KEY } from '../utils/collapsedCards'
 
 // The Dashboard is a pure renderer over GET /api/portfolio/overview — mock
 // the client and feed it a canned payload.
@@ -10,13 +12,30 @@ vi.mock('../services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../services/api')>()
   return {
     ...actual,
-    apiClient: { getPortfolioOverview: vi.fn(), getPortfolioHistory: vi.fn() },
+    // getConfig/updateConfig back the collapsible cards' stored state.
+    apiClient: { getPortfolioOverview: vi.fn(), getPortfolioHistory: vi.fn(), getPortfolioHoldings: vi.fn(), getConfig: vi.fn(), updateConfig: vi.fn() },
   }
 })
 
 import { apiClient } from '../services/api'
 const getPortfolioOverview = apiClient.getPortfolioOverview as ReturnType<typeof vi.fn>
 const getPortfolioHistory = apiClient.getPortfolioHistory as ReturnType<typeof vi.fn>
+const getPortfolioHoldings = apiClient.getPortfolioHoldings as ReturnType<typeof vi.fn>
+const getConfig = apiClient.getConfig as ReturnType<typeof vi.fn>
+const updateConfig = apiClient.updateConfig as ReturnType<typeof vi.fn>
+
+/** A holding as the heat map needs it — area from value, colour from return. */
+function holdingFixture(over: Partial<PortfolioHolding> & { symbol: string }): PortfolioHolding {
+  return {
+    long_name: null, instrument_type: null, is_etf: false, is_international: false,
+    currency: 'AUD', sector: null, notes: null, fields: {}, shares: 10, invested: 900,
+    avg_cost: 90, native_avg_cost: 90, current_price: 100, native_current_price: 100,
+    price_source: 'cache', price_date: '2026-09-17', change: 1, change_percent: 1,
+    volume: 1000, current_value: 1000, dividends: 0, pl: 100, pl_pct: 11.1,
+    sma150: null, stop_loss: null, is_trailing_sell: false,
+    ...over,
+  } as PortfolioHolding
+}
 
 /** Minimal history payload; the value chart has its own test file. */
 function historyFixture() {
@@ -114,6 +133,71 @@ beforeEach(() => {
   getPortfolioOverview.mockReset()
   getPortfolioOverview.mockResolvedValue(overviewFixture())
   getPortfolioHistory.mockReset().mockResolvedValue(historyFixture())
+  getPortfolioHoldings.mockReset().mockResolvedValue({ holdings: [], fx_rates: {} })
+  getConfig.mockReset().mockResolvedValue({})
+  updateConfig.mockReset().mockResolvedValue(undefined)
+  // The config read is cached module-wide, so one test's stored state would
+  // otherwise be reused by every later one.
+  invalidateAppConfig()
+})
+
+describe('Dashboard heat map', () => {
+  it('maps the whole portfolio, across every section', async () => {
+    getPortfolioHoldings.mockResolvedValue({
+      holdings: [
+        holdingFixture({ symbol: 'BHP.AX' }),
+        holdingFixture({ symbol: 'EXPD', is_international: true }),
+        holdingFixture({ symbol: 'VAS.AX', is_etf: true }),
+      ],
+      fx_rates: {},
+    })
+    await renderDashboard()
+    const card = (await screen.findByText('Heat Map')).closest('.manager-card')! as HTMLElement
+    for (const symbol of ['BHP.AX', 'EXPD', 'VAS.AX']) {
+      expect(within(card).getByText(symbol)).toBeTruthy()
+    }
+  })
+
+  it('folds away on click, and remembers it', async () => {
+    getPortfolioHoldings.mockResolvedValue({ holdings: [holdingFixture({ symbol: 'BHP.AX' })], fx_rates: {} })
+    await renderDashboard()
+    const toggle = await screen.findByRole('button', { name: /Heat Map/ })
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText('BHP.AX')).toBeNull()
+    await waitFor(() =>
+      expect(updateConfig).toHaveBeenCalledWith(COLLAPSED_CARDS_KEY, JSON.stringify(['heatmap-overall'])),
+    )
+  })
+
+  it('opens folded when the stored state says so', async () => {
+    getConfig.mockResolvedValue({ [COLLAPSED_CARDS_KEY]: JSON.stringify(['heatmap-overall']) })
+    getPortfolioHoldings.mockResolvedValue({ holdings: [holdingFixture({ symbol: 'BHP.AX' })], fx_rates: {} })
+    await renderDashboard()
+    const toggle = await screen.findByRole('button', { name: /Heat Map/ })
+    await waitFor(() => expect(toggle.getAttribute('aria-expanded')).toBe('false'))
+    expect(screen.queryByText('BHP.AX')).toBeNull()
+
+    // Still reachable — a folded card is a fold, not a removal.
+    fireEvent.click(toggle)
+    expect(screen.getByText('BHP.AX')).toBeTruthy()
+  })
+
+  it('leaves the card out entirely when there is nothing to map', async () => {
+    await renderDashboard()
+    expect(screen.queryByText('Heat Map')).toBeNull()
+  })
+
+  // The overview drives every other card on the screen; a heat map that could
+  // not load must not take them with it.
+  it('keeps the rest of the dashboard when the holdings fetch fails', async () => {
+    getPortfolioHoldings.mockRejectedValue(new Error('nope'))
+    await renderDashboard()
+    expect(screen.queryByText('Heat Map')).toBeNull()
+    expect(screen.getByText('Worst Holdings — 150SMA')).toBeTruthy()
+  })
 })
 
 describe('Dashboard custom lists', () => {

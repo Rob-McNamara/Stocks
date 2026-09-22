@@ -60,6 +60,10 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
   const [transactions, setTransactions] = useState<HoldingTransaction[]>([])
   const [prices, setPrices] = useState<Record<string, number | null>>({})
   const [volumes, setVolumes] = useState<Record<string, number | null>>({})
+  // The trading date each cached price belongs to. Without it the chart dates
+  // the live price "today" in UTC, which runs a day ahead of the last US close
+  // for most of the Sydney day and invents a bar no candle can be drawn for.
+  const [priceDates, setPriceDates] = useState<Record<string, string | null>>({})
   const [symbolFields, setSymbolFields] = useState<Record<string, Record<string, string>>>({})
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
   /** Server-computed risk rows from /api/portfolio/risk */
@@ -106,12 +110,15 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
       const cachedPrices = await apiClient.getCachedPrices(activeSymbols)
       const priceMap: Record<string, number | null> = {}
       const volumeMap: Record<string, number | null> = {}
+      const dateMap: Record<string, string | null> = {}
       cachedPrices.forEach((p) => {
         priceMap[p.symbol] = p.price
         volumeMap[p.symbol] = p.volume
+        dateMap[p.symbol] = p.price_date ?? null
       })
       setPrices(priceMap)
       setVolumes(volumeMap)
+      setPriceDates(dateMap)
 
       setLoading(false)
       onLoading(false)
@@ -228,6 +235,7 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
             purchases={getRemainingPurchaseLots(transactions, selectedSymbol)}
             currentPrice={prices[selectedSymbol] ?? null}
             currentVolume={volumes[selectedSymbol] ?? null}
+            currentPriceDate={priceDates[selectedSymbol] ?? null}
             markerPrice={selectedRow?.stopLoss ?? null}
             markerLabel={selectedRow?.isTrailingSell ? 'Trailing Sell' : 'Stop Loss'}
             markerMode="stoploss"

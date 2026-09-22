@@ -231,6 +231,37 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     loadHistory()
   }, [symbol])
 
+  /**
+   * History is fetched once per symbol, but the live price keeps polling. When
+   * a session's daily bar lands after the chart was drawn, the loaded history
+   * ends a day short and the live price is appended close-only below — a day
+   * that renders no candle and no OHLC in the tooltip. Reload the bars as soon
+   * as the live price reports a trading date newer than the newest one held.
+   *
+   * One attempt per (symbol, trading date): the daily bar is stored before the
+   * quote cache advances, so the bar is there by the time this runs, and the
+   * guard keeps a backend that is still catching up from being polled.
+   */
+  const historyRefetchedFor = useRef<string | null>(null)
+  useEffect(() => { historyRefetchedFor.current = null }, [symbol])
+  useEffect(() => {
+    if (!symbol || !currentPriceDate || history.length === 0) return
+    const newest = history[history.length - 1].date
+    if (currentPriceDate <= newest) return
+    if (historyRefetchedFor.current === currentPriceDate) return
+    historyRefetchedFor.current = currentPriceDate
+
+    let cancelled = false
+    apiClient.getPriceHistory(symbol, 600)
+      .then((data) => {
+        // Only adopt bars that actually advance the chart, so a backend still
+        // serving the old tail cannot retrigger this effect in a loop.
+        if (!cancelled && data.length > 0 && data[data.length - 1].date > newest) setHistory(data)
+      })
+      .catch(() => { /* keep the bars we have — the live close-only point still draws */ })
+    return () => { cancelled = true }
+  }, [symbol, currentPriceDate, history])
+
   // Resolve the currency for this symbol, then fetch its FX rate. When the
   // parent passes a non-AUD currency (from its symbolInfo cache) we trust it;
   // only when the prop says AUD — which can also mean "unknown" — do we
