@@ -250,9 +250,11 @@ describe('which currency a price leads with', () => {
 
   it('leads with the traded currency on the international screen, AUD in brackets', async () => {
     await renderScope('international', usdPurchase)
-    // Summary card: "10@USD 190.92 (A$291.50)"
-    const card = await screen.findByText(/10@USD 190\.92/)
+    // Summary card: "10@190.92 (A$291.50)" — the card's USD tag names the
+    // currency, so the figure does not repeat it.
+    const card = await screen.findByText(/10@190\.92/)
     expect(card.textContent).toContain('(A$291.50)')
+    expect(card.textContent).not.toContain('USD')
 
     const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
     const price = within(table).getByText(/USD 180\.10/)
@@ -269,11 +271,15 @@ describe('which currency a price leads with', () => {
     expect(within(table).getByRole('columnheader', { name: 'Price (AUD)' })).toBeTruthy()
   })
 
-  it('reads the 150SMA in the stock\'s currency and marks the AUD totals with A$', async () => {
+  it('reads the 150SMA in the stock\'s currency and marks every AUD total with A$', async () => {
     await renderScope('international', usdPurchase)
-    expect(await screen.findByText(/150SMA: USD 185\.00/)).toBeTruthy()
+    expect(await screen.findByText(/150SMA: 185\.00/)).toBeTruthy()
     expect(screen.getByText(/Current value: A\$2915\.00/)).toBeTruthy()
     expect(screen.getByText(/Dividends: A\$0\.00/)).toBeTruthy()
+    // The P/L is an AUD figure too — current value less cost, plus income.
+    // Scoped to the card: a heat map tile's tooltip quotes a P/L as well.
+    const intlCard = screen.getByText(/Current value: A\$2915\.00/).closest('div')!.parentElement!
+    expect(within(intlCard).getByText(/P\/L: \+A\$/)).toBeTruthy()
   })
 
   it('leaves the local card in plain AUD, with no suffix', async () => {
@@ -281,6 +287,8 @@ describe('which currency a price leads with', () => {
     expect(await screen.findByText(/150SMA: \$38\.00/)).toBeTruthy()
     const value = screen.getByText(/Current value: \$1000\.00/)
     expect(value.textContent).not.toContain('A$')
+    const card = value.closest('div')!.parentElement!
+    expect(within(card).getByText(/P\/L: /).textContent).not.toContain('A$')
   })
 
   // A foreign stock bought in AUD has no native figure to lead with, and the

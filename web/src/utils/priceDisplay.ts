@@ -4,8 +4,12 @@
  * On the International screen a holding is read in the currency it trades in,
  * so the native price leads and the AUD conversion follows in brackets; the
  * Local screen keeps AUD leading. The bracketed AUD carries an `A$` rather
- * than the bare `$` used elsewhere, because beside a US$ figure a lone `$`
+ * than the bare `$` used elsewhere, because beside a foreign figure a lone `$`
  * says nothing.
+ *
+ * `currency` labels the native figure, and is left out where the surrounding
+ * card already names it — the holding's own currency tag — so the code is not
+ * repeated on every line.
  *
  * Either side may be missing — a symbol with no FX rate yet has no AUD figure,
  * and a close-only quote has no native one — so whichever exists leads and the
@@ -18,7 +22,7 @@ export function priceParts(
   nativeFirst: boolean,
 ): { main: string; aside: string | null } {
   const audText = aud != null ? `$${aud.toFixed(2)}` : null
-  const nativeText = native != null && currency ? `${currency} ${native.toFixed(2)}` : null
+  const nativeText = native != null ? (currency ? `${currency} ${native.toFixed(2)}` : native.toFixed(2)) : null
   if (nativeFirst && nativeText) {
     return { main: nativeText, aside: aud != null ? `(A$${aud.toFixed(2)})` : null }
   }

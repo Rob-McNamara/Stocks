@@ -1112,9 +1112,12 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                 const symCurrency = item.currency
                 const isForeign = item.isInternational
                 const isSelected = selectedChartSymbol === item.symbol
-                const price = priceParts(item.currentPrice, item.nativePrice, symCurrency, nativeFirst && isForeign)
+                // The card's own currency tag names the currency, so the
+                // figures below it carry no code — only the AUD conversions
+                // are marked, and those wear A$.
+                const price = priceParts(item.currentPrice, item.nativePrice, null, nativeFirst && isForeign)
                 const sma = nativeFirst && isForeign && item.nativeSma150 != null
-                  ? { value: item.nativeSma150, text: `${symCurrency} ${item.nativeSma150.toFixed(2)}` }
+                  ? { value: item.nativeSma150, text: item.nativeSma150.toFixed(2) }
                   : { value: item.sma150, text: item.sma150 !== null ? `$${item.sma150.toFixed(2)}` : '' }
                 // `A$` only where it earns its keep: on the International
                 // screen the prices above these totals are in the stock's own
@@ -1223,7 +1226,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                         {/* A baseline replaces the purchase as the basis, so
                             there is one figure — labelled with the period it
                             actually covers rather than left to be assumed. */}
-                        P/L{item.basisDate ? ` since ${item.basisDate}` : ''}: {pl >= 0 ? '+' : '-'}${Math.abs(pl).toFixed(2)}
+                        P/L{item.basisDate ? ` since ${item.basisDate}` : ''}: {pl >= 0 ? '+' : '-'}{aud}{Math.abs(pl).toFixed(2)}
                         {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
                       </div>
                     )
