@@ -615,6 +615,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     change: h.change,
     changePercent: h.change_percent,
     sma150: h.sma150,
+    nativeSma150: h.native_sma150,
     currentValue: h.current_value,
     avgCost: h.avg_cost,
     nativeAvgCost: h.native_avg_cost,
@@ -1112,6 +1113,13 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                 const isForeign = item.isInternational
                 const isSelected = selectedChartSymbol === item.symbol
                 const price = priceParts(item.currentPrice, item.nativePrice, symCurrency, nativeFirst && isForeign)
+                const sma = nativeFirst && isForeign && item.nativeSma150 != null
+                  ? { value: item.nativeSma150, text: `${symCurrency} ${item.nativeSma150.toFixed(2)}` }
+                  : { value: item.sma150, text: item.sma150 !== null ? `$${item.sma150.toFixed(2)}` : '' }
+                // `A$` only where it earns its keep: on the International
+                // screen the prices above these totals are in the stock's own
+                // currency, so a bare `$` would not say which is which.
+                const aud = nativeFirst ? 'A$' : '$'
                 return (
                 <div
                   key={item.symbol}
@@ -1170,13 +1178,17 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                       {item.change >= 0 ? '+' : ''}{item.change.toFixed(2)} ({item.change >= 0 ? '+' : ''}{item.changePercent.toFixed(2)}%)
                     </div>
                   )}
-                  {item.sma150 !== null && (
-                    <div style={{ color: item.currentPrice !== null && item.sma150 > item.currentPrice ? '#f44336' : undefined }}>
-                      150SMA: ${item.sma150.toFixed(2)}
+                  {/* The average is read against the price above it, so it is
+                      quoted in whichever currency that price is in. Comparing
+                      the two AUD figures keeps the colour right even when one
+                      of the native ones is missing. */}
+                  {sma.value !== null && (
+                    <div style={{ color: item.currentPrice !== null && item.sma150 !== null && item.sma150 > item.currentPrice ? '#f44336' : undefined }}>
+                      150SMA: {sma.text}
                     </div>
                   )}
-                  <div>Current value: ${item.currentValue.toFixed(2)}</div>
-                  <div>Dividends: ${item.dividends.toFixed(2)}</div>
+                  <div>Current value: {aud}{item.currentValue.toFixed(2)}</div>
+                  <div>Dividends: {aud}{item.dividends.toFixed(2)}</div>
                   {holdingsSymbolFields[item.symbol]?.['stop_loss'] && (
                     <div style={{ fontSize: 11, color: '#555' }}>
                       <span style={{ color: '#999' }}>Stop Loss:</span> {holdingsSymbolFields[item.symbol]['stop_loss']}

@@ -29,7 +29,7 @@ function holding(overrides: Partial<PortfolioHolding> & { symbol: string }): Por
     dividends: 0,
     pl: 200,
     pl_pct: 20,
-    sma150: null,
+    sma150: null, native_sma150: null,
     stop_loss: null,
     is_trailing_sell: false,
     basis_date: null,

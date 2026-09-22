@@ -6577,7 +6577,10 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
         let fields: HashMap<&String, &String> = sym_fields
             .map(|f| f.iter().filter(|(k, _)| k.as_str() != "_notes").collect())
             .unwrap_or_default();
-        let sma150 = stored_sma(&conn, symbol, 150).map(|v| ctx.to_aud(symbol, v));
+        // Stored bars are native, so the SMA is too: reported both ways, like
+        // the price, so a holding can be read in the currency it trades in.
+        let native_sma150 = stored_sma(&conn, symbol, 150);
+        let sma150 = native_sma150.map(|v| ctx.to_aud(symbol, v));
         let itype = ctx.info.get(symbol).and_then(|i| i.0.clone());
         // Effective stop loss (manual field, or the trailing-sell trigger) in
         // the symbol's native currency, matching native_current_price.
@@ -6635,6 +6638,7 @@ async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
             "basis_date": rebased.as_ref().map(|(date, _)| date.clone()),
             "basis_price": rebased.as_ref().map(|(_, native)| *native),
             "sma150": sma150,
+            "native_sma150": native_sma150,
             "stop_loss": stop_loss,
             "is_trailing_sell": is_trailing_sell,
         }));
@@ -9605,6 +9609,52 @@ mod tests {
             "chart ends at {}, holdings say {total}",
             last["stocks"]
         );
+    }
+
+    /// The card reads a foreign holding in its own currency, so the 150-day
+    /// average has to be available unconverted — the AUD one beside it is what
+    /// the totals and the comparisons are built from.
+    #[actix_web::test]
+    async fn the_150_day_average_is_reported_in_both_currencies() {
+        let (_file, db_path) = setup_test_db();
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, created_at)
+             VALUES (1, 'USX', 'purchase', '2026-01-05', 10.0, 150.0, 0.0, '2026-01-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('USX', 'USD', 'x')", [])
+            .unwrap();
+        // A cached rate, fresh enough to be used: without one the endpoint asks
+        // Yahoo, and the test would price the holding at the live rate.
+        conn.execute(
+            "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date)
+             VALUES ('USDAUD=X', 1.5, ?1, ?2)",
+            params![Utc::now().to_rfc3339(), Utc::now().format("%Y-%m-%d").to_string()],
+        )
+        .unwrap();
+        // 150 closes at 100 USD make an average of exactly 100.
+        let start = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        for i in 0..150 {
+            let date = (start + chrono::Duration::days(i)).format("%Y-%m-%d").to_string();
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('USX', ?1, 100.0, 'x')",
+                params![date],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('USDAUD=X', ?1, 1.5, 'x')",
+                params![date],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let body = get_json(&db_path, "/api/portfolio/holdings").await;
+        let usx = find(&body["holdings"], "USX");
+        assert!(close_to(&usx["native_sma150"], 100.0), "native average stays in USD, got {}", usx["native_sma150"]);
+        assert!(close_to(&usx["sma150"], 150.0), "the AUD average is converted at 1.5, got {}", usx["sma150"]);
     }
 
     /// A weekly indicator crossed in days must use the last *completed* week.

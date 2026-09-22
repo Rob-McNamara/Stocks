@@ -130,7 +130,7 @@ function makePortfolioHolding(over: Record<string, unknown> & { symbol: string }
     avg_cost: 90, native_avg_cost: 90, current_price: 100, native_current_price: 100,
     price_source: 'cache', price_date: '2026-09-17', change: 1, change_percent: 1,
     volume: 1000, current_value: 1000, dividends: 0, pl: 100, pl_pct: 11.1,
-    sma150: null, stop_loss: null, is_trailing_sell: false,
+    sma150: null, native_sma150: null, stop_loss: null, is_trailing_sell: false,
     ...over,
   }
 }
@@ -229,8 +229,12 @@ describe('which currency a price leads with', () => {
   const EXPD = makePortfolioHolding({
     symbol: 'EXPD', is_international: true, currency: 'USD',
     current_price: 291.5, native_current_price: 190.92,
+    sma150: 282.5, native_sma150: 185.0, current_value: 2915, dividends: 0,
   })
-  const BHP = makePortfolioHolding({ symbol: 'BHP.AX', current_price: 41.25, native_current_price: 41.25 })
+  const BHP = makePortfolioHolding({
+    symbol: 'BHP.AX', current_price: 41.25, native_current_price: 41.25,
+    sma150: 38.0, native_sma150: 38.0, current_value: 1000,
+  })
 
   async function renderScope(scope: 'local' | 'international', tx: Record<string, unknown>) {
     mocked.getPortfolioHoldings.mockResolvedValue({ holdings: [EXPD, BHP], fx_rates: { USD: 1.527 } })
@@ -263,6 +267,20 @@ describe('which currency a price leads with', () => {
     const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
     expect(within(table).getByText(/\$40\.00/)).toBeTruthy()
     expect(within(table).getByRole('columnheader', { name: 'Price (AUD)' })).toBeTruthy()
+  })
+
+  it('reads the 150SMA in the stock\'s currency and marks the AUD totals with A$', async () => {
+    await renderScope('international', usdPurchase)
+    expect(await screen.findByText(/150SMA: USD 185\.00/)).toBeTruthy()
+    expect(screen.getByText(/Current value: A\$2915\.00/)).toBeTruthy()
+    expect(screen.getByText(/Dividends: A\$0\.00/)).toBeTruthy()
+  })
+
+  it('leaves the local card in plain AUD, with no suffix', async () => {
+    await renderScope('local', { id: 1, symbol: 'BHP.AX', price: 40.0 })
+    expect(await screen.findByText(/150SMA: \$38\.00/)).toBeTruthy()
+    const value = screen.getByText(/Current value: \$1000\.00/)
+    expect(value.textContent).not.toContain('A$')
   })
 
   // A foreign stock bought in AUD has no native figure to lead with, and the

@@ -238,6 +238,8 @@ export interface PortfolioHolding {
   pl: number
   pl_pct: number | null
   sma150: number | null
+  /** The same 150-day average in the symbol's own currency */
+  native_sma150: number | null
   /** Effective stop loss in native currency: manual field, or the trailing-sell trigger */
   stop_loss: number | null
   is_trailing_sell: boolean
