@@ -7,7 +7,7 @@ import PriceChart from './PriceChart'
 import HoldingsHeatMap from './HoldingsHeatMap'
 import CollapsibleCard from './CollapsibleCard'
 import type { HoldingScope } from '../utils/holdingScope'
-import { priceParts } from '../utils/priceDisplay'
+import { formatPrice, priceParts } from '../utils/priceDisplay'
 
 /**
  * The sections each screen is organised by, in display order.
@@ -1165,7 +1165,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                 // missing native figure.
                 const averageLine = (label: string, audValue: number | null, nativeValue: number | null) => {
                   const useNative = nativeFirst && isForeign && nativeValue != null
-                  const shown = useNative ? nativeValue.toFixed(2) : audValue !== null ? `$${audValue.toFixed(2)}` : null
+                  const shown = useNative ? formatPrice(nativeValue) : audValue !== null ? `$${formatPrice(audValue)}` : null
                   if (shown === null) return null
                   const below = item.currentPrice !== null && audValue !== null && audValue > item.currentPrice
                   return (
@@ -1229,7 +1229,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                   </div>
                   {item.change !== null && item.changePercent !== null && (
                     <div style={{ color: item.change >= 0 ? '#4caf50' : '#f44336', fontSize: 12 }}>
-                      {item.change >= 0 ? '+' : ''}{item.change.toFixed(2)} ({item.change >= 0 ? '+' : ''}{item.changePercent.toFixed(2)}%)
+                      {item.change >= 0 ? '+' : ''}{formatPrice(item.change)} ({item.change >= 0 ? '+' : ''}{item.changePercent.toFixed(2)}%)
                     </div>
                   )}
                   {/* The average is read against the price above it, so it is

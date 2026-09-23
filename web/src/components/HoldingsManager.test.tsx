@@ -326,6 +326,41 @@ describe('which currency a price leads with', () => {
   })
 })
 
+describe('a stock trading under a cent', () => {
+  // AEG.AX: 0.075 a share, a tenth of a cent a day, averages a cent apart.
+  // At two decimals the card reads $0.08 four times over and +0.00 a day.
+  it('keeps the card\'s price, averages and change apart', async () => {
+    mocked.getPortfolioHoldings.mockResolvedValue({
+      holdings: [makePortfolioHolding({
+        symbol: 'AEG.AX', shares: 20000, current_price: 0.075, native_current_price: 0.075,
+        change: 0.001, change_percent: 1.351, current_value: 1500,
+        sma50: 0.0826899998939037, sma150: 0.06969000010212262, ema40w: 0.06509998670151802,
+      })],
+      fx_rates: {},
+    })
+    mocked.getHoldings.mockResolvedValue([makeTransaction({ id: 1, symbol: 'AEG.AX', price: 0.062 })])
+    mocked.getPortfolioLots.mockResolvedValue({
+      lots: [{ transaction_id: 1, remaining: 20000, current_value: 1500, unrealised_pl: 260 }],
+    })
+    render(<HoldingsManager scope="local" onLoading={() => {}} />)
+    await waitFor(() => expect((triggerButton() as HTMLButtonElement).disabled).toBe(false))
+
+    expect(await screen.findByText(/20000@\$0\.075/)).toBeTruthy()
+    expect(screen.getByText(/50SMA: \$0\.0827/)).toBeTruthy()
+    expect(screen.getByText(/150SMA: \$0\.0697/)).toBeTruthy()
+    expect(screen.getByText(/40W EMA: \$0\.0651/)).toBeTruthy()
+    expect(screen.getByText(/\+0\.001 \(\+1\.35%\)/)).toBeTruthy()
+
+    // The holding is worth $1500 — a total, still in plain dollars and cents.
+    const header = (await screen.findAllByText(/Current Value:/))[0].parentElement!
+    expect(within(header).getByText(/Current Value:/).textContent).toContain('$1,500.00')
+
+    // And the purchase price in the lot table, likewise sub-cent.
+    const table = document.querySelector('.holdings-table-wrapper')! as HTMLElement
+    expect(within(table).getByText('$0.062')).toBeTruthy()
+  })
+})
+
 describe("today's P/L", () => {
   const holding = (over: Record<string, unknown> & { symbol: string }) =>
     makePortfolioHolding({ is_international: true, currency: 'USD', ...over })

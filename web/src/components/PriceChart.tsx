@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { apiClient, type ChartDrawing } from '../services/api'
+import { formatPrice } from '../utils/priceDisplay'
 import { calculateSMA, calculateEMA } from '../utils/sma'
 import { toWeeklyBars } from '../utils/bars'
 import { loadChartDefaults, FALLBACK_CHART_DEFAULTS, CHART_HEIGHT_RANGE, type ChartTimeframe } from '../utils/chartDefaults'
@@ -487,6 +488,17 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const plotWidth = width - left - right
     const plotHeight = height - top - bottom
 
+    // Bars are positioned across `seriesWidth`, not the full plot: with the
+    // last bar's centre on the plot's right edge, half a candle hangs over the
+    // axis and there is nowhere to the right of it to aim at. The gap is half
+    // a candle plus a few pixels, so the newest bar sits wholly inside the
+    // plot with room beside it to hover. Everything else — the axes, the plot
+    // box, a drawn level's line — still spans the full width.
+    const barPitch = plotWidth / Math.max(trimmedHistory.length, 1)
+    const candleWidth = Math.max(1, Math.min(14, barPitch - 1))
+    const seriesWidth = Math.max(1, plotWidth - (candleWidth / 2 + 3))
+    const xAt = (index: number) => left + (seriesWidth * index) / Math.max(trimmedHistory.length - 1, 1)
+
     const closeValues = trimmedHistory.map((item) => item.close)
     const validValues = closeValues.filter((val): val is number => val !== null).map((v) => v * fxMultiplier)
     // In candle mode the extremes are the wicks, not the closes — without this
@@ -523,7 +535,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const toY = (v: number) => top + plotHeight - ((v - minValue) / priceRange) * plotHeight
 
     const points = trimmedHistory.map((item, index) => ({
-      x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
+      x: xAt(index),
       y: item.close !== null ? toY(item.close * fxMultiplier) : null,
     }))
 
@@ -535,7 +547,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         const globalIndex = seriesHistory.length - trimmedHistory.length + index
         const value = allOverlays[overlay.id][globalIndex]
         return {
-          x: left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1),
+          x: xAt(index),
           y: value !== null ? toY(value * fxMultiplier) : null,
         }
       }),
@@ -544,9 +556,8 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     // Candle bodies span open→close, wicks span low→high. Colour is close vs
     // the bar's *own* open (candlestick convention), which is not the same as
     // the volume bars' close-vs-previous-close rule.
-    const candleWidth = Math.max(1, Math.min(14, plotWidth / Math.max(trimmedHistory.length, 1) - 1))
     const candles = trimmedHistory.map((item, index) => {
-      const x = left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1)
+      const x = xAt(index)
       const { open, high, low, close } = item
       if (open === null || high === null || low === null || close === null) return null
       const openY = toY(open * fxMultiplier)
@@ -573,8 +584,8 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const volumePlotHeight = volumeHeight - 20
 
     const volumeBars = trimmedHistory.map((item, index) => {
-      const x = left + (plotWidth * index) / Math.max(trimmedHistory.length - 1, 1)
-      const barWidth = Math.min(20, Math.max(4, plotWidth / trimmedHistory.length - 2))
+      const x = xAt(index)
+      const barWidth = Math.min(20, Math.max(4, barPitch - 2))
       const volume = item.volume ?? 0
       const barHeight = (volume / maxVolume) * volumePlotHeight
       const y = volumeTop + volumePlotHeight - barHeight
@@ -620,14 +631,14 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         const [year, month, day] = item.date.split('-')
         const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         const label = `${day} ${months[parseInt(month, 10) - 1]} '${year.slice(2)}`
-        xLabels.push({ x: left + (plotWidth * idx) / Math.max(trimmedHistory.length - 1, 1), label })
+        xLabels.push({ x: xAt(idx), label })
       }
     }
 
     return {
       width: frame.width, height: volumeTop + volumeHeight,
       points, overlayLines, candles, volumeBars, yLabels, xLabels,
-      left, right, top, bottom, plotWidth, plotHeight,
+      left, right, top, bottom, plotWidth, seriesWidth, plotHeight,
       pricePlotHeight: plotHeight, axisY, labelY, toY, minValue, maxValue,
     }
   }, [frame, trimmedHistory, seriesHistory.length, allOverlays, fxMultiplier, currSym, markerPrice, markers, purchasePrice, purchases, isInternational, showInAud, fxRate, showCandles, yZoom, yCenter])
@@ -644,7 +655,9 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const latestClose = trimmedHistory[trimmedHistory.length - 1]?.close
     if (latestClose == null) return []
     const lastIdx = trimmedHistory.length - 1
-    const todayX = chartData.left + chartData.plotWidth
+    // "Today" is the last bar, which now stops short of the plot's edge;
+    // "tomorrow" stays out in the marker margin beyond it.
+    const todayX = chartData.left + chartData.seriesWidth
     const tomorrowX = chartData.left + chartData.plotWidth + 15
 
     return allMarkers.map((m) => {
@@ -663,7 +676,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
           const close = trimmedHistory[i].close
           if (close !== null && close * fxMultiplier < mp) {
             const crossIdx = Math.min(i + 1, lastIdx)
-            const x = chartData.left + (chartData.plotWidth * crossIdx) / Math.max(lastIdx, 1)
+            const x = chartData.left + (chartData.seriesWidth * crossIdx) / Math.max(lastIdx, 1)
             return { x, y, label: m.label, color: m.color, price: mp }
           }
         }
@@ -692,7 +705,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       if (date && date >= firstDate) {
         const idx = trimmedHistory.findIndex((h) => h.date >= date)
         const i = idx >= 0 ? idx : trimmedHistory.length - 1
-        const x = chartData.left + (chartData.plotWidth * i) / Math.max(trimmedHistory.length - 1, 1)
+        const x = chartData.left + (chartData.seriesWidth * i) / Math.max(trimmedHistory.length - 1, 1)
         return { x, y, price: displayPrice, date, onAxis: false }
       }
       return { x: chartData.left, y, price: displayPrice, date, onAxis: true }
@@ -736,13 +749,13 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const dateToX = (date: string): number => {
     const n = trimmedHistory.length
     if (n === 0) return chartData.left
-    const xAt = (i: number) => chartData.left + (chartData.plotWidth * i) / Math.max(n - 1, 1)
+    const xAt = (i: number) => chartData.left + (chartData.seriesWidth * i) / Math.max(n - 1, 1)
     const first = trimmedHistory[0].date
     const last = trimmedHistory[n - 1].date
     const day = 86400000
     const spanDays = Math.max((Date.parse(last) - Date.parse(first)) / day, 1)
     // Pixels per calendar day, used only to extrapolate beyond the data.
-    const pxPerDay = chartData.plotWidth / spanDays
+    const pxPerDay = chartData.seriesWidth / spanDays
 
     if (date <= first) return xAt(0) - ((Date.parse(first) - Date.parse(date)) / day) * pxPerDay
     if (date >= last) return xAt(n - 1) + ((Date.parse(date) - Date.parse(last)) / day) * pxPerDay
@@ -759,7 +772,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const dateAtX = (x: number): string | null => {
     const n = trimmedHistory.length
     if (n === 0) return null
-    const i = Math.round(((x - chartData.left) / chartData.plotWidth) * (n - 1))
+    const i = Math.round(((x - chartData.left) / chartData.seriesWidth) * (n - 1))
     return trimmedHistory[Math.max(0, Math.min(n - 1, i))].date
   }
 
@@ -1023,7 +1036,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const rect = svg.getBoundingClientRect()
     const svgX = ((e.clientX - rect.left) / rect.width) * chartData.width
     const plotX = svgX - chartData.left
-    const idx = Math.round((plotX / chartData.plotWidth) * (trimmedHistory.length - 1))
+    const idx = Math.round((plotX / chartData.seriesWidth) * (trimmedHistory.length - 1))
     setHoverIndex(Math.max(0, Math.min(trimmedHistory.length - 1, idx)))
   }
 
@@ -1076,13 +1089,13 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       <div className="chart-summary">
         <div>
           <span className="chart-symbol">{symbol}</span>
-          <span className="chart-value">{latestPrice !== null ? `${currSym}${latestPrice.toFixed(2)}` : 'Price unavailable'}</span>
+          <span className="chart-value">{latestPrice !== null ? `${currSym}${formatPrice(latestPrice)}` : 'Price unavailable'}</span>
           {purchasePrice != null && latestPrice !== null && (() => {
             const displayPurchase = purchasePrice * fxMultiplier
             const pl = ((latestPrice - displayPurchase) / displayPurchase) * 100
             return (
               <>
-                <span style={{ fontSize: 12, marginLeft: 10, color: '#888' }}>avg cost {currSym}{displayPurchase.toFixed(2)}</span>
+                <span style={{ fontSize: 12, marginLeft: 10, color: '#888' }}>avg cost {currSym}{formatPrice(displayPurchase)}</span>
                 <span style={{ fontSize: 12, marginLeft: 6, fontWeight: 600, color: pl >= 0 ? '#2e7d32' : '#c62828' }}>
                   {pl >= 0 ? '+' : ''}{pl.toFixed(1)}%
                 </span>
@@ -1397,7 +1410,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                   stroke={colour} strokeWidth={dragging ? 2 : 1.5} strokeDasharray="6 4"
                 />
                 <text x={chartData.left + 4} y={y - 4} fontSize="11" fill={colour} fontFamily="inherit">
-                  {d.label ? `${d.label} ` : ''}{currSym}{(price * fxMultiplier).toFixed(2)}
+                  {d.label ? `${d.label} ` : ''}{currSym}{formatPrice(price * fxMultiplier)}
                 </text>
                 {/* A 1.5px line is too thin to grab, so an invisible wide
                     stroke over it takes the drag. */}
@@ -1442,7 +1455,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
               fill={dot.onAxis ? PURCHASE_AXIS_COLOR : PURCHASE_COLOR}
               stroke="#fff" strokeWidth="2"
             >
-              <title>{dot.onAxis ? 'Purchased before this range' : `Purchased ${dot.date}`} at {currSym}{dot.price.toFixed(2)}</title>
+              <title>{dot.onAxis ? 'Purchased before this range' : `Purchased ${dot.date}`} at {currSym}{formatPrice(dot.price)}</title>
             </circle>
           ))}
 
@@ -1471,19 +1484,19 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
               <text x={tooltipX + 10} y={chartData.top + 20} fontSize="11" fill="#aac" fontFamily="inherit">{hoverData.date}</text>
               {hoverData.price !== null && (
                 <text x={tooltipX + 10} y={chartData.top + 38} fontSize="13" fill="#fff" fontFamily="inherit" fontWeight="600">
-                  Price: {currSym}{hoverData.price.toFixed(2)}
+                  Price: {currSym}{formatPrice(hoverData.price)}
                 </text>
               )}
               {hoverData.ohlc && (
                 <>
                   <text x={tooltipX + 10} y={chartData.top + 56} fontSize="12" fill="#aac" fontFamily="inherit">
-                    Open: {currSym}{hoverData.ohlc.open.toFixed(2)}
+                    Open: {currSym}{formatPrice(hoverData.ohlc.open)}
                   </text>
                   <text x={tooltipX + 10} y={chartData.top + 74} fontSize="12" fill="#aac" fontFamily="inherit">
-                    High: {currSym}{hoverData.ohlc.high.toFixed(2)}
+                    High: {currSym}{formatPrice(hoverData.ohlc.high)}
                   </text>
                   <text x={tooltipX + 10} y={chartData.top + 92} fontSize="12" fill="#aac" fontFamily="inherit">
-                    Low: {currSym}{hoverData.ohlc.low.toFixed(2)}
+                    Low: {currSym}{formatPrice(hoverData.ohlc.low)}
                   </text>
                 </>
               )}
@@ -1492,7 +1505,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                   <g key={id}>
                     <rect x={tooltipX + 10} y={tooltipRowY(i) - 8} width={9} height={9} rx="2" fill={color} />
                     <text x={tooltipX + 24} y={tooltipRowY(i)} fontSize="12" fill={TOOLTIP_INK} fontFamily="inherit">
-                      {label}: {currSym}{value.toFixed(2)}
+                      {label}: {currSym}{formatPrice(value)}
                     </text>
                   </g>
                 ) : null
@@ -1501,7 +1514,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                 <g key={`m${i}`}>
                   <rect x={tooltipX + 10} y={tooltipRowY(activeOverlayValues.length + i) - 8} width={9} height={9} rx="2" fill={dot.color} />
                   <text x={tooltipX + 24} y={tooltipRowY(activeOverlayValues.length + i)} fontSize="12" fill={TOOLTIP_INK} fontFamily="inherit">
-                    {dot.label}: {currSym}{dot.price.toFixed(2)}
+                    {dot.label}: {currSym}{formatPrice(dot.price)}
                   </text>
                 </g>
               ))}
@@ -1513,7 +1526,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
                     fill={purchaseDot.onAxis ? PURCHASE_AXIS_COLOR : PURCHASE_COLOR}
                   />
                   <text x={tooltipX + 24} y={tooltipRowY(activeOverlayValues.length + markerDots.length)} fontSize="12" fill={TOOLTIP_INK} fontFamily="inherit">
-                    Purchase: {currSym}{purchaseDot.price.toFixed(2)}
+                    Purchase: {currSym}{formatPrice(purchaseDot.price)}
                   </text>
                 </g>
               )}

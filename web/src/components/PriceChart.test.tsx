@@ -41,6 +41,14 @@ const moveTrendline = apiClient.moveTrendline as ReturnType<typeof vi.fn>
 // size can stub ResizeObserver.
 const LEFT = 72
 const PLOT_WIDTH = 1040 - 72 - 20
+/**
+ * Bars stop short of the plot's right edge by half a candle plus 3px, so the
+ * newest one sits wholly inside it with room beside it to hover. Axes, the
+ * plot box and a drawn level still span PLOT_WIDTH.
+ */
+const seriesWidth = (bars: number) =>
+  PLOT_WIDTH - (Math.max(1, Math.min(14, PLOT_WIDTH / Math.max(bars, 1) - 1)) / 2 + 3)
+const SERIES_WIDTH = seriesWidth(40)
 
 function isoDaysAgo(n: number): string {
   const d = new Date()
@@ -416,7 +424,7 @@ describe('purchase dot placement', () => {
     })
     const dot = container.querySelector('circle[fill="#1565c0"]')!
     expect(dot).toBeTruthy()
-    const expectedX = LEFT + (PLOT_WIDTH * purchaseIdx) / (DATES.length - 1)
+    const expectedX = LEFT + (SERIES_WIDTH * purchaseIdx) / (DATES.length - 1)
     expect(Math.abs(parseFloat(dot.getAttribute('cx')!) - expectedX)).toBeLessThan(0.5)
   })
 
@@ -448,7 +456,7 @@ describe('purchase dot placement', () => {
     expect(dots).toHaveLength(2)
     const xs = dots.map((d) => parseFloat(d.getAttribute('cx')!)).sort((a, b) => a - b)
     for (const [i, idx] of [first, second].entries()) {
-      const expected = LEFT + (PLOT_WIDTH * idx) / (DATES.length - 1)
+      const expected = LEFT + (SERIES_WIDTH * idx) / (DATES.length - 1)
       expect(Math.abs(xs[i] - expected)).toBeLessThan(0.5)
     }
   })
@@ -469,7 +477,7 @@ describe('purchase dot placement', () => {
     expect(container.querySelectorAll('circle[fill="#ff9800"]')).toHaveLength(1)
     const inRange = [...container.querySelectorAll('circle[fill="#1565c0"]')]
     expect(inRange).toHaveLength(1)
-    const expected = LEFT + (PLOT_WIDTH * visible) / (DATES.length - 1)
+    const expected = LEFT + (SERIES_WIDTH * visible) / (DATES.length - 1)
     expect(Math.abs(parseFloat(inRange[0].getAttribute('cx')!) - expected)).toBeLessThan(0.5)
   })
 })
@@ -837,6 +845,38 @@ describe('placing a level', () => {
   })
 })
 
+describe('the newest bar', () => {
+  // With the last bar centred on the plot's right edge, half its candle hung
+  // over the axis and there was nothing to its right to aim the pointer at.
+  it('sits wholly inside the plot, not over the axis', async () => {
+    getPriceHistory.mockResolvedValue(OHLC_HISTORY)
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByRole('button', { name: /Candle/ }))
+
+    await waitFor(() => expect(container.querySelector('rect.candle-body')).toBeTruthy())
+    const bodies = [...container.querySelectorAll('rect.candle-body')]
+    const last = bodies[bodies.length - 1]
+    const rightEdge = parseFloat(last.getAttribute('x')!) + parseFloat(last.getAttribute('width')!)
+    expect(rightEdge).toBeLessThanOrEqual(LEFT + PLOT_WIDTH)
+    // And the gap beside it is real, not a rounding artefact.
+    expect(LEFT + PLOT_WIDTH - rightEdge).toBeGreaterThan(2)
+  })
+
+  it('is what the pointer lands on in the gap beside it', async () => {
+    const { container } = await renderChart()
+    const svg = container.querySelector('svg')!
+    svg.getBoundingClientRect = () => ({
+      top: 0, left: 0, width: 1040, height: 460, right: 1040, bottom: 460, x: 0, y: 0, toJSON: () => {},
+    }) as DOMRect
+
+    // Between the last bar and the plot's edge — previously past every bar.
+    fireEvent.mouseMove(svg, { clientX: LEFT + PLOT_WIDTH - 2, clientY: 200 })
+    await waitFor(() => expect(screen.getByText(/Price:/)).toBeTruthy())
+    const tooltip = screen.getByText(/Price:/).closest('div')!.parentElement!
+    expect(tooltip.textContent).toContain(DATES[DATES.length - 1])
+  })
+})
+
 describe('trendlines', () => {
   const trend = (over: Record<string, unknown> = {}) => ({
     id: 5, symbol: 'TST.AX', kind: 'trend' as const,
@@ -856,8 +896,8 @@ describe('trendlines', () => {
     const x2 = parseFloat(seg.getAttribute('x2')!)
     const y1 = parseFloat(seg.getAttribute('y1')!)
     const y2 = parseFloat(seg.getAttribute('y2')!)
-    expect(Math.abs(x1 - (LEFT + (PLOT_WIDTH * 5) / (DATES.length - 1)))).toBeLessThan(0.5)
-    expect(Math.abs(x2 - (LEFT + (PLOT_WIDTH * 20) / (DATES.length - 1)))).toBeLessThan(0.5)
+    expect(Math.abs(x1 - (LEFT + (SERIES_WIDTH * 5) / (DATES.length - 1)))).toBeLessThan(0.5)
+    expect(Math.abs(x2 - (LEFT + (SERIES_WIDTH * 20) / (DATES.length - 1)))).toBeLessThan(0.5)
     // Rising price means a lower y at the later anchor.
     expect(y2).toBeLessThan(y1)
   })
@@ -913,7 +953,7 @@ describe('moving a trendline', () => {
     created_at: 'x', ...over,
   })
   /** x of bar `i` in the unmeasured 1100-wide fallback frame. */
-  const barX = (i: number) => LEFT + (PLOT_WIDTH * i) / (DATES.length - 1)
+  const barX = (i: number) => LEFT + (SERIES_WIDTH * i) / (DATES.length - 1)
 
   const setRect = (container: HTMLElement) => {
     const svg = container.querySelector('svg')!
