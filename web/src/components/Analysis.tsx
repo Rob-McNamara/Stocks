@@ -400,7 +400,13 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
             <div className="modal-body">
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <label style={{ fontSize: 13, color: '#666' }}>Stop Loss Price</label>
+                <label style={{ fontSize: 13, color: '#666' }}>
+                  Stop Loss Price
+                  {(() => {
+                    const ccy = riskRows.find((r) => r.symbol === editingStopLossSymbol)?.native_currency
+                    return ccy && ccy !== 'AUD' ? ` (${ccy})` : ''
+                  })()}
+                </label>
                 <input
                   type="number"
                   min="0"

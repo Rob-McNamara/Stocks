@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { apiClient, type EnrichedWatchlistItem } from '../services/api'
+import { formatPrice } from '../utils/priceDisplay'
 import { SECTORS } from '../utils/sectors'
 import PriceChart, { BREAKTHROUGH_COLOR, STOP_LOSS_COLOR } from './PriceChart'
 import StockAnalysis from './StockAnalysis'
@@ -35,6 +36,7 @@ interface CurrentPrice {
   price_date?: string | null
   sma50?: number | null
   sma150?: number | null
+  ema40w?: number | null
   volumeChangePct?: number | null
   daysSince50SMA?: number | null
   volumePct50SMA?: number | null
@@ -87,43 +89,6 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
   // Server-driven sector list from /api/meta; static list is the offline fallback
   const [sectorOptions, setSectorOptions] = useState<string[]>([...SECTORS])
 
-  useEffect(() => {
-    loadWatchlistData()
-  }, [])
-
-  useEffect(() => {
-    if (!initialSymbol) return
-    const entry = symbols.find((s) => s.symbol === initialSymbol)
-    if (entry) {
-      setSelectedList(entry.list_name)
-      setSelectedSymbol(initialSymbol)
-      onInitialSymbolConsumed?.()
-    }
-  }, [initialSymbol, symbols])
-
-  // A "Move to Holdings" transaction was saved. The server removed the
-  // memberships atomically (POST /api/holdings/from-watchlist) — just resync.
-  useEffect(() => {
-    if (!removeSymbolRequest) return
-    onRemoveSymbolConsumed?.()
-    const resync = async () => {
-      try {
-        if (selectedSymbol === removeSymbolRequest) setSelectedSymbol('')
-        const [listsData, enriched] = await Promise.all([
-          apiClient.getWatchlistLists(),
-          apiClient.getWatchlistEnriched(),
-        ])
-        setLists(listsData.length > 0 ? listsData : ['Default'])
-        applyEnriched(enriched)
-        setSuccess(`${removeSymbolRequest} moved to Holdings and removed from watchlist`)
-        setTimeout(() => setSuccess(null), 3000)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to refresh watchlist')
-      }
-    }
-    resync()
-  }, [removeSymbolRequest])
-
   /** Map the enriched server response into component state. */
   const applyEnriched = (data: { items: EnrichedWatchlistItem[]; prices_updated_at: string | null }) => {
     const items = data.items
@@ -154,6 +119,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
         price_date: i.price_date,
         sma50: i.indicators?.sma50 ?? null,
         sma150: i.indicators?.sma150 ?? null,
+        ema40w: i.indicators?.ema40w ?? null,
         sma50Trend: i.indicators?.sma50_trend ?? null,
         sma150Trend: i.indicators?.sma150_trend ?? null,
         daysSince50SMA: i.indicators?.days_since_50sma ?? null,
@@ -200,6 +166,43 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
       onLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadWatchlistData()
+  }, [])
+
+  useEffect(() => {
+    if (!initialSymbol) return
+    const entry = symbols.find((s) => s.symbol === initialSymbol)
+    if (entry) {
+      setSelectedList(entry.list_name)
+      setSelectedSymbol(initialSymbol)
+      onInitialSymbolConsumed?.()
+    }
+  }, [initialSymbol, symbols])
+
+  // A "Move to Holdings" transaction was saved. The server removed the
+  // memberships atomically (POST /api/holdings/from-watchlist) — just resync.
+  useEffect(() => {
+    if (!removeSymbolRequest) return
+    onRemoveSymbolConsumed?.()
+    const resync = async () => {
+      try {
+        if (selectedSymbol === removeSymbolRequest) setSelectedSymbol('')
+        const [listsData, enriched] = await Promise.all([
+          apiClient.getWatchlistLists(),
+          apiClient.getWatchlistEnriched(),
+        ])
+        setLists(listsData.length > 0 ? listsData : ['Default'])
+        applyEnriched(enriched)
+        setSuccess(`${removeSymbolRequest} moved to Holdings and removed from watchlist`)
+        setTimeout(() => setSuccess(null), 3000)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to refresh watchlist')
+      }
+    }
+    resync()
+  }, [removeSymbolRequest])
 
   const handleCreateList = () => {
     const name = newListName.trim()
@@ -443,7 +446,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
             <div className="price-details">
               <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
                 {priceData.price != null ? (
-                  <span className="price-value">${priceData.price.toFixed(2)}</span>
+                  <span className="price-value">${formatPrice(priceData.price)}</span>
                 ) : (
                   <span className="price-unavailable">—</span>
                 )}
@@ -457,11 +460,11 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
               {priceData.volume && (
                 <div className="volume">Vol: {priceData.volume.toLocaleString()}</div>
               )}
-              {(priceData.sma50 != null || priceData.sma150 != null) && (
+              {(priceData.sma50 != null || priceData.sma150 != null || priceData.ema40w != null) && (
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                   {priceData.sma50 != null && (
                     <span className={`sma-value ${priceData.price !== null && priceData.sma50 > priceData.price ? 'sma-above-price' : ''}`}>
-                      50SMA: ${priceData.sma50.toFixed(2)}
+                      50SMA: ${formatPrice(priceData.sma50)}
                       {priceData.sma50Trend != null && (
                         <span style={{ marginLeft: 4, fontSize: 10, color: priceData.sma50Trend === 'down' ? '#c62828' : '#2e7d32', fontWeight: 600 }}>
                           {priceData.sma50Trend === 'down' ? '↓' : '↑'}
@@ -481,7 +484,7 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                   )}
                   {priceData.sma150 != null && (
                     <span className={`sma-value ${priceData.price !== null && priceData.sma150 > priceData.price ? 'sma-above-price' : ''}`}>
-                      150SMA: ${priceData.sma150.toFixed(2)}
+                      150SMA: ${formatPrice(priceData.sma150)}
                       {priceData.sma150Trend != null && (
                         <span style={{ marginLeft: 4, fontSize: 10, color: priceData.sma150Trend === 'down' ? '#c62828' : '#2e7d32', fontWeight: 600 }}>
                           {priceData.sma150Trend === 'down' ? '↓' : '↑'}
@@ -497,6 +500,11 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
                           )}
                         </span>
                       )}
+                    </span>
+                  )}
+                  {priceData.ema40w != null && (
+                    <span className={`sma-value ${priceData.price !== null && priceData.ema40w > priceData.price ? 'sma-above-price' : ''}`}>
+                      40W EMA: ${formatPrice(priceData.ema40w)}
                     </span>
                   )}
                 </div>

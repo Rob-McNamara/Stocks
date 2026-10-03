@@ -1,68 +1,9 @@
-use chrono::{NaiveDate, TimeZone, Utc};
 use reqwest::Client;
-use rusqlite::{params, Connection};
-use serde::Deserialize;
-use std::{collections::HashMap, env, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
+use stocks::db::{insert_event_log, open_db};
+use stocks::dividends::{self, DividendEvent};
 use stocks::portfolio::{self, ImpliedDividendPayment, PortfolioTx, TxType};
 use tokio::time;
-
-/// Open the SQLite database with WAL mode and a busy timeout so the API,
-/// price daemon and dividends daemon can write concurrently without
-/// intermittent "database is locked" failures.
-fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    Ok(conn)
-}
-
-#[derive(Debug)]
-struct DividendEvent {
-    #[allow(dead_code)] // set for Debug/log symmetry; storage passes the symbol separately
-    symbol: String,
-    ex_date: NaiveDate,
-    payment_date: Option<NaiveDate>,
-    record_date: Option<NaiveDate>,
-    amount: f64,
-    fetched_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooChartResponse {
-    chart: YahooChart,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooChart {
-    result: Option<Vec<YahooResult>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooResult {
-    meta: Option<YahooResultMeta>,
-    events: Option<YahooEvents>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooResultMeta {
-    /// Exchange UTC offset in seconds — needed to date events correctly
-    gmtoffset: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooEvents {
-    dividends: Option<HashMap<String, YahooDividendEntry>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct YahooDividendEntry {
-    amount: Option<f64>,
-    date: Option<i64>,
-    ex_date: Option<i64>,
-    payment_date: Option<i64>,
-    record_date: Option<i64>,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,8 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let db_path = PathBuf::from(database_path);
     init_db(&db_path)?;
 
-    let client = Client::builder()
-        .user_agent("stocks-dividends-daemon/1.0")
+    let client = stocks::http::builder("stocks-dividends-daemon/1.0")
         .build()?;
 
     if run_once {
@@ -117,7 +57,7 @@ async fn run_dividend_check(client: &Client, db_path: &PathBuf) -> anyhow::Resul
 
     for symbol in unique_symbols {
         log::info!("Checking dividends for {}", symbol);
-        let events = match fetch_dividend_events(client, &symbol).await {
+        let events = match dividends::fetch_events(client, &symbol).await {
             Ok(ev) => ev,
             Err(err) => {
                 log::error!("Dividend fetch failed for {}: {}", symbol, err);
@@ -132,7 +72,12 @@ async fn run_dividend_check(client: &Client, db_path: &PathBuf) -> anyhow::Resul
             continue;
         }
 
-        store_dividend_events(db_path, &symbol, &events)?;
+        // One symbol's failure must not abandon the rest of the run.
+        if let Err(err) = store_dividend_events(db_path, &symbol, &events) {
+            log::error!("Storing dividends failed for {}: {}", symbol, err);
+            let _ = insert_event_log(db_path, "error", "dividend_fetch", "dividends_daemon", Some(&symbol), &format!("Store error: {}", err));
+            continue;
+        }
 
         let symbol_transactions: Vec<PortfolioTx> = holdings
             .iter()
@@ -206,68 +151,6 @@ fn load_holdings_transactions(db_path: &PathBuf) -> anyhow::Result<Vec<Portfolio
     rows.collect::<Result<_, rusqlite::Error>>().map_err(|err| err.into())
 }
 
-async fn fetch_dividend_events(client: &Client, symbol: &str) -> anyhow::Result<Vec<DividendEvent>> {
-    let url = format!(
-        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=5y&events=div",
-        symbol
-    );
-
-    let response = client.get(&url).send().await?;
-    let response = response.error_for_status()?;
-    let payload: YahooChartResponse = response.json().await?;
-
-    let result = payload
-        .chart
-        .result
-        .and_then(|items| items.into_iter().next())
-        .ok_or_else(|| anyhow::anyhow!("No chart result found for {}", symbol))?;
-
-    let now = Utc::now().to_rfc3339();
-    let mut events = Vec::new();
-
-    // Yahoo stamps dividend events at the market open; for exchanges ahead
-    // of UTC (e.g. ASX during daylight saving) the UTC date is one day
-    // early, so dates are taken in exchange time: UTC + meta.gmtoffset.
-    let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset).unwrap_or(0);
-
-    if let Some(events_payload) = result.events
-        && let Some(dividends) = events_payload.dividends {
-            for entry in dividends.values() {
-                let amount = entry.amount.unwrap_or(0.0);
-                if amount <= 0.0 {
-                    continue;
-                }
-
-                let ex_date = entry
-                    .ex_date
-                    .or(entry.date)
-                    .ok_or_else(|| anyhow::anyhow!("Dividend entry missing date for {}", symbol))?;
-                let payment_date = entry.payment_date;
-                let record_date = entry.record_date;
-
-                let event = DividendEvent {
-                    symbol: symbol.to_string(),
-                    ex_date: Utc.timestamp_opt(ex_date + gmtoffset, 0)
-                        .single()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid ex-date timestamp {}", ex_date))?
-                        .date_naive(),
-                    payment_date: payment_date
-                        .and_then(|ts| Utc.timestamp_opt(ts + gmtoffset, 0).single())
-                        .map(|dt| dt.date_naive()),
-                    record_date: record_date
-                        .and_then(|ts| Utc.timestamp_opt(ts + gmtoffset, 0).single())
-                        .map(|dt| dt.date_naive()),
-                    amount,
-                    fetched_at: now.clone(),
-                };
-                events.push(event);
-            }
-        }
-
-    events.sort_by_key(|event| event.ex_date);
-    Ok(events)
-}
-
 fn init_db(path: &PathBuf) -> anyhow::Result<()> {
     let conn = open_db(path)?;
     conn.execute_batch(
@@ -297,91 +180,25 @@ fn init_db(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn store_dividend_events(
-    db_path: &PathBuf,
-    symbol: &str,
-    events: &[DividendEvent],
-) -> anyhow::Result<()> {
+/// Stored through `stocks::dividends`, the same deduping, replacing store the
+/// API uses. This daemon used to upsert Yahoo's raw events, which put back
+/// every duplicate the API had collapsed.
+fn store_dividend_events(db_path: &PathBuf, symbol: &str, events: &[DividendEvent]) -> anyhow::Result<()> {
     let mut conn = open_db(db_path)?;
-    let tx = conn.transaction()?;
-    {
-        let mut insert = tx.prepare(
-            "INSERT OR REPLACE INTO dividend_events
-             (symbol, ex_date, payment_date, record_date, amount, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-
-        for event in events {
-            insert.execute(params![
-                symbol,
-                event.ex_date.format("%Y-%m-%d").to_string(),
-                event
-                    .payment_date
-                    .map(|d| d.format("%Y-%m-%d").to_string()),
-                event
-                    .record_date
-                    .map(|d| d.format("%Y-%m-%d").to_string()),
-                event.amount,
-                event.fetched_at,
-            ])?;
-        }
-    }
-
-    tx.commit()?;
-    // Log successful dividend fetch
-    let details = format!("Stored {} dividend events for {}", events.len(), symbol);
+    let stored = dividends::replace_events(&mut conn, symbol, events)?;
+    let details = if stored == 0 {
+        format!("Dividend events for {} unchanged", symbol)
+    } else {
+        format!("Stored {} dividend events for {}", stored, symbol)
+    };
     let _ = insert_event_log(db_path, "info", "dividend_fetch", "dividends_daemon", Some(symbol), &details);
-    Ok(())
-}
-
-fn insert_event_log(
-    db_path: &PathBuf,
-    level: &str,
-    event_type: &str,
-    source: &str,
-    symbol: Option<&str>,
-    details: &str,
-) -> anyhow::Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![now, level, source, event_type, symbol, details],
-    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// gmtoffset must survive deserialisation of the dividends payload —
-    /// ASX ex-dividend dates are stamped at the market open (23:00 UTC the
-    /// previous day during daylight saving) and shift a day early without it.
-    #[test]
-    fn dividend_chart_response_parses_gmtoffset() {
-        let json = r#"{
-            "chart": {
-                "result": [{
-                    "meta": { "gmtoffset": 39600 },
-                    "events": {
-                        "dividends": {
-                            "1767564000": { "amount": 0.44, "date": 1767564000 }
-                        }
-                    }
-                }]
-            }
-        }"#;
-        let payload: YahooChartResponse = serde_json::from_str(json).unwrap();
-        let result = payload.chart.result.unwrap().into_iter().next().unwrap();
-        let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset).unwrap_or(0);
-        assert_eq!(gmtoffset, 39600);
-        let ts = result.events.unwrap().dividends.unwrap().values().next().unwrap().date.unwrap();
-        // 1767564000 = 2026-01-04 22:00 UTC = 2026-01-05 09:00 AEDT: the
-        // ex-date must land on the Sydney trading day, not the UTC day.
-        let ex_date = Utc.timestamp_opt(ts + gmtoffset, 0).single().unwrap().date_naive();
-        assert_eq!(ex_date, NaiveDate::from_ymd_opt(2026, 1, 5).unwrap());
-    }
+    use chrono::NaiveDate;
 
     /// End-to-end through the daemon's own load path: seed a temp DB, load
     /// transactions as the daemon does, and assert the computed payments

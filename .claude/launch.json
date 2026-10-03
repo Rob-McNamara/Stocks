@@ -4,7 +4,7 @@
     {
       "name": "web",
       "runtimeExecutable": "npx",
-      "runtimeArgs": ["vite", "--host"],
+      "runtimeArgs": ["vite"],
       "port": 5173,
       "autoPort": false,
       "cwd": "web"

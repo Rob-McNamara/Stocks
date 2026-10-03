@@ -1,4 +1,11 @@
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001/api/v1'
+/**
+ * Compiled into the JavaScript bundle, so anyone who can load the page can
+ * read it. It keeps other devices on the network from calling the API
+ * directly; it is not a secret from the browser. Serve the page only where
+ * you'd be happy for its users to hold the token — localhost, by default
+ * (`vite` without `--host`).
+ */
 const API_TOKEN: string | undefined = import.meta.env.VITE_API_TOKEN
 
 /** fetch wrapper that attaches the bearer token when VITE_API_TOKEN is set. */
@@ -189,6 +196,8 @@ export interface WatchlistIndicators {
   days_since_150sma: number | null
   volume_pct_150sma: number | null
   volume_change_pct: number | null
+  /** 40-week EMA over weekly closes, in the symbol's own currency */
+  ema40w: number | null
 }
 
 export interface EnrichedWatchlistItem {
@@ -229,6 +238,8 @@ export interface PortfolioHolding {
   current_price: number | null
   native_current_price: number | null
   price_source: 'cache' | 'manual' | 'none'
+  /** A price exists but no FX rate does, so the AUD figures are absent. */
+  fx_missing?: boolean
   price_date: string | null
   change: number | null
   change_percent: number | null
@@ -266,6 +277,8 @@ export interface PortfolioHolding {
 export interface RiskRow {
   symbol: string
   currency: string
+  /** The stock's trading currency — what a manual stop loss is entered in. */
+  native_currency?: string
   current_price: number | null
   purchase_price: number | null
   pl_pct: number | null
@@ -487,14 +500,29 @@ export interface HoldingTransactionPayload {
 }
 
 /**
- * URL of an account's ledger as CSV.
+ * Download an account's ledger as CSV, saved under the server's filename.
  *
- * A link rather than a fetch: the response carries Content-Disposition, so the
- * browser saves it under the server's filename with no blob juggling, and the
- * running balance stays in the order the server computed it.
+ * Fetched rather than linked: a plain link cannot carry the Authorization
+ * header, so with API_TOKEN set the download came back 401. The running
+ * balance is still computed and ordered by the server.
  */
-export function cashAccountCsvUrl(accountId: number): string {
-  return `${API_BASE_URL}/cash/accounts/${accountId}/transactions.csv`
+export async function downloadCashAccountCsv(accountId: number): Promise<void> {
+  const response = await apiFetch(`${API_BASE_URL}/cash/accounts/${accountId}/transactions.csv`)
+  if (!response.ok) {
+    throw new Error((await apiErrorMessage(response)) || 'Failed to export the account')
+  }
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? `cash-account-${accountId}.csv`
+  const url = URL.createObjectURL(await response.blob())
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  // Revoked after a beat: Safari starts the download asynchronously and fails
+  // it if the URL is already gone.
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 export interface ChartDrawing {
@@ -518,6 +546,17 @@ export interface NewTrendline {
   endDate: string
   endPrice: number
   label?: string
+}
+
+/**
+ * The server refused a sale of more shares than are held. Re-sending the same
+ * payload with `confirm: true` records it anyway.
+ */
+export class OversellError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'OversellError'
+  }
 }
 
 export const apiClient = {
@@ -961,6 +1000,7 @@ export const apiClient = {
 
     if (!response.ok) {
       const message = await apiErrorMessage(response)
+      if (response.status === 409) throw new OversellError(message)
       throw new Error(message || 'Failed to update holding transaction')
     }
 

@@ -18,6 +18,21 @@
 use chrono::NaiveDate;
 use std::collections::HashMap;
 
+/// Share counts closer to zero than this are zero.
+///
+/// Quantities are floats, and fractional shares (common on US holdings) don't
+/// subtract exactly: buying 0.4 and selling 0.1 then 0.3 leaves about 5.6e-17,
+/// not 0. Compared against exactly zero, that residue kept a fully sold
+/// position "held" — listed with a near-zero value, never attributed its
+/// sold-side dividends, never treated as exited. Every lot and position
+/// comparison goes through this instead.
+pub const SHARE_EPSILON: f64 = 1e-9;
+
+/// `shares`, with float residue snapped to exactly zero.
+pub fn settle_shares(shares: f64) -> f64 {
+    if shares.abs() < SHARE_EPSILON { 0.0 } else { shares }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxType {
     Purchase,
@@ -128,12 +143,12 @@ pub fn sort_transactions(txs: &[PortfolioTx]) -> Vec<PortfolioTx> {
 pub fn apply_fifo_sale(lots: &mut Vec<Lot>, quantity: f64) -> f64 {
     let mut remaining = quantity;
     let mut cost_basis = 0.0;
-    while remaining > 0.0 && !lots.is_empty() {
+    while remaining > SHARE_EPSILON && !lots.is_empty() {
         let used = remaining.min(lots[0].quantity);
         cost_basis += used * lots[0].price;
         lots[0].quantity -= used;
         remaining -= used;
-        if lots[0].quantity <= 0.0 {
+        if lots[0].quantity <= SHARE_EPSILON {
             lots.remove(0);
         }
     }
@@ -211,7 +226,7 @@ pub fn calc_symbol_summary(txs: &[PortfolioTx]) -> SymbolSummary {
         }
     }
 
-    let remaining_shares = lots.iter().map(|l| l.quantity).sum();
+    let remaining_shares = settle_shares(lots.iter().map(|l| l.quantity).sum());
     let remaining_cost = lots.iter().map(|l| l.quantity * l.price).sum();
     let native_remaining_cost = native_lots.iter().map(|l| l.quantity * l.price).sum();
 
@@ -381,7 +396,7 @@ pub fn shares_on_date(txs: &[PortfolioTx], date: &str) -> f64 {
             _ => {}
         }
     }
-    shares.max(0.0)
+    settle_shares(shares).max(0.0)
 }
 
 /// A payment implied by a per-share dividend event.
@@ -468,7 +483,7 @@ pub fn calc_symbol_position(txs: &[PortfolioTx]) -> SymbolPosition {
         }
     }
 
-    let remaining_shares: f64 = lots.iter().map(|l| l.quantity).sum();
+    let remaining_shares: f64 = settle_shares(lots.iter().map(|l| l.quantity).sum());
     let remaining_cost = lots.iter().map(|l| l.quantity * l.price).sum();
     let native_remaining_cost = native_lots.iter().map(|l| l.quantity * l.price).sum();
     let sold_dividends = if remaining_shares == 0.0 && total_sold_qty > 0.0 { dividends } else { 0.0 };
@@ -516,12 +531,12 @@ pub fn calc_remaining_by_lot(transactions: &[PortfolioTx]) -> HashMap<i64, f64> 
                 }
                 (TxType::Sale, Some(qty)) => {
                     let mut remaining = qty;
-                    while remaining > 0.0 && !lots.is_empty() {
+                    while remaining > SHARE_EPSILON && !lots.is_empty() {
                         let used = remaining.min(lots[0].1);
-                        lots[0].1 -= used;
+                        lots[0].1 = settle_shares(lots[0].1 - used);
                         result.insert(lots[0].0, lots[0].1);
                         remaining -= used;
-                        if lots[0].1 <= 0.0 {
+                        if lots[0].1 <= SHARE_EPSILON {
                             lots.remove(0);
                         }
                     }
@@ -552,7 +567,7 @@ pub fn get_active_holding_symbols(transactions: &[PortfolioTx]) -> Vec<String> {
                 }
             }
     }
-    order.into_iter().filter(|s| net.get(s).copied().unwrap_or(0.0) > 0.0).collect()
+    order.into_iter().filter(|s| net.get(s).copied().unwrap_or(0.0) > SHARE_EPSILON).collect()
 }
 
 /// Date of the earliest purchase lot that still has unsold shares.
@@ -565,11 +580,11 @@ pub fn get_earliest_remaining_purchase_date(transactions: &[PortfolioTx], symbol
             (TxType::Purchase, Some(qty)) if qty != 0.0 => lots.push((tx.date.clone(), qty)),
             (TxType::Sale, Some(qty)) if qty != 0.0 => {
                 let mut remaining = qty;
-                while remaining > 0.0 && !lots.is_empty() {
+                while remaining > SHARE_EPSILON && !lots.is_empty() {
                     let used = remaining.min(lots[0].1);
                     lots[0].1 -= used;
                     remaining -= used;
-                    if lots[0].1 <= 0.0 {
+                    if lots[0].1 <= SHARE_EPSILON {
                         lots.remove(0);
                     }
                 }
@@ -621,7 +636,7 @@ pub fn calc_sold_entries(txs: &[PortfolioTx]) -> Vec<SoldEntry> {
                 let mut remaining = qty;
                 let mut cost_basis = 0.0;
                 let mut earliest = tx.date.clone();
-                while remaining > 0.0 && !lots.is_empty() {
+                while remaining > SHARE_EPSILON && !lots.is_empty() {
                     let used = remaining.min(lots[0].0);
                     if lots[0].2 < earliest {
                         earliest = lots[0].2.clone();
@@ -629,7 +644,7 @@ pub fn calc_sold_entries(txs: &[PortfolioTx]) -> Vec<SoldEntry> {
                     cost_basis += used * lots[0].1;
                     remaining -= used;
                     lots[0].0 -= used;
-                    if lots[0].0 <= 0.0 {
+                    if lots[0].0 <= SHARE_EPSILON {
                         lots.remove(0);
                     }
                 }
@@ -658,7 +673,7 @@ pub fn calc_sold_entries(txs: &[PortfolioTx]) -> Vec<SoldEntry> {
         }
     }
 
-    let remaining_shares: f64 = lots.iter().map(|l| l.0).sum();
+    let remaining_shares: f64 = settle_shares(lots.iter().map(|l| l.0).sum());
     if remaining_shares == 0.0 && total_sold_qty > 0.0 && dividends > 0.0 {
         for sale in &mut sales {
             let share = (sale.quantity / total_sold_qty) * dividends;
@@ -695,6 +710,29 @@ mod tests {
             brokerage: None,
             dividends_total: 0.0,
         }
+    }
+
+    /// Fractional quantities don't subtract exactly: 0.4 − 0.1 − 0.3 is about
+    /// 5.6e-17, not zero. A position sold out that way must read as closed, so
+    /// its dividends move to the sold side and nothing is left "held".
+    #[test]
+    fn a_fractional_sell_out_closes_the_position() {
+        let txs = vec![
+            tx(1, "purchase", "2025-01-01", 0.4, 100.0, None),
+            tx(2, "sale", "2025-02-01", 0.1, 110.0, None),
+            tx(3, "sale", "2025-03-01", 0.3, 120.0, None),
+            tx(4, "dividend", "2025-01-15", 0.0, 0.0, Some(5.0)),
+        ];
+        let (bought, first, second) = std::hint::black_box((0.4_f64, 0.1, 0.3));
+        assert!(bought - first - second > 0.0, "the residue this guards against is real");
+
+        let position = calc_symbol_position(&txs);
+        assert_eq!(position.remaining_shares, 0.0);
+        assert_eq!(position.sold_dividends, 5.0);
+        assert_eq!(calc_symbol_summary(&txs).remaining_shares, 0.0);
+        assert_eq!(shares_on_date(&txs, "2025-12-31"), 0.0);
+        assert!(get_active_holding_symbols(&txs).is_empty());
+        assert!(calc_sold_entries(&txs).iter().all(|e| e.dividends > 0.0));
     }
 
     /// Each sale is costed against the lots it actually consumed, so a symbol

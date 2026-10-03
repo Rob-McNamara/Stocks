@@ -1,19 +1,11 @@
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use reqwest::Client;
-use rusqlite::{params, Connection};
-use serde::Deserialize;
+use rusqlite::params;
 use std::{env, path::PathBuf, time::Duration};
+use stocks::db::{insert_event_log, open_db};
+use stocks::prices::{upsert_daily_bar, DailyBar, Upsert};
+use stocks::yahoo::ChartResponse;
 use tokio::time;
-
-/// Open the SQLite database with WAL mode and a busy timeout so the API,
-/// price daemon and dividends daemon can write concurrently without
-/// intermittent "database is locked" failures.
-fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    Ok(conn)
-}
 
 #[derive(Debug)]
 struct PriceRecord {
@@ -25,53 +17,10 @@ struct PriceRecord {
     volume: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct YahooChartResponse {
-    chart: YahooChart,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooChart {
-    result: Option<Vec<YahooResult>>,
-    error: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooMeta {
-    #[serde(rename = "instrumentType")]
-    instrument_type: Option<String>,
-    #[serde(rename = "longName")]
-    long_name: Option<String>,
-    currency: Option<String>,
-    /// Exchange UTC offset in seconds — needed to date bars correctly
-    gmtoffset: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooResult {
-    meta: YahooMeta,
-    timestamp: Option<Vec<i64>>,
-    indicators: YahooIndicators,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooIndicators {
-    quote: Vec<YahooQuote>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooQuote {
-    open: Option<Vec<Option<f64>>>,
-    high: Option<Vec<Option<f64>>>,
-    low: Option<Vec<Option<f64>>>,
-    close: Option<Vec<Option<f64>>>,
-    volume: Option<Vec<Option<i64>>>,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let symbols = env::var("STOCK_SYMBOLS").unwrap_or_else(|_| "BHP".to_string());
+    let symbols = env::var("STOCK_SYMBOLS").unwrap_or_else(|_| "BHP.AX".to_string());
     let database_path = env::var("DATABASE_PATH").unwrap_or_else(|_| "stocks.db".to_string());
     let fetch_schedule_hour = env::var("FETCH_SCHEDULE_HOUR")
         .ok()
@@ -116,8 +65,7 @@ async fn main() -> anyhow::Result<()> {
     init_db(&db_path)?;
     let manual_holidays = parse_asx_manual_holidays();
 
-    let client = Client::builder()
-        .user_agent("stocks-daemon/1.0")
+    let client = stocks::http::builder("stocks-daemon/1.0")
         .build()?;
 
     let today = Utc::now().date_naive();
@@ -157,12 +105,20 @@ async fn main() -> anyhow::Result<()> {
             for symbol in symbols.iter() {
                 match fetch_and_store(&client, &db_path, symbol, historical_range.as_ref()).await {
                     Ok(count) => log::info!("Stored {} rows for {}", count, symbol),
-                    Err(err) => log::error!("Failed to update {}: {}", symbol, err),
+                    Err(err) => {
+                        log::error!("Failed to update {}: {}", symbol, err);
+                        let _ = insert_event_log(&db_path, "error", "price_fetch", "daemon", Some(symbol), &format!("Failed to update: {}", err));
+                    }
                 }
             }
         }
 
-        next_run += ChronoDuration::days(1);
+        // Recomputed from the wall clock rather than `next_run + 24h`. A fixed
+        // 24 hours keeps the UTC time constant, so when Sydney's clocks went
+        // back in April a 16:15 run became 15:15 — before the ASX closed —
+        // and stored an intraday price as the close. It also stops a laptop
+        // that slept through several days from running them back to back.
+        next_run = next_daily_run(fetch_schedule_hour, fetch_schedule_minute);
     }
 }
 
@@ -175,7 +131,10 @@ async fn run_one_shot(
     for symbol in symbols.iter() {
         match fetch_and_store(client, db_path, symbol, historical_range).await {
             Ok(count) => log::info!("Stored {} rows for {}", count, symbol),
-            Err(err) => log::error!("Failed to update {}: {}", symbol, err),
+            Err(err) => {
+                log::error!("Failed to update {}: {}", symbol, err);
+                let _ = insert_event_log(db_path, "error", "price_fetch", "daemon", Some(symbol), &format!("Failed to update: {}", err));
+            }
         }
     }
     Ok(())
@@ -449,9 +408,8 @@ async fn fetch_and_store(
 /// date is one day early, so the date is taken in exchange time:
 /// UTC + meta.gmtoffset.
 fn bar_date(ts: i64, gmtoffset: Option<i64>) -> String {
-    Utc.timestamp_opt(ts + gmtoffset.unwrap_or(0), 0)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap())
+    stocks::yahoo::local_date(ts, gmtoffset)
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
         .format("%Y-%m-%d")
         .to_string()
 }
@@ -480,50 +438,34 @@ async fn fetch_closing_prices(
     };
 
     let response = client.get(&url).send().await?.error_for_status()?;
-    let payload: YahooChartResponse = response.json().await?;
+    let payload: ChartResponse = response.json().await?;
+    let result = payload.chart.into_first(symbol).map_err(anyhow::Error::msg)?;
 
-    let result = payload
-        .chart
-        .result
-        .as_ref()
-        .and_then(|items| items.first())
-        .ok_or_else(|| {
-            if let Some(error) = &payload.chart.error {
-                anyhow::anyhow!("No chart result found for {}: {}", symbol, error)
-            } else {
-                anyhow::anyhow!("No chart result found for {}", symbol)
-            }
-        })?;
-
-    let instrument_type = result.meta.instrument_type.clone();
-    let long_name = result.meta.long_name.clone();
-    let currency = result.meta.currency.clone();
+    let meta = result.meta.as_ref();
+    let instrument_type = meta.and_then(|m| m.instrument_type.clone());
+    let long_name = meta.and_then(|m| m.long_name.clone());
+    let currency = meta.and_then(|m| m.currency.clone());
 
     let timestamp = result.timestamp.as_ref().ok_or_else(|| {
         anyhow::anyhow!("No timestamp array in Yahoo response for {}", symbol)
     })?;
-
     let quote = result
-        .indicators
-        .quote
-        .first()
+        .quote()
         .ok_or_else(|| anyhow::anyhow!("No quote data in Yahoo response for {}", symbol))?;
 
-    let gmtoffset = result.meta.gmtoffset;
-    let mut records = Vec::with_capacity(timestamp.len());
-    for (index, ts) in timestamp.iter().enumerate() {
-        let date = bar_date(*ts, gmtoffset);
-
-        let record = PriceRecord {
-            date,
-            open: quote.open.as_ref().and_then(|v| v.get(index).cloned().flatten()),
-            high: quote.high.as_ref().and_then(|v| v.get(index).cloned().flatten()),
-            low: quote.low.as_ref().and_then(|v| v.get(index).cloned().flatten()),
-            close: quote.close.as_ref().and_then(|v| v.get(index).cloned().flatten()),
-            volume: quote.volume.as_ref().and_then(|v| v.get(index).cloned().flatten()),
-        };
-        records.push(record);
-    }
+    let gmtoffset = result.gmtoffset();
+    let records = timestamp
+        .iter()
+        .enumerate()
+        .map(|(index, ts)| PriceRecord {
+            date: bar_date(*ts, gmtoffset),
+            open: quote.open_at(index),
+            high: quote.high_at(index),
+            low: quote.low_at(index),
+            close: quote.close_at(index),
+            volume: quote.volume_at(index),
+        })
+        .collect();
 
     Ok((records, instrument_type, long_name, currency))
 }
@@ -552,30 +494,40 @@ fn store_symbol_info(
 fn store_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> anyhow::Result<usize> {
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction()?;
-    let mut insert = tx.prepare(
-        "INSERT OR REPLACE INTO prices (symbol, date, open, high, low, close, volume, fetched_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
-
     let fetched_at = Utc::now().to_rfc3339();
     let mut count = 0;
+    let mut refused: Vec<String> = Vec::new();
 
-    for record in records.into_iter().filter(|r| r.close.is_some()) {
-        insert.execute(params![
-            symbol,
-            record.date,
-            record.open,
-            record.high,
-            record.low,
-            record.close,
-            record.volume,
-            fetched_at,
-        ])?;
-        count += 1;
+    // Through the API's own writer: a zero close (Yahoo's answer for a
+    // delisted ticker) is refused, and a bar missing its open/high/low keeps
+    // the values a backfill stored. This used to be a bare INSERT OR REPLACE,
+    // which undid both on every scheduled run.
+    for record in records.iter().filter(|r| r.close.is_some()) {
+        let bar = DailyBar {
+            date: &record.date,
+            open: record.open,
+            high: record.high,
+            low: record.low,
+            close: record.close,
+            volume: record.volume,
+        };
+        match upsert_daily_bar(&tx, symbol, &bar, &fetched_at)? {
+            Upsert::Written => count += 1,
+            Upsert::RefusedUnusableClose => refused.push(record.date.clone()),
+        }
     }
-
-    drop(insert);
     tx.commit()?;
+
+    if !refused.is_empty() {
+        let _ = insert_event_log(
+            db_path,
+            "warn",
+            "price_persist",
+            "daemon",
+            Some(symbol),
+            &format!("Refused {} bar(s) with a non-positive close ({}); kept the last good bars", refused.len(), refused.join(", ")),
+        );
+    }
     // Stamp the refresh so /api/v1/sync-state can tell polling clients that
     // daily closes changed (the prices table itself has no audit trigger).
     conn.execute(
@@ -583,27 +535,9 @@ fn store_prices(db_path: &PathBuf, symbol: &str, records: Vec<PriceRecord>) -> a
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![Utc::now().to_rfc3339()],
     )?;
-    // Log event
     let details = format!("Inserted {} price records", count);
     let _ = insert_event_log(db_path, "info", "price_update", "daemon", Some(symbol), &details);
     Ok(count)
-}
-
-fn insert_event_log(
-    db_path: &PathBuf,
-    level: &str,
-    event_type: &str,
-    source: &str,
-    symbol: Option<&str>,
-    details: &str,
-) -> anyhow::Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![now, level, source, event_type, symbol, details],
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -667,11 +601,11 @@ mod tests {
                 "error": null
             }
         }"#;
-        let payload: YahooChartResponse = serde_json::from_str(json).unwrap();
+        let payload: ChartResponse = serde_json::from_str(json).unwrap();
         let result = &payload.chart.result.unwrap()[0];
-        assert_eq!(result.meta.gmtoffset, Some(AEDT));
+        assert_eq!(result.gmtoffset(), Some(AEDT));
         // 1767564000 = 2026-01-04 22:00 UTC = 2026-01-05 09:00 AEDT
-        assert_eq!(bar_date(result.timestamp.as_ref().unwrap()[0], result.meta.gmtoffset), "2026-01-05");
+        assert_eq!(bar_date(result.timestamp.as_ref().unwrap()[0], result.gmtoffset()), "2026-01-05");
     }
 
     // -------------------------------------------------------------------------

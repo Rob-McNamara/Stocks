@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { apiClient, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
+import { apiClient, OversellError, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
 import { settlementAccountsFor, settlesByConversion } from '../utils/cash'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
@@ -285,7 +285,15 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       if (Object.keys(editing.custom_fields).length > 0) {
         payload.custom_fields = editing.custom_fields
       }
-      await apiClient.updateHoldingTransaction(editing.id, payload)
+      try {
+        await apiClient.updateHoldingTransaction(editing.id, payload)
+      } catch (err) {
+        // Raising a sale above the shares held is refused unless acknowledged,
+        // the same as recording a new one.
+        if (!(err instanceof OversellError)) throw err
+        if (!confirm(`${err.message.replace(/ Re-submit.*$/, '')}\n\nSave anyway?`)) return
+        await apiClient.updateHoldingTransaction(editing.id, { ...payload, confirm: true })
+      }
       await loadLedger()
       setEditing(null)
     } catch (err) {
@@ -416,7 +424,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                     <td>
                       {row.type === 'dividend' && row.amount !== null
                         ? row.perShare
-                          ? `$${row.amount.toFixed(4)} per share`
+                          ? `$${row.amount.toFixed(4)}${row.currency !== 'AUD' ? ` ${row.currency}` : ''} per share`
                           : `$${row.amount.toFixed(2)}`
                         : row.quantity !== null && row.price !== null
                         ? `$${(row.quantity * row.price).toFixed(2)}`

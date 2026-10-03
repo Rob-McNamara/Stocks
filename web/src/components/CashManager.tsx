@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { apiClient, cashAccountCsvUrl, type CashAccount, type CashTransaction } from '../services/api'
+import { apiClient, downloadCashAccountCsv, type CashAccount, type CashTransaction } from '../services/api'
 
 /**
  * Kinds a person enters by hand. `trade_buy`/`trade_sell` are written by the
@@ -67,17 +67,6 @@ export default function CashManager({ onLoading, onCashChanged }: { onLoading: (
   const [toAmount, setToAmount] = useState('')
   const [transferDate, setTransferDate] = useState(today())
 
-  useEffect(() => {
-    loadAll()
-  }, [])
-
-  useEffect(() => {
-    apiClient
-      .getCashTransactions(filterAccount ? Number(filterAccount) : undefined)
-      .then(setTransactions)
-      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load transactions'))
-  }, [filterAccount])
-
   const loadAll = async () => {
     try {
       setLoading(true)
@@ -97,6 +86,17 @@ export default function CashManager({ onLoading, onCashChanged }: { onLoading: (
       onLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadAll()
+  }, [])
+
+  useEffect(() => {
+    apiClient
+      .getCashTransactions(filterAccount ? Number(filterAccount) : undefined)
+      .then(setTransactions)
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load transactions'))
+  }, [filterAccount])
 
   /** Refresh after any write, and tell the app so the Dashboard re-values. */
   const refresh = async (message: string) => {
@@ -281,21 +281,21 @@ export default function CashManager({ onLoading, onCashChanged }: { onLoading: (
                     </td>
                     <td>{account.transaction_count}</td>
                     <td style={{ display: 'flex', gap: 6 }}>
-                      {/* A plain link, not a fetch: the server names the file
-                          and marks it an attachment, so the browser saves it
-                          without the page having to assemble a blob. */}
-                      <a
+                      {/* Fetched, not linked, so the API token travels with it. */}
+                      <button
+                        type="button"
                         className="btn btn-secondary btn-small"
-                        href={cashAccountCsvUrl(account.id)}
+                        disabled={account.transaction_count === 0}
                         title={account.transaction_count > 0
                           ? `Download ${account.name} as CSV with a running balance`
                           : 'No transactions to export'}
-                        style={account.transaction_count === 0
-                          ? { pointerEvents: 'none', opacity: 0.5 }
-                          : undefined}
+                        onClick={() => {
+                          downloadCashAccountCsv(account.id).catch((err) =>
+                            setError(err instanceof Error ? err.message : 'Failed to export the account'))
+                        }}
                       >
                         Export CSV
-                      </a>
+                      </button>
                       <button
                         className="btn btn-danger btn-small"
                         onClick={() => handleDeleteAccount(account)}

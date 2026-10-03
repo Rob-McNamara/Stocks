@@ -17,29 +17,33 @@ export default function StockAnalysis({ symbol, symbolName, onClose }: StockAnal
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [historyLoaded, setHistoryLoaded] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
+  // Loads earlier analysis only. Starting a new one is a paid API call, so it
+  // waits for the button: it used to start on its own whenever there was no
+  // history — or the history merely failed to load — and React's development
+  // double-run of effects sent it twice.
   useEffect(() => {
-    loadHistory()
+    let cancelled = false
+    setHistoryLoaded(false)
+    apiClient.getAnalysisHistory(symbol)
+      .then((history) => {
+        if (!cancelled) setMessages(history.map((h) => ({ role: h.role, content: h.content })))
+      })
+      .catch((err) => {
+        if (!cancelled) setError(`Could not load earlier analysis: ${err instanceof Error ? err.message : String(err)}`)
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoaded(true)
+      })
+    return () => { cancelled = true }
   }, [symbol])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
-
-  const loadHistory = async () => {
-    try {
-      const history = await apiClient.getAnalysisHistory(symbol)
-      if (history.length > 0) {
-        setMessages(history.map((h) => ({ role: h.role, content: h.content })))
-      } else {
-        sendMessage(`Analyze ${symbol}`)
-      }
-    } catch {
-      sendMessage(`Analyze ${symbol}`)
-    }
-  }
 
   const sendMessage = async (text: string) => {
     const userMsg: Message = { role: 'user', content: text }
@@ -105,7 +109,11 @@ export default function StockAnalysis({ symbol, symbolName, onClose }: StockAnal
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
           {messages.length === 0 && !loading && (
             <div style={{ textAlign: 'center', color: '#999', marginTop: 40, fontSize: 14 }}>
-              Starting analysis...
+              {historyLoaded ? (
+                <button type="button" className="btn btn-primary" onClick={() => sendMessage(`Analyze ${symbol}`)}>
+                  Run analysis
+                </button>
+              ) : 'Loading earlier analysis...'}
             </div>
           )}
           {messages.map((msg, i) => (

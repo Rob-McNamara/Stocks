@@ -23,25 +23,13 @@
 use chrono::{NaiveDate, Utc};
 use reqwest::Client;
 use rusqlite::{params, Connection};
-use serde::Deserialize;
+use stocks::db::open_db;
+use stocks::yahoo::ChartResponse;
 use std::{env, path::PathBuf, time::Duration};
 use tokio::time;
 
-/// WAL and a busy timeout so this can run while the API and daemon are live.
-fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
-    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    Ok(conn)
-}
-
-fn insert_event_log(db_path: &PathBuf, level: &str, symbol: Option<&str>, details: &str) {
-    let Ok(conn) = open_db(db_path) else { return };
-    let _ = conn.execute(
-        "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details)
-         VALUES (?1, ?2, 'backfill_sold', 'price_backfill', ?3, ?4)",
-        params![Utc::now().to_rfc3339(), level, symbol, details],
-    );
+fn insert_event_log(db_path: &std::path::Path, level: &str, symbol: Option<&str>, details: &str) {
+    let _ = stocks::db::insert_event_log(db_path, level, "price_backfill", "backfill_sold", symbol, details);
 }
 
 /// One symbol needing history, with the date its coverage has to reach back to.
@@ -88,32 +76,6 @@ fn load_targets(db_path: &PathBuf, only: Option<&str>) -> anyhow::Result<Vec<Tar
     Ok(out)
 }
 
-#[derive(Deserialize)]
-struct ChartResponse {
-    chart: Chart,
-}
-#[derive(Deserialize)]
-struct Chart {
-    result: Option<Vec<ChartResult>>,
-}
-#[derive(Deserialize)]
-struct ChartResult {
-    timestamp: Option<Vec<i64>>,
-    indicators: Indicators,
-}
-#[derive(Deserialize)]
-struct Indicators {
-    quote: Vec<Quote>,
-}
-#[derive(Deserialize)]
-struct Quote {
-    open: Option<Vec<Option<f64>>>,
-    high: Option<Vec<Option<f64>>>,
-    low: Option<Vec<Option<f64>>>,
-    close: Option<Vec<Option<f64>>>,
-    volume: Option<Vec<Option<i64>>>,
-}
-
 struct Bar {
     date: String,
     open: Option<f64>,
@@ -148,24 +110,27 @@ async fn fetch_daily(
     let Some(result) = parsed.chart.result.and_then(|r| r.into_iter().next()) else {
         return Ok(Vec::new());
     };
-    let (Some(stamps), Some(quote)) = (result.timestamp, result.indicators.quote.into_iter().next())
-    else {
+    let gmtoffset = result.gmtoffset();
+    let (Some(stamps), Some(quote)) = (result.timestamp.as_ref(), result.quote()) else {
         return Ok(Vec::new());
     };
 
-    let at = |v: &Option<Vec<Option<f64>>>, i: usize| v.as_ref().and_then(|s| s.get(i).copied().flatten());
     let mut bars = Vec::new();
     for (i, ts) in stamps.iter().enumerate() {
-        // A bar with no close is a non-trading stub; there is nothing to record.
-        let Some(close) = at(&quote.close, i) else { continue };
-        let Some(dt) = chrono::DateTime::from_timestamp(*ts, 0) else { continue };
+        // A bar with no real close is a non-trading stub, or Yahoo's zero for
+        // a delisted ticker; there is nothing to record.
+        let Some(close) = quote.close_at(i).filter(|c| stocks::prices::is_usable_price(Some(*c))) else { continue };
+        // Dated in exchange time, like every other writer. This tool used the
+        // UTC date, which files an ASX bar a day early during daylight saving
+        // (it opens at 23:00 UTC the previous day).
+        let Some(date) = stocks::yahoo::local_date(*ts, gmtoffset) else { continue };
         bars.push(Bar {
-            date: dt.format("%Y-%m-%d").to_string(),
-            open: at(&quote.open, i),
-            high: at(&quote.high, i),
-            low: at(&quote.low, i),
+            date: date.format("%Y-%m-%d").to_string(),
+            open: quote.open_at(i),
+            high: quote.high_at(i),
+            low: quote.low_at(i),
             close,
-            volume: quote.volume.as_ref().and_then(|s| s.get(i).copied().flatten()),
+            volume: quote.volume_at(i),
         });
     }
     Ok(bars)
@@ -224,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
         if dry_run { ", dry run — nothing will be written" } else { "" }
     );
 
-    let client = Client::builder().user_agent("stocks-api/1.0").build()?;
+    let client = stocks::http::builder("stocks-api/1.0").build()?;
     let (mut total_written, mut failed, mut untouched) = (0usize, 0usize, 0usize);
 
     for (i, t) in targets.iter().enumerate() {

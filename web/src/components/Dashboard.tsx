@@ -146,30 +146,6 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
     ? historyRange
     : 'all'
 
-  useEffect(() => {
-    load()
-  }, [holdingsVersion])
-
-  // Loaded separately from the overview: the overview carries only aggregates,
-  // and a failure here should empty the heat map rather than the whole screen.
-  useEffect(() => {
-    apiClient
-      .getPortfolioHoldings()
-      .then((r) => setHeatMapHoldings(r.holdings))
-      .catch(() => setHeatMapHoldings([]))
-  }, [holdingsVersion])
-
-  // Loaded separately from the overview: it sweeps every day of history, so a
-  // slow response should not hold up the rest of the dashboard.
-  useEffect(() => {
-    const from = rangeStart(activeRange)
-    setHistoryError(null)
-    apiClient
-      .getPortfolioHistory(from)
-      .then(setHistory)
-      .catch((err) => setHistoryError(err instanceof Error ? err.message : 'Failed to load portfolio history'))
-  }, [holdingsVersion, activeRange])
-
   // `quiet` keeps the rendered dashboard on screen while refetching — a sort
   // click should re-rank a table, not blank the entire page.
   const load = async (listSort: Record<string, 'asc' | 'desc'> = diffSort, quiet = false) => {
@@ -193,6 +169,30 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       }
     }
   }
+
+  useEffect(() => {
+    load()
+  }, [holdingsVersion])
+
+  // Loaded separately from the overview: the overview carries only aggregates,
+  // and a failure here should empty the heat map rather than the whole screen.
+  useEffect(() => {
+    apiClient
+      .getPortfolioHoldings()
+      .then((r) => setHeatMapHoldings(r.holdings))
+      .catch(() => setHeatMapHoldings([]))
+  }, [holdingsVersion])
+
+  // Loaded separately from the overview: it sweeps every day of history, so a
+  // slow response should not hold up the rest of the dashboard.
+  useEffect(() => {
+    const from = rangeStart(activeRange)
+    setHistoryError(null)
+    apiClient
+      .getPortfolioHistory(from)
+      .then(setHistory)
+      .catch((err) => setHistoryError(err instanceof Error ? err.message : 'Failed to load portfolio history'))
+  }, [holdingsVersion, activeRange])
 
   const portfolio = useMemo(() => {
     const t = overview?.totals

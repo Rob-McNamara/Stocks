@@ -649,6 +649,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     currentPrice: h.current_price,
     nativePrice: h.native_current_price,
     priceSource: h.price_source,
+    fxMissing: h.fx_missing ?? false,
     change: h.change,
     changePercent: h.change_percent,
     sma50: h.sma50,
@@ -1226,6 +1227,11 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                       </span>
                     )}
                     {item.priceSource === 'manual' && <span style={{ fontSize: 11, marginLeft: 4 }}>(manual)</span>}
+                    {item.fxMissing && (
+                      <span style={{ fontSize: 11, marginLeft: 4, color: '#f44336' }} title="No exchange rate is available, so this holding has no AUD value and is left out of the totals">
+                        (no AUD rate)
+                      </span>
+                    )}
                   </div>
                   {item.change !== null && item.changePercent !== null && (
                     <div style={{ color: item.change >= 0 ? '#4caf50' : '#f44336', fontSize: 12 }}>

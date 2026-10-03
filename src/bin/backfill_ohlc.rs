@@ -24,72 +24,23 @@
 //! `close`, and widens the fetched range to contain the stored close so a
 //! repaired row cannot be flagged again.
 
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, Utc};
 use reqwest::Client;
-use rusqlite::{params, Connection};
-use serde::Deserialize;
+use rusqlite::params;
+use stocks::db::open_db;
+use stocks::yahoo::ChartResponse;
 use std::{env, path::PathBuf, time::Duration};
 use tokio::time;
 
-/// Open the SQLite database with WAL mode and a busy timeout so this tool can
-/// run while the API and price daemon are live.
-fn open_db<P: AsRef<std::path::Path>>(path: P) -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    Ok(conn)
-}
-
+/// Logged under this tool's own source, through the shared writer.
 fn insert_event_log(
-    db_path: &PathBuf,
+    db_path: &std::path::Path,
     level: &str,
     event_type: &str,
     symbol: Option<&str>,
     details: &str,
-) -> anyhow::Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO event_log (timestamp, level, source, event_type, symbol, details) VALUES (?1, ?2, 'backfill_ohlc', ?3, ?4, ?5)",
-        params![now, level, event_type, symbol, details],
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooChartResponse {
-    chart: YahooChart,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooChart {
-    result: Option<Vec<YahooResult>>,
-    error: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooResult {
-    meta: Option<YahooMeta>,
-    timestamp: Option<Vec<i64>>,
-    indicators: YahooIndicators,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooMeta {
-    /// Exchange UTC offset in seconds — needed to date bars correctly
-    gmtoffset: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooIndicators {
-    quote: Vec<YahooQuote>,
-}
-
-#[derive(Debug, Deserialize)]
-struct YahooQuote {
-    open: Option<Vec<Option<f64>>>,
-    high: Option<Vec<Option<f64>>>,
-    low: Option<Vec<Option<f64>>>,
+) -> Result<(), String> {
+    stocks::db::insert_event_log(db_path, level, event_type, "backfill_ohlc", symbol, details)
 }
 
 /// Which stored rows a run works on.
@@ -137,9 +88,7 @@ impl OhlBar {
 /// `yahoo_local_date` in the API, and getting it wrong would file OHLC against
 /// the neighbouring day's close.
 fn yahoo_local_date(ts: i64, gmtoffset: Option<i64>) -> Option<NaiveDate> {
-    Utc.timestamp_opt(ts + gmtoffset.unwrap_or(0), 0)
-        .single()
-        .map(|dt| dt.date_naive())
+    stocks::yahoo::local_date(ts, gmtoffset)
 }
 
 #[tokio::main]
@@ -183,8 +132,7 @@ async fn main() -> anyhow::Result<()> {
         if dry_run { " (dry run — no writes)" } else { "" }
     );
 
-    let client = Client::builder()
-        .user_agent("stocks-backfill/1.0")
+    let client = stocks::http::builder("stocks-backfill/1.0")
         .build()?;
 
     let mut total_updated = 0usize;
@@ -342,36 +290,21 @@ async fn fetch_daily_history(
         .await?
         .error_for_status()?;
 
-    let payload: YahooChartResponse = response.json().await?;
-    let result = payload
-        .chart
-        .result
-        .as_ref()
-        .and_then(|items| items.first())
-        .ok_or_else(|| match payload.chart.error {
-            Some(ref e) => anyhow::anyhow!("no chart result: {}", e),
-            None => anyhow::anyhow!("no chart result"),
-        })?;
-
+    let payload: ChartResponse = response.json().await?;
+    let result = payload.chart.into_first(symbol).map_err(anyhow::Error::msg)?;
     let timestamps = result
         .timestamp
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no timestamp data"))?;
-    let quote = result
-        .indicators
-        .quote
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no quote data"))?;
-    let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
+    let quote = result.quote().ok_or_else(|| anyhow::anyhow!("no quote data"))?;
+    let gmtoffset = result.gmtoffset();
 
     let mut bars = Vec::with_capacity(timestamps.len());
     for (index, ts) in timestamps.iter().enumerate() {
         let Some(date) = yahoo_local_date(*ts, gmtoffset) else {
             continue;
         };
-        let open = quote.open.as_ref().and_then(|v| v.get(index).cloned().flatten());
-        let high = quote.high.as_ref().and_then(|v| v.get(index).cloned().flatten());
-        let low = quote.low.as_ref().and_then(|v| v.get(index).cloned().flatten());
+        let (open, high, low) = (quote.open_at(index), quote.high_at(index), quote.low_at(index));
         if open.is_none() && high.is_none() && low.is_none() {
             continue;
         }
@@ -450,6 +383,8 @@ fn count_fillable(db_path: &PathBuf, mode: Mode, symbol: &str, bars: &[OhlBar]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use rusqlite::Connection;
 
     /// The bug this guards against: an ASX bar for Monday opens 10:00 AEDT,
     /// which is 23:00 UTC *Sunday*. Dating it in UTC would attach Monday's

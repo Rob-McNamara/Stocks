@@ -66,6 +66,13 @@ function App() {
     setActiveTab(holdingsTabFor(data.symbol, data.currency))
   }
 
+  const testBackendConnection = async () => {
+    const healthy = await apiClient.checkHealth()
+    if (!healthy) {
+      setError('Cannot connect to backend. Make sure the API server is running.')
+    }
+  }
+
   useEffect(() => {
     testBackendConnection()
   }, [])
@@ -86,13 +93,6 @@ function App() {
       .catch((err) => console.error('Startup refresh failed:', err))
       .finally(() => setHoldingsVersion((v) => v + 1))
   }, [])
-
-  const testBackendConnection = async () => {
-    const healthy = await apiClient.checkHealth()
-    if (!healthy) {
-      setError('Cannot connect to backend. Make sure the API server is running.')
-    }
-  }
 
   return (
     <div className="app-container">

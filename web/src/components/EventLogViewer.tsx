@@ -27,10 +27,6 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    loadEvents({ page, level, source, eventType, symbol })
-  }, [page])
-
   const loadEvents = async (opts: { page: number; level: string; source: string; eventType: string; symbol: string }) => {
     try {
       setLoading(true)
@@ -53,6 +49,10 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
       onLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadEvents({ page, level, source, eventType, symbol })
+  }, [page])
 
   const handleFilterSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()

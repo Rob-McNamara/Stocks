@@ -16,7 +16,12 @@ use std::path::PathBuf;
 use crate::{open_db, DEFAULT_SECTORS_JSON};
 
 pub fn init_db(path: &PathBuf) -> Result<(), String> {
-    let conn = open_db(path).map_err(|err| err.to_string())?;
+    let mut db = open_db(path).map_err(|err| err.to_string())?;
+    // Everything below commits together. The watchlist rebuilds rename, copy
+    // and drop tables in several steps; run outside a transaction, a failure
+    // part-way left a half-migrated schema — which is why Step 3's recovery
+    // path exists. Now a failure leaves the database exactly as it was.
+    let conn = db.transaction().map_err(|err| err.to_string())?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS prices (
             id INTEGER PRIMARY KEY,
@@ -619,46 +624,26 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app_config', 'INSERT', NEW.key, NULL,
-                json_object('key', NEW.key, 'value', NEW.value));
+                json_object('key', NEW.key, 'value', CASE WHEN NEW.key = 'ai_api_key' THEN '[redacted]' ELSE NEW.value END));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_app_config_update AFTER UPDATE ON app_config
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app_config', 'UPDATE', NEW.key,
-                json_object('key', OLD.key, 'value', OLD.value),
-                json_object('key', NEW.key, 'value', NEW.value));
+                json_object('key', OLD.key, 'value', CASE WHEN OLD.key = 'ai_api_key' THEN '[redacted]' ELSE OLD.value END),
+                json_object('key', NEW.key, 'value', CASE WHEN NEW.key = 'ai_api_key' THEN '[redacted]' ELSE NEW.value END));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_app_config_delete AFTER DELETE ON app_config
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app_config', 'DELETE', OLD.key,
-                json_object('key', OLD.key, 'value', OLD.value), NULL);
+                json_object('key', OLD.key, 'value', CASE WHEN OLD.key = 'ai_api_key' THEN '[redacted]' ELSE OLD.value END), NULL);
         END;
 
-        -- dividend_events
-        CREATE TRIGGER IF NOT EXISTS audit_dividend_events_insert AFTER INSERT ON dividend_events
-        BEGIN
-            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
-            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'INSERT', CAST(NEW.id AS TEXT), NULL,
-                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount,
-                    'payment_date', NEW.payment_date, 'record_date', NEW.record_date, 'fetched_at', NEW.fetched_at));
-        END;
-        CREATE TRIGGER IF NOT EXISTS audit_dividend_events_update AFTER UPDATE ON dividend_events
-        BEGIN
-            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
-            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'UPDATE', CAST(NEW.id AS TEXT),
-                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount,
-                    'payment_date', OLD.payment_date, 'record_date', OLD.record_date, 'fetched_at', OLD.fetched_at),
-                json_object('id', NEW.id, 'symbol', NEW.symbol, 'ex_date', NEW.ex_date, 'amount', NEW.amount,
-                    'payment_date', NEW.payment_date, 'record_date', NEW.record_date, 'fetched_at', NEW.fetched_at));
-        END;
-        CREATE TRIGGER IF NOT EXISTS audit_dividend_events_delete AFTER DELETE ON dividend_events
-        BEGIN
-            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
-            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'dividend_events', 'DELETE', CAST(OLD.id AS TEXT),
-                json_object('id', OLD.id, 'symbol', OLD.symbol, 'ex_date', OLD.ex_date, 'amount', OLD.amount,
-                    'payment_date', OLD.payment_date, 'record_date', OLD.record_date, 'fetched_at', OLD.fetched_at), NULL);
-        END;
+        -- dividend_events: deliberately not audited. Every row is fetched from
+        -- Yahoo and re-derivable, and each refresh replaced the whole set, so
+        -- its triggers wrote ~10,000 audit rows a month with no user input in
+        -- any of them. The DROPs above remove triggers older databases have.
 
         -- cash_accounts
         CREATE TRIGGER IF NOT EXISTS audit_cash_accounts_insert AFTER INSERT ON cash_accounts
@@ -772,7 +757,14 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
                 json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name,
                     'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'updated_at', NEW.updated_at));
         END;
+        -- Only a real change is recorded. Every quote upserts the row and
+        -- bumps updated_at; recording those wrote ~16,000 identical rows a
+        -- month and buried the one user-typed column, the withholding rate.
         CREATE TRIGGER IF NOT EXISTS audit_symbol_info_update AFTER UPDATE ON symbol_info
+        WHEN OLD.instrument_type IS NOT NEW.instrument_type
+          OR OLD.long_name IS NOT NEW.long_name
+          OR OLD.currency IS NOT NEW.currency
+          OR OLD.dividend_withholding_pct IS NOT NEW.dividend_withholding_pct
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'UPDATE', NEW.symbol,
@@ -790,6 +782,18 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
         END;
     ";
     conn.execute_batch(trigger_sql).map_err(|err| err.to_string())?;
+
+    // The AI key is a secret, and the audit log keeps a year of old and new
+    // values. The app_config triggers above record it as '[redacted]'; this
+    // scrubs any row written before they did.
+    conn.execute(
+        "UPDATE audit_log
+            SET old_values = CASE WHEN old_values IS NULL THEN NULL ELSE json_set(old_values, '$.value', '[redacted]') END,
+                new_values = CASE WHEN new_values IS NULL THEN NULL ELSE json_set(new_values, '$.value', '[redacted]') END
+          WHERE table_name = 'app_config' AND row_id = 'ai_api_key'",
+        [],
+    )
+    .map_err(|err| err.to_string())?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS stock_analysis_messages (
@@ -833,6 +837,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
         END;",
     ).map_err(|err| err.to_string())?;
 
+    conn.commit().map_err(|err| err.to_string())?;
     Ok(())
 }
 

@@ -10,14 +10,16 @@ The watchlist uses a **two-table normalised design**. Do not collapse these back
 
 ```sql
 watchlist_symbols     (id, symbol UNIQUE, notes, updated_at)
-watchlist_memberships (id, symbol, list_name, added_at)  -- FK: symbol → watchlist_symbols.symbol
+watchlist_memberships (id, symbol, list_name, added_at)  -- symbol → watchlist_symbols.symbol (logical link, not a declared FK)
 ```
 
 When querying watchlist data always JOIN the two tables. When a membership is deleted and no memberships remain for that symbol, also delete the `watchlist_symbols` row.
 
+The link is not declared as a foreign key, and SQLite foreign keys are not enabled (`PRAGMA foreign_keys` is never set), so nothing in the database enforces it — the code that adds and removes memberships does. Keep that cleanup in the same transaction as the membership change.
+
 ## Audit Logging
 
-Every new table and every new column **must** be added to the audit triggers in the same change that introduces it. The triggers live in `init_db()` in `src/bin/api.rs` (search `CREATE TRIGGER IF NOT EXISTS audit_`).
+Every new table and every new column **must** be added to the audit triggers in the same change that introduces it. The triggers live in `init_db()` in `src/bin/api/schema.rs` (search `CREATE TRIGGER IF NOT EXISTS audit_`).
 
 A column is only audited if it appears explicitly in the trigger's `json_object(...)` payload — for the update trigger, in **both** the `OLD` and `NEW` object. Adding a column with `add_column_if_missing()` does not extend the trigger, and nothing detects the drift: the audit log keeps working and silently omits the new field. This is how `watchlist_symbols.breakthrough_price` and `stop_loss_price` became unrecoverable after a data-loss incident.
 
@@ -29,6 +31,9 @@ Deliberate exclusions — do **not** add triggers to these:
 
 - `prices` — 150k+ machine-fetched rows; auditing it would dwarf the database, and the data is re-fetchable from Yahoo.
 - `cached_current_prices` — pure cache, rewritten on every price refresh.
+- `dividend_events` — fetched from Yahoo and re-derivable. Its triggers are dropped in `init_db()`; when it was audited, each refresh wrote thousands of rows with no user input in any of them. (What the user decides about a dividend lives in `dividend_exclusions` and `holdings_transactions`, which are audited.)
+
+`symbol_info` stays audited because `dividend_withholding_pct` is user-typed, but its update trigger has a `WHEN` clause so the per-quote upsert that changes nothing is not recorded. A new column there must be added to that `WHEN` list as well as to the payloads.
 - `audit_log`, `event_log` — the log tables themselves.
 
 The test for whether something needs auditing: **if a user typed it, it must be audited.** Machine-fetched data that can be re-derived from an external source does not.
@@ -50,6 +55,21 @@ migrates rows in the databases that have it, and that loop skips any table
 
 Do not read its lack of triggers as the drift this section warns about. If it is
 ever dropped for good, remove it from `SYMBOL_KEYED_TABLES` at the same time.
+
+## Code Layout
+
+Shared by every binary, in `src/` (the `stocks` library):
+
+- `db.rs` — `open_db` (WAL + busy timeout) and `insert_event_log`. Use these; don't open SQLite directly.
+- `http.rs` — the only way to build an HTTP client (it sets the timeouts).
+- `yahoo.rs` — Yahoo chart response types and `local_date` (bars and events are dated in exchange time).
+- `prices.rs` — `upsert_daily_bar`, the one writer for `prices` (refuses zero closes, keeps backfilled OHLC).
+- `dividends.rs` — fetching, de-duplicating and storing dividend events.
+- `portfolio.rs`, `indicators.rs`, `hindsight.rs` — the calculation engines.
+
+The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `charts`, `analysis`, `refresh`, `config`, plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
+
+A write that touches more than one row goes through `with_tx`, so it commits all-or-nothing.
 
 ## Error and Warning Logging
 

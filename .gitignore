@@ -9,8 +9,10 @@ web/coverage/
 web/dist/
 .claude/settings.local.json
 
-# Point-in-time database backups taken before migrations — 750 MB and growing,
-# and reproducible only in the sense that they are snapshots of local state.
+# Point-in-time database backups taken before migrations — about 1 GB and
+# growing, and reproducible only in the sense that they are snapshots of local
+# state. They live in backups/; the root patterns catch one taken the old way.
+backups/
 stocks-backup-*.db
 stocks-backup-*.db-wal
 stocks-backup-*.db-shm

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { apiClient } from '../services/api'
-import { OVERLAYS } from './PriceChart'
+import { OVERLAYS } from '../utils/chartOverlays'
 import {
   CHART_DEFAULTS_KEY, CHART_HEIGHT_RANGE, FALLBACK_CHART_DEFAULTS, TIMEFRAMES,
   parseChartDefaults, type ChartDefaults, type ChartTimeframe,
@@ -18,7 +18,7 @@ interface ConfigPanelProps {
 
 
 /** Used when the model field is cleared, and as its placeholder. */
-const AI_MODEL_FALLBACK = 'claude-sonnet-4-20250514'
+const AI_MODEL_FALLBACK = 'claude-sonnet-5-5'
 
 export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelProps) {
   const [config, setConfig] = useState<Record<string, string>>({})
@@ -154,10 +154,6 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
     }
   }
 
-  useEffect(() => {
-    loadConfig()
-  }, [])
-
   const loadConfig = async () => {
     try {
       setLoading(true)
@@ -183,6 +179,10 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
       onLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadConfig()
+  }, [])
 
   const manualPrices = Object.entries(config)
     .filter(([k, v]) => k.startsWith('manual_price_') && v !== '')

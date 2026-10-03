@@ -7,10 +7,10 @@
 //! through `is_usable_quote`, because the feed answers a delisted ticker with
 //! a zero rather than an error.
 
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, Utc};
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use stocks::yahoo::ChartResponse;
 use std::{collections::HashMap, path::PathBuf};
 
 use crate::{
@@ -62,24 +62,22 @@ pub(crate) fn widen_bar_to_body(bar: &PriceHistoryPoint) -> PriceHistoryPoint {
 
 pub(crate) fn persist_price_history(conn: &Connection, symbol: &str, records: &[PriceHistoryPoint]) {
     let now = Utc::now().to_rfc3339();
-    for r in records.iter().map(widen_bar_to_body) {
-        // COALESCE on the OHLC columns so a close-only refresh can never blank
-        // out bars the backfill already filled.
-        if let Some(close) = r.close
-            && let Err(err) = conn.execute(
-                "INSERT INTO prices (symbol, date, open, high, low, close, volume, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(symbol, date) DO UPDATE SET
-                   open = COALESCE(excluded.open, open),
-                   high = COALESCE(excluded.high, high),
-                   low = COALESCE(excluded.low, low),
-                   close = excluded.close,
-                   volume = excluded.volume,
-                   fetched_at = excluded.fetched_at",
-                params![symbol, r.date, r.open, r.high, r.low, close, r.volume, now],
-            ) {
+    // The shared writer refuses a zero close, widens each bar to its own body
+    // and never blanks a backfilled open/high/low — the same rules the price
+    // daemon now follows.
+    for r in records {
+        let bar = stocks::prices::DailyBar { date: &r.date, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume };
+        match stocks::prices::upsert_daily_bar(conn, symbol, &bar, &now) {
+            Ok(stocks::prices::Upsert::Written) => {}
+            Ok(stocks::prices::Upsert::RefusedUnusableClose) => {
+                if r.close.is_some() {
+                    log_event_on_conn(conn, "warn", "price_persist", Some(symbol), &format!("Refusing to write non-positive close {:?} for {} — keeping the last good bar", r.close, r.date));
+                }
+            }
+            Err(err) => {
                 log_event_on_conn(conn, "warn", "price_persist", Some(symbol), &format!("Failed to persist price history: {}", err));
             }
+        }
     }
 }
 
@@ -127,13 +125,10 @@ pub(crate) async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i
         mark_history_checked(symbol);
     }
 
-    let client = Client::builder()
-        .user_agent("stocks-api/1.0")
-        .build()
-        .map_err(|err| err.to_string())?;
+    let client = http_client();
 
     if may_fetch && (history.is_empty() || !has_enough_data) {
-        match fetch_price_history_from_yahoo(&client, symbol, days).await {
+        match fetch_price_history_from_yahoo(client, symbol, days).await {
             Ok(records) => {
                 if records.len() > history.len() {
                     match open_db(db_path) {
@@ -151,7 +146,7 @@ pub(crate) async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i
         }
     } else if may_fetch && needs_supplement {
         // Stored data is behind the last trading day — fetch from Yahoo and append missing records
-        match fetch_price_history_from_yahoo(&client, symbol, days).await {
+        match fetch_price_history_from_yahoo(client, symbol, days).await {
             Ok(yahoo) => {
                 let new_records: Vec<_> = yahoo.into_iter().filter(|r| r.date > last_stored).collect();
                 match open_db(db_path) {
@@ -172,12 +167,12 @@ pub(crate) async fn fetch_price_history(db_path: &PathBuf, symbol: &str, days: i
 }
 
 /// Fetch daily history for many symbols with bounded concurrency.
-pub(crate) async fn fetch_histories(db_path: &PathBuf, symbols: &[String], days: i64) -> HashMap<String, Vec<PriceHistoryPoint>> {
+pub(crate) async fn fetch_histories(db_path: &std::path::Path, symbols: &[String], days: i64) -> HashMap<String, Vec<PriceHistoryPoint>> {
     let mut out = HashMap::new();
     for chunk in symbols.chunks(5) {
         let mut set = tokio::task::JoinSet::new();
         for sym in chunk {
-            let db = db_path.clone();
+            let db = db_path.to_path_buf();
             let sym = sym.clone();
             set.spawn(async move {
                 let result = fetch_price_history(&db, &sym, days).await;
@@ -232,96 +227,30 @@ pub(crate) fn fx_rate_on(conn: &Connection, currency: &str, date: &str) -> Optio
     .flatten()
 }
 
-#[derive(Deserialize)]
-pub(crate) struct YahooQuoteResponse {
-    pub(crate) chart: YahooChartData,
+/// The API's one HTTP client.
+///
+/// Every request used to build its own, which threw away pooled connections
+/// to Yahoo between calls and left a dozen places to keep the timeouts right.
+/// A `reqwest::Client` is cheap to share and safe across threads. A caller
+/// that legitimately waits longer — the AI analysis — sets a timeout on its
+/// own request rather than building another client.
+pub(crate) fn http_client() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        stocks::http::builder("stocks-api/1.0")
+            .build()
+            .expect("the HTTP client's fixed configuration is valid")
+    })
 }
 
-#[derive(Deserialize)]
-pub(crate) struct YahooChartData {
-    pub(crate) result: Option<Vec<YahooResultData>>,
-}
+/// A quote's chart meta. The response types live in `stocks::yahoo`, shared
+/// with the daemons and backfill tools that read the same endpoint.
+pub(crate) use stocks::yahoo::Meta as YahooMeta;
 
-#[derive(Deserialize)]
-pub(crate) struct YahooResultData {
-    pub(crate) meta: YahooMeta,
-    #[serde(default)]
-    pub(crate) indicators: Option<YahooHistoryIndicators>,
-}
-
-#[allow(non_snake_case)]
-#[derive(Deserialize)]
-pub(crate) struct YahooMeta {
-    #[serde(rename = "regularMarketPrice")]
-    pub(crate) regular_market_price: Option<f64>,
-    #[serde(rename = "regularMarketChange")]
-    pub(crate) regular_market_change: Option<f64>,
-    #[serde(rename = "regularMarketChangePercent")]
-    pub(crate) regular_market_change_percent: Option<f64>,
-    #[serde(rename = "regularMarketVolume")]
-    pub(crate) regular_market_volume: Option<i64>,
-    #[serde(rename = "chartPreviousClose")]
-    pub(crate) chart_previous_close: Option<f64>,
-    #[serde(rename = "regularMarketDayHigh")]
-    pub(crate) regular_market_day_high: Option<f64>,
-    #[serde(rename = "regularMarketDayLow")]
-    pub(crate) regular_market_day_low: Option<f64>,
-    /// Yahoo's chart meta has no open field — filled from the quote arrays in
-    /// `fetch_current_price`, hence `default` rather than a rename.
-    #[serde(default)]
-    pub(crate) day_open: Option<f64>,
-    #[serde(rename = "instrumentType")]
-    pub(crate) instrument_type: Option<String>,
-    #[serde(rename = "longName")]
-    pub(crate) long_name: Option<String>,
-    pub(crate) currency: Option<String>,
-    #[serde(rename = "regularMarketTime")]
-    pub(crate) regular_market_time: Option<i64>,
-    /// Exchange UTC offset in seconds — needed to date bars correctly
-    pub(crate) gmtoffset: Option<i64>,
-}
-
-/// Convert a Yahoo bar/event timestamp to the exchange-local trading date.
-/// Yahoo stamps daily bars at the market open; for exchanges ahead of UTC
-/// (ASX opens 10:00 Sydney = 23:00 UTC the *previous* day during daylight
-/// saving) the UTC date is one day early, so the date must be taken in
-/// exchange time: UTC + meta.gmtoffset.
+/// Exchange-local trading date of a Yahoo timestamp; see
+/// `stocks::yahoo::local_date`.
 pub(crate) fn yahoo_local_date(ts: i64, gmtoffset: Option<i64>) -> Option<NaiveDate> {
-    Utc.timestamp_opt(ts + gmtoffset.unwrap_or(0), 0)
-        .single()
-        .map(|dt| dt.date_naive())
-}
-
-#[derive(Deserialize)]
-pub(crate) struct YahooHistoryResponse {
-    pub(crate) chart: YahooHistoryChart,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct YahooHistoryChart {
-    pub(crate) result: Option<Vec<YahooHistoryResult>>,
-    pub(crate) error: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct YahooHistoryResult {
-    pub(crate) meta: Option<YahooMeta>,
-    pub(crate) timestamp: Option<Vec<i64>>,
-    pub(crate) indicators: YahooHistoryIndicators,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct YahooHistoryIndicators {
-    pub(crate) quote: Vec<YahooHistoryQuote>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct YahooHistoryQuote {
-    pub(crate) open: Option<Vec<Option<f64>>>,
-    pub(crate) high: Option<Vec<Option<f64>>>,
-    pub(crate) low: Option<Vec<Option<f64>>>,
-    pub(crate) close: Option<Vec<Option<f64>>>,
-    pub(crate) volume: Option<Vec<Option<i64>>>,
+    stocks::yahoo::local_date(ts, gmtoffset)
 }
 
 pub(crate) async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str, days: i64) -> Result<Vec<PriceHistoryPoint>, String> {
@@ -340,29 +269,15 @@ pub(crate) async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str
         .await
         .map_err(|err| err.to_string())?;
     let response = response.error_for_status().map_err(|err| err.to_string())?;
-    let payload: YahooHistoryResponse = response.json().await.map_err(|err| err.to_string())?;
-
-    let result = payload
-        .chart
-        .result
-        .as_ref()
-        .and_then(|items| items.first())
-        .ok_or_else(|| {
-            if let Some(error) = payload.chart.error {
-                anyhow::anyhow!("No chart result found for {}: {}", symbol, error).to_string()
-            } else {
-                format!("No chart result found for {}", symbol)
-            }
-        })?;
+    let payload: ChartResponse = response.json().await.map_err(|err| err.to_string())?;
+    let result = payload.chart.into_first(symbol)?;
 
     let timestamps = result.timestamp.as_ref().ok_or_else(|| format!("No timestamp data in Yahoo response for {}", symbol))?;
     let quote = result
-        .indicators
-        .quote
-        .first()
+        .quote()
         .ok_or_else(|| format!("No quote data in Yahoo response for {}", symbol))?;
 
-    let gmtoffset = result.meta.as_ref().and_then(|m| m.gmtoffset);
+    let gmtoffset = result.gmtoffset();
     let mut records = Vec::with_capacity(timestamps.len());
     for (index, ts) in timestamps.iter().enumerate() {
         let date = yahoo_local_date(*ts, gmtoffset)
@@ -370,11 +285,11 @@ pub(crate) async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str
             .format("%Y-%m-%d")
             .to_string();
 
-        let close = quote.close.as_ref().and_then(|v| v.get(index).cloned().flatten());
-        let volume = quote.volume.as_ref().and_then(|v| v.get(index).cloned().flatten());
-        let open = quote.open.as_ref().and_then(|v| v.get(index).cloned().flatten());
-        let high = quote.high.as_ref().and_then(|v| v.get(index).cloned().flatten());
-        let low = quote.low.as_ref().and_then(|v| v.get(index).cloned().flatten());
+        let close = quote.close_at(index);
+        let volume = quote.volume_at(index);
+        let open = quote.open_at(index);
+        let high = quote.high_at(index);
+        let low = quote.low_at(index);
 
         if close.is_some() {
             // Widened here as well as on persist, so a first load that serves
@@ -404,19 +319,19 @@ pub(crate) async fn fetch_current_price(client: &Client, symbol: &str) -> Result
         .error_for_status()
         .map_err(|err| err.to_string())?;
 
-    let data: YahooQuoteResponse = response
+    let data: ChartResponse = response
         .json()
         .await
         .map_err(|err| err.to_string())?;
 
-    let result = data
+    let mut result = data
         .chart
         .result
         .and_then(|r| r.into_iter().next())
         .ok_or_else(|| "No chart data available".to_string())?;
 
-    let mut meta = result.meta;
-    let day_quote = result.indicators.as_ref().and_then(|ind| ind.quote.first());
+    let mut meta = result.meta.take().ok_or_else(|| "No chart data available".to_string())?;
+    let day_quote = result.quote();
     // Fall back to the time-series volume when regularMarketVolume is absent in metadata
     if meta.regular_market_volume.is_none() {
         meta.regular_market_volume = day_quote
@@ -454,14 +369,7 @@ pub(crate) fn session_range(
     lows: [Option<f64>; 2],
     trades: [Option<f64>; 2],
 ) -> (Option<f64>, Option<f64>) {
-    let usable = |v: &Option<f64>| v.filter(|p| is_usable_quote(Some(*p)));
-    let high = highs.iter().chain(trades.iter()).filter_map(usable).reduce(f64::max);
-    let low = lows.iter().chain(trades.iter()).filter_map(usable).reduce(f64::min);
-    // With no high or low from either source, the open and price alone are not
-    // a range — leave the side empty rather than invent one.
-    let high = if highs.iter().any(|v| usable(v).is_some()) { high } else { None };
-    let low = if lows.iter().any(|v| usable(v).is_some()) { low } else { None };
-    (high, low)
+    stocks::prices::session_range(highs, lows, trades)
 }
 
 /// AUD rate per currency, served from the price cache when fresh (<1h),
@@ -472,7 +380,7 @@ pub(crate) async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -
     if currencies.is_empty() {
         return rates;
     }
-    let client = Client::builder().user_agent("stocks-api/1.0").build().ok();
+    let client = http_client();
     for currency in currencies {
         let pair = format!("{}AUD=X", currency);
         let cached: Option<(Option<f64>, String)> = open_db(db_path).ok().and_then(|conn| {
@@ -499,33 +407,39 @@ pub(crate) async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -
             continue;
         }
         let mut live: Option<f64> = None;
-        if let Some(client) = &client {
-            match fetch_current_price(client, &pair).await {
-                Ok(meta) => {
-                    live = meta.regular_market_price.filter(|p| is_usable_quote(Some(*p)));
-                    if live.is_some()
-                        && let Ok(conn) = open_db(db_path) {
-                            let _ = cache_current_price(&conn, &CurrentPrice {
-                                symbol: pair.clone(),
-                                price: live,
-                                change: None,
-                                change_percent: None,
-                                volume: None,
-                                day_open: None,
-                                day_high: None,
-                                day_low: None,
-                                last_updated: Utc::now().to_rfc3339(),
-                                price_date: None,
-                                error: None,
-                            });
-                        }
-                }
-                Err(err) => {
-                    let _ = insert_event_log(db_path, "warn", "fx_fetch", "api", None, &format!("FX rate fetch failed for {}, using cached value if available: {}", currency, err));
-                }
+        match fetch_current_price(client, &pair).await {
+            Ok(meta) => {
+                live = meta.regular_market_price.filter(|p| is_usable_quote(Some(*p)));
+                if live.is_some()
+                    && let Ok(conn) = open_db(db_path) {
+                        let _ = cache_current_price(&conn, &CurrentPrice {
+                            symbol: pair.clone(),
+                            price: live,
+                            change: None,
+                            change_percent: None,
+                            volume: None,
+                            day_open: None,
+                            day_high: None,
+                            day_low: None,
+                            last_updated: Utc::now().to_rfc3339(),
+                            price_date: None,
+                            error: None,
+                        });
+                    }
+            }
+            Err(err) => {
+                let _ = insert_event_log(db_path, "warn", "fx_fetch", "api", None, &format!("FX rate fetch failed for {}, using cached value if available: {}", currency, err));
             }
         }
-        rates.insert(currency.clone(), live.or(cached.and_then(|c| c.0)));
+        // Last resort: the daily rate history the FX sync keeps. A day-old
+        // close is a far better answer than none, which leaves every holding
+        // in this currency without an AUD value.
+        let stored = || {
+            open_db(db_path).ok().and_then(|conn| {
+                fx_rate_on(&conn, currency, &chrono::Local::now().format("%Y-%m-%d").to_string())
+            })
+        };
+        rates.insert(currency.clone(), live.or(cached.and_then(|c| c.0)).or_else(stored));
     }
     rates
 }

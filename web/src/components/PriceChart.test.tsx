@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
-import PriceChart, { DRAWING_COLOR, OVERLAYS } from './PriceChart'
+import PriceChart, { DRAWING_COLOR } from './PriceChart'
+import { OVERLAYS } from '../utils/chartOverlays'
 import { invalidateAppConfig } from '../utils/appConfig'
 import { CHART_HEIGHT_RANGE } from '../utils/chartDefaults'
 
@@ -719,6 +720,18 @@ describe('price scale zoom', () => {
     fireEvent.mouseUp(window)
   }
 
+  // Unmounting mid-drag used to leave the window listeners attached, still
+  // setting state on a chart that no longer existed.
+  it('drops its window listeners when the chart goes away mid-drag', async () => {
+    const { container, unmount } = await renderChart()
+    const removed = vi.spyOn(window, 'removeEventListener')
+    fireEvent.mouseDown(gutter(container), { clientY: 300 })
+    unmount()
+    const events = removed.mock.calls.map(([type]) => type)
+    expect(events).toContain('mousemove')
+    expect(events).toContain('mouseup')
+  })
+
   it('fits the data until the scale is touched', async () => {
     const { container } = await renderChart()
     expect(screen.queryByRole('button', { name: /Fit/ })).toBeNull()
@@ -1127,5 +1140,28 @@ describe('measured geometry', () => {
     } finally {
       ;(window as unknown as { ResizeObserver: unknown }).ResizeObserver = originals
     }
+  })
+})
+
+describe('switching symbols', () => {
+  /**
+   * A slow request for the previous symbol (one needing a Yahoo top-up, say)
+   * can land after the new symbol's. It used to be adopted, drawing the old
+   * symbol's bars under the new symbol's name.
+   */
+  it('ignores a history response for a symbol no longer shown', async () => {
+    let resolveOld: (rows: typeof HISTORY) => void = () => {}
+    const OLD_HISTORY = DATES.map((date) => ({ date, open: null, high: null, low: null, close: 987.65, volume: 1 }))
+    getPriceHistory.mockImplementation((symbol: string) =>
+      symbol === 'OLD.AX' ? new Promise((resolve) => { resolveOld = resolve }) : Promise.resolve(HISTORY),
+    )
+
+    const { rerender, container } = render(<PriceChart symbol="OLD.AX" currency="AUD" onLoading={() => {}} />)
+    rerender(<PriceChart symbol="NEW.AX" currency="AUD" onLoading={() => {}} />)
+    await waitFor(() => expect(screen.queryByText(/Loading chart/)).toBeNull())
+
+    resolveOld(OLD_HISTORY)
+    await new Promise((r) => setTimeout(r, 0))
+    expect(container.textContent).not.toMatch(/987/)
   })
 })
