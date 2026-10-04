@@ -17,7 +17,11 @@ export default function StockAnalysis({ symbol, symbolName, onClose }: StockAnal
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [historyLoaded, setHistoryLoaded] = useState(false)
+  // Which symbol's history has finished loading. Compared with `symbol`
+  // rather than reset to false on a change, so switching symbol needs no
+  // synchronous state update in the effect.
+  const [historyLoadedFor, setHistoryLoadedFor] = useState<string | null>(null)
+  const historyLoaded = historyLoadedFor === symbol
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -27,7 +31,6 @@ export default function StockAnalysis({ symbol, symbolName, onClose }: StockAnal
   // double-run of effects sent it twice.
   useEffect(() => {
     let cancelled = false
-    setHistoryLoaded(false)
     apiClient.getAnalysisHistory(symbol)
       .then((history) => {
         if (!cancelled) setMessages(history.map((h) => ({ role: h.role, content: h.content })))
@@ -36,7 +39,7 @@ export default function StockAnalysis({ symbol, symbolName, onClose }: StockAnal
         if (!cancelled) setError(`Could not load earlier analysis: ${err instanceof Error ? err.message : String(err)}`)
       })
       .finally(() => {
-        if (!cancelled) setHistoryLoaded(true)
+        if (!cancelled) setHistoryLoadedFor(symbol)
       })
     return () => { cancelled = true }
   }, [symbol])

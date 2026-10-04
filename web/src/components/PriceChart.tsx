@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useId, useMemo, useRef, useState } from 'react'
 import { apiClient, type ChartDrawing } from '../services/api'
 import { formatPrice } from '../utils/priceDisplay'
 import { calculateSMA, calculateEMA } from '../utils/sma'
@@ -97,8 +97,15 @@ function buildPath(points: Array<{ x: number; y: number | null }>) {
   return filtered.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
 }
 
+/** Stable empty series, so memos keyed on the bars don't recompute. */
+const NO_BARS: PriceHistoryPoint[] = []
+
 export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onLoading, currentPrice, currentVolume, currentPriceDate, purchasePrice, purchaseDate, purchases, markerPrice, markerLabel, markerMode = 'breakthrough', markers }: PriceChartProps) {
-  const [history, setHistory] = useState<PriceHistoryPoint[]>([])
+  // Bars are kept with the symbol they belong to, and only that symbol's are
+  // drawn: switching symbol needs no effect to clear the old ones, and a
+  // late response for a symbol no longer shown can never be drawn.
+  const [loadedHistory, setLoadedHistory] = useState<{ symbol: string; bars: PriceHistoryPoint[] }>({ symbol: '', bars: NO_BARS })
+  const history = loadedHistory.symbol === symbol ? loadedHistory.bars : NO_BARS
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [activeOverlays, setActiveOverlays] = useState<Set<string>>(new Set(FALLBACK_CHART_DEFAULTS.overlays))
@@ -128,11 +135,11 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const [barInterval, setBarInterval] = useState<'day' | 'week'>(FALLBACK_CHART_DEFAULTS.barInterval)
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
   const [showInAud, setShowInAud] = useState(false)
-  const [fxRate, setFxRate] = useState<number | null>(null)
-  const [fxLoading, setFxLoading] = useState(false)
+  // The last rate looked up, with the currency it is for.
+  const [fetchedRate, setFetchedRate] = useState<{ currency: string; rate: number | null } | null>(null)
   // detectedCurrency is resolved from symbol info — more reliable than the prop when
   // the parent's symbolInfo cache hasn't been populated yet for this symbol.
-  const [detectedCurrency, setDetectedCurrency] = useState<string>('AUD')
+  const [lookedUpCurrency, setLookedUpCurrency] = useState<{ symbol: string; currency: string } | null>(null)
   /**
    * Rendered size of the chart frame, in CSS pixels.
    *
@@ -189,10 +196,13 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   const [yCenter, setYCenter] = useState<number | null>(null)
   const yZoomed = yZoom !== 1 || yCenter !== null
 
-  const isInternational = detectedCurrency !== 'AUD'
+
+  // The parent's loading callback, read through an effect event: it is a new
+  // function on every parent render, and as a dependency it would refetch.
+  const reportLoading = useEffectEvent((busy: boolean) => onLoading(busy))
 
   useEffect(() => {
-    if (!symbol) { setHistory([]); return }
+    if (!symbol) return
     // Switching symbols quickly leaves the earlier request in flight. One that
     // needs a Yahoo top-up can land after the newer one, and without this it
     // drew the old symbol's bars under the new symbol's name.
@@ -202,16 +212,16 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       try {
         setLoading(true)
         setError(null)
-        onLoading(true)
+        reportLoading(true)
         const data = await apiClient.getPriceHistory(symbol, 600)
-        if (!cancelled) setHistory(data)
+        if (!cancelled) setLoadedHistory({ symbol, bars: data })
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load price history')
       } finally {
         settled = true
         if (!cancelled) {
           setLoading(false)
-          onLoading(false)
+          reportLoading(false)
         }
       }
     }
@@ -220,7 +230,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       cancelled = true
       // Abandoned mid-flight: its finally block will now skip the reset, so
       // clear the loading state here rather than leave it on.
-      if (!settled) onLoading(false)
+      if (!settled) reportLoading(false)
     }
   }, [symbol])
 
@@ -249,43 +259,56 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       .then((data) => {
         // Only adopt bars that actually advance the chart, so a backend still
         // serving the old tail cannot retrigger this effect in a loop.
-        if (!cancelled && data.length > 0 && data[data.length - 1].date > newest) setHistory(data)
+        if (!cancelled && data.length > 0 && data[data.length - 1].date > newest) setLoadedHistory({ symbol, bars: data })
       })
       .catch(() => { /* keep the bars we have — the live close-only point still draws */ })
     return () => { cancelled = true }
   }, [symbol, currentPriceDate, history])
 
-  // Resolve the currency for this symbol, then fetch its FX rate. When the
-  // parent passes a non-AUD currency (from its symbolInfo cache) we trust it;
-  // only when the prop says AUD — which can also mean "unknown" — do we
-  // double-check against symbol_info.
+  // The symbol's currency. A non-AUD currency from the parent (its
+  // symbolInfo cache) is trusted; AUD can also mean "unknown", so it is
+  // double-checked against symbol_info, and AUD stands until that answers.
+  const propCurrency = currencyProp.toUpperCase()
+  const detectedCurrency = propCurrency !== 'AUD'
+    ? propCurrency
+    : lookedUpCurrency?.symbol === symbol ? lookedUpCurrency.currency : 'AUD'
+  const isInternational = detectedCurrency !== 'AUD'
+
   useEffect(() => {
-    if (!symbol) return
+    if (!symbol || propCurrency !== 'AUD') return
+    let cancelled = false
+    apiClient.getSymbolInfo()
+      .then((symbols) => {
+        const info = symbols.find((s) => s.symbol === symbol)
+        if (!cancelled) setLookedUpCurrency({ symbol, currency: info?.currency?.toUpperCase() ?? 'AUD' })
+      })
+      .catch(() => { if (!cancelled) setLookedUpCurrency({ symbol, currency: 'AUD' }) })
+    return () => { cancelled = true }
+  }, [symbol, propCurrency])
+
+  // Today's rate for that currency — loading until it arrives.
+  const fxRate = detectedCurrency !== 'AUD' && fetchedRate?.currency === detectedCurrency ? fetchedRate.rate : null
+  const fxLoading = detectedCurrency !== 'AUD' && fetchedRate?.currency !== detectedCurrency
+
+  useEffect(() => {
+    if (detectedCurrency === 'AUD') return
+    let cancelled = false
+    const today = new Date().toISOString().slice(0, 10)
+    apiClient.getFxRateForDate(detectedCurrency, today)
+      .then((result) => { if (!cancelled) setFetchedRate({ currency: detectedCurrency, rate: result?.rate ?? null }) })
+      .catch(() => { if (!cancelled) setFetchedRate({ currency: detectedCurrency, rate: null }) })
+    return () => { cancelled = true }
+  }, [detectedCurrency])
+
+  // A new symbol (or currency) starts in its own currency, and a half-placed
+  // trendline belongs to the symbol it was started on. Reset during render,
+  // keyed on what was last shown, rather than by an effect.
+  const [shownKey, setShownKey] = useState(`${symbol}|${currencyProp}`)
+  if (shownKey !== `${symbol}|${currencyProp}`) {
+    setShownKey(`${symbol}|${currencyProp}`)
     setShowInAud(false)
-    setFxRate(null)
-
-    const applyCurrency = (resolved: string) => {
-      setDetectedCurrency(resolved)
-      if (resolved !== 'AUD') {
-        const today = new Date().toISOString().slice(0, 10)
-        setFxLoading(true)
-        apiClient.getFxRateForDate(resolved, today)
-          .then((result) => { if (result) setFxRate(result.rate) })
-          .finally(() => setFxLoading(false))
-      }
-    }
-
-    const propCurrency = currencyProp.toUpperCase()
-    if (propCurrency !== 'AUD') {
-      applyCurrency(propCurrency)
-      return
-    }
-    setDetectedCurrency('AUD')
-    apiClient.getSymbolInfo().then((symbols) => {
-      const info = symbols.find((s) => s.symbol === symbol)
-      applyCurrency(info?.currency?.toUpperCase() ?? 'AUD')
-    }).catch(() => applyCurrency('AUD'))
-  }, [symbol, currencyProp])
+    setPendingAnchor(null)
+  }
 
   const toggleOverlay = (id: string) => {
     setActiveOverlays((prev) => {
@@ -378,7 +401,6 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
   // charting it. A failure just means no levels — never a broken chart.
   useEffect(() => {
     let cancelled = false
-    setPendingAnchor(null)
     apiClient.getChartDrawings?.(symbol)
       .then((rows) => { if (!cancelled) setDrawings(rows) })
       .catch(() => { if (!cancelled) setDrawings([]) })
@@ -435,6 +457,9 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     [trimmedHistory]
   )
   const showCandles = chartType === 'candle' && hasOhlc
+
+  // Read outside the memo so the compiler can track it as a value of its own.
+  const seriesLength = seriesHistory.length
 
   const chartData = useMemo(() => {
     // 60px of the frame is the right margin the stop-loss and level markers
@@ -506,7 +531,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       color: overlay.color,
       dash: overlay.dash,
       points: trimmedHistory.map((_, index) => {
-        const globalIndex = seriesHistory.length - trimmedHistory.length + index
+        const globalIndex = seriesLength - trimmedHistory.length + index
         const value = allOverlays[overlay.id][globalIndex]
         return {
           x: xAt(index),
@@ -603,7 +628,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
       left, right, top, bottom, plotWidth, seriesWidth, plotHeight,
       pricePlotHeight: plotHeight, axisY, labelY, toY, minValue, maxValue,
     }
-  }, [frame, trimmedHistory, seriesHistory.length, allOverlays, fxMultiplier, currSym, markerPrice, markers, purchasePrice, purchases, isInternational, showInAud, fxRate, showCandles, yZoom, yCenter])
+  }, [frame, trimmedHistory, seriesLength, allOverlays, fxMultiplier, currSym, markerPrice, markers, purchasePrice, purchases, showCandles, yZoom, yCenter])
 
   const allMarkers = useMemo(() => {
     const defs: Array<{ price: number; label: string; mode: 'breakthrough' | 'stoploss'; color: string }> = []
@@ -684,7 +709,7 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     }
     if (purchasePrice == null) return []
     return [place(purchasePrice, purchaseDate ?? null)]
-  }, [purchases, purchasePrice, purchaseDate, trimmedHistory, chartData, fxMultiplier, isInternational, showInAud, fxRate])
+  }, [purchases, purchasePrice, purchaseDate, trimmedHistory, chartData, fxMultiplier])
 
   // The tooltip and the y-range logic below still reason about a single
   // representative purchase.

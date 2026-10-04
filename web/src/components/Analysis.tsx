@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { apiClient, type RiskRow, type RiskTotals } from '../services/api'
 import { getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from '../utils/holdings'
 import PriceChart from './PriceChart'
@@ -79,55 +79,64 @@ export default function Analysis({ onLoading, holdingsVersion }: { onLoading: (l
   const [editTrailingSellPct, setEditTrailingSellPct] = useState('')
   const [editTrailingSellDate, setEditTrailingSellDate] = useState('')
 
-  useEffect(() => {
-    loadData()
-  }, [holdingsVersion])
+  /**
+   * Load holdings, risk rows and chart inputs.
+   *
+   * State is set only in the promise callbacks, never synchronously, so the
+   * effect below can start a load without a cascading render. A reload keeps
+   * showing the current rows until the new ones arrive; the app-wide loading
+   * indicator (`onLoading`) shows that one is under way.
+   */
+  const loadData = () => {
+    onLoading(true)
+    return Promise.all([
+      apiClient.getHoldings(),
+      apiClient.getHoldingsSymbolFields(),
+      apiClient.getSymbolInfo(),
+      apiClient.getPortfolioRisk(),
+    ])
+      .then(async ([txData, symFields, infoData, riskData]) => {
+        setError(null)
+        setTransactions(txData)
+        setSymbolFields(symFields)
+        const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
+        infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
+        setSymbolInfo(infoMap)
+        setRiskRows(riskData.rows)
+        setRiskTotals(riskData.totals)
 
-  const loadData = async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      onLoading(true)
+        const activeSymbols = riskData.rows.map((r) => r.symbol)
+        if (!selectedSymbol && activeSymbols.length > 0) setSelectedSymbol(activeSymbols[0])
 
-      const [txData, symFields, infoData, riskData] = await Promise.all([
-        apiClient.getHoldings(),
-        apiClient.getHoldingsSymbolFields(),
-        apiClient.getSymbolInfo(),
-        apiClient.getPortfolioRisk(),
-      ])
-      setTransactions(txData)
-      setSymbolFields(symFields)
-      const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
-      infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
-      setSymbolInfo(infoMap)
-      setRiskRows(riskData.rows)
-      setRiskTotals(riskData.totals)
-
-      const activeSymbols = riskData.rows.map((r) => r.symbol)
-      if (!selectedSymbol && activeSymbols.length > 0) setSelectedSymbol(activeSymbols[0])
-
-      // Native cached prices/volumes are only needed as chart inputs
-      const cachedPrices = await apiClient.getCachedPrices(activeSymbols)
-      const priceMap: Record<string, number | null> = {}
-      const volumeMap: Record<string, number | null> = {}
-      const dateMap: Record<string, string | null> = {}
-      cachedPrices.forEach((p) => {
-        priceMap[p.symbol] = p.price
-        volumeMap[p.symbol] = p.volume
-        dateMap[p.symbol] = p.price_date ?? null
+        // Native cached prices/volumes are only needed as chart inputs
+        const cachedPrices = await apiClient.getCachedPrices(activeSymbols)
+        const priceMap: Record<string, number | null> = {}
+        const volumeMap: Record<string, number | null> = {}
+        const dateMap: Record<string, string | null> = {}
+        cachedPrices.forEach((p) => {
+          priceMap[p.symbol] = p.price
+          volumeMap[p.symbol] = p.volume
+          dateMap[p.symbol] = p.price_date ?? null
+        })
+        setPrices(priceMap)
+        setVolumes(volumeMap)
+        setPriceDates(dateMap)
       })
-      setPrices(priceMap)
-      setVolumes(volumeMap)
-      setPriceDates(dateMap)
-
-      setLoading(false)
-      onLoading(false)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load analysis data')
-      setLoading(false)
-      onLoading(false)
-    }
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load analysis data'))
+      .finally(() => {
+        setLoading(false)
+        onLoading(false)
+      })
   }
+
+  // Reload whenever holdings change. An effect event, so the selection and
+  // callbacks loadData reads are current without becoming dependencies.
+  const reload = useEffectEvent(() => {
+    void loadData()
+  })
+  useEffect(() => {
+    reload()
+  }, [holdingsVersion])
 
   // Adapt server risk rows to the shape the JSX renders
   const rows: AnalysisRow[] = useMemo(() => riskRows.map((r) => ({

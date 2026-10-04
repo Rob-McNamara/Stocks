@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { apiClient, type HindsightRow, type HindsightPoint, type HindsightStatus } from '../services/api'
 
 // Thin client: every figure here is computed by the API (GET /api/hindsight),
@@ -188,18 +188,23 @@ export default function Hindsight({
     return () => window.removeEventListener('resize', fit)
   }, [fit])
 
+  // The parent's loading callback, read through an effect event: it is a new
+  // function on every parent render, and as a dependency it would refetch
+  // each time. Only a change of holdings should.
+  const reportLoading = useEffectEvent((busy: boolean) => onLoading(busy))
+
   useEffect(() => {
     const load = async () => {
       try {
         setLoading(true)
         setError(null)
-        onLoading(true)
+        reportLoading(true)
         setRows(await apiClient.getHindsight())
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load hindsight')
       } finally {
         setLoading(false)
-        onLoading(false)
+        reportLoading(false)
       }
     }
     load()

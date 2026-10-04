@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { apiClient, type HoldingTransactionPayload, type PortfolioHolding, type PortfolioLot, type CashAccount } from '../services/api'
 import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from '../utils/holdings'
 import { settlementAccountsFor } from '../utils/cash'
@@ -78,6 +78,11 @@ interface HoldingsPrefill {
   customFields?: Record<string, string>
 }
 
+/** Today as YYYY-MM-DD, the form's default trade date. */
+function todayIso(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
 export default function HoldingsManager({ scope, onLoading, onTransactionsChanged, configVersion, holdingsVersion, prefill, onPrefillConsumed, onPrefillSaved, focusSymbol, onFocusSymbolConsumed }: { scope: HoldingScope; onLoading: (loading: boolean) => void; onTransactionsChanged?: () => void; configVersion?: number; holdingsVersion?: number; prefill?: HoldingsPrefill | null; onPrefillConsumed?: () => void; onPrefillSaved?: (symbol: string) => void; focusSymbol?: string | null; onFocusSymbolConsumed?: () => void }) {
   /**
    * Whether a holding belongs to this screen. Declared up here because the
@@ -137,7 +142,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
   const [symbolInfo, setSymbolInfo] = useState<Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }>>({})
   const [symbol, setSymbol] = useState('')
   const [transactionType, setTransactionType] = useState<HoldingTransaction['transaction_type']>('purchase')
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
+  const [date, setDate] = useState(todayIso)
   const [quantity, setQuantity] = useState('')
   const [price, setPrice] = useState('')
   const [amount, setAmount] = useState('')
@@ -153,19 +158,19 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     () => settlementAccountsFor(cashAccounts, currency),
     [cashAccounts, currency],
   )
-  const [fxRate, setFxRate] = useState<number | null>(null)
-  const [fxRateDate, setFxRateDate] = useState<string | null>(null)
-  const [fxLoading, setFxLoading] = useState(false)
+  // The last rate looked up for the form, keyed by the currency and date it
+  // is for. The rate shown is worked out from it during render (below).
+  const [fetchedFx, setFetchedFx] = useState<{ key: string; rate: number | null; date: string | null } | null>(null)
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, string>>({})
   const [holdingsSymbolFields, setHoldingsSymbolFields] = useState<Record<string, Record<string, string>>>({})
   // Symbol whose form values came from a watchlist prefill. While the form
   // still shows that symbol, the per-symbol pre-population effect must not
   // overwrite the prefilled sector/custom fields — including when the
   // holdings symbol fields finish loading after the prefill was applied.
-  const prefillAppliedSymbol = useRef<string | null>(null)
+  const [prefillAppliedSymbol, setPrefillAppliedSymbol] = useState<string | null>(null)
   // Symbol that arrived via "Move to Holdings" — the watchlist entry is only
   // removed (via onPrefillSaved) once a transaction for it is actually saved.
-  const prefillPendingSymbol = useRef<string | null>(null)
+  const [prefillPendingSymbol, setPrefillPendingSymbol] = useState<string | null>(null)
   const [editingSymbolCard, setEditingSymbolCard] = useState<string | null>(null)
   const [editCardSymbol, setEditCardSymbol] = useState('')
   const [stopLossPrice, setStopLossPrice] = useState('')
@@ -217,11 +222,9 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     setTrailingSellDate('')
     setSector('')
     setCustomFieldValues({})
-    setDate(new Date().toISOString().slice(0, 10))
+    setDate(todayIso())
     setCurrency('AUD')
     setCashAccountId('')
-    setFxRate(null)
-    setFxRateDate(null)
   }
 
   const recordFormIsDirty = () =>
@@ -253,22 +256,23 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [showRecordDialog])
 
-  // holdingsVersion, not just configVersion: a holding recorded on the other
-  // screen belongs to this one whenever its currency says so, and that screen
-  // is already mounted behind this one rather than remounted on the way in.
-  useEffect(() => {
-    loadHoldings()
-  }, [configVersion, holdingsVersion])
-
-  // Pre-fill form when navigating from watchlist
-  useEffect(() => {
-    if (!prefill) return
+  // Pre-fill the form when arriving from the watchlist. Applied during render,
+  // keyed on the prefill last applied — React's pattern for adjusting state
+  // when a prop changes — so no effect sets state; telling the parent it was
+  // used is a separate effect, since a parent can't be updated mid-render.
+  const [appliedPrefill, setAppliedPrefill] = useState<HoldingsPrefill | null>(null)
+  // State set during render isn't visible until the next one, so a prefill
+  // applied in this render is also tracked locally for the blocks below.
+  let prefilledThisRender: string | null = null
+  if (!prefill && appliedPrefill !== null) setAppliedPrefill(null)
+  if (prefill && prefill !== appliedPrefill) {
+    prefilledThisRender = prefill.symbol.trim().toUpperCase()
+    setAppliedPrefill(prefill)
     setSymbol(prefill.symbol)
     setTransactionType('purchase')
-    setDate(new Date().toISOString().slice(0, 10))
+    setDate(todayIso())
     setQuantity('')
-    if (prefill.price != null) setPrice(prefill.price.toString())
-    else setPrice('')
+    setPrice(prefill.price != null ? prefill.price.toString() : '')
     setAmount('')
     setBrokerage('')
     setNotes(prefill.notes ?? '')
@@ -292,66 +296,82 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     setStopLossPrice(prefill.customFields?.['stop_loss'] ?? '')
     setTrailingSellPct('')
     setTrailingSellDate('')
-    prefillAppliedSymbol.current = prefill.symbol.trim().toUpperCase()
-    prefillPendingSymbol.current = prefill.symbol.trim().toUpperCase()
+    setPrefillAppliedSymbol(prefill.symbol.trim().toUpperCase())
+    setPrefillPendingSymbol(prefill.symbol.trim().toUpperCase())
     // The form is behind a button now, so a prefill that did not open the
     // dialog would look like "Move to Holdings" had done nothing.
     setShowRecordDialog(true)
-    onPrefillConsumed?.()
-  }, [prefill])
-
-  // Auto-detect currency from symbolInfo when adding a new transaction
+  }
+  const consumePrefill = useEffectEvent(() => onPrefillConsumed?.())
   useEffect(() => {
+    if (appliedPrefill) consumePrefill()
+  }, [appliedPrefill])
+
+  // Auto-detect currency from symbolInfo when adding a new transaction —
+  // re-applied whenever the symbol or what is known about it changes, and
+  // otherwise left to the user's choice.
+  const [currencyDetectedFor, setCurrencyDetectedFor] = useState<{ symbol: string; info: typeof symbolInfo; options: string[] } | null>(null)
+  if (currencyDetectedFor?.symbol !== symbol || currencyDetectedFor.info !== symbolInfo || currencyDetectedFor.options !== currencyOptions) {
+    setCurrencyDetectedFor({ symbol, info: symbolInfo, options: currencyOptions })
     const detected = symbolInfo[symbol]?.currency?.toUpperCase()
     if (detected && detected !== 'AUD' && currencyOptions.includes(detected)) {
       setCurrency(detected)
     } else if (detected === 'AUD') {
       setCurrency('AUD')
     }
-  }, [symbol, symbolInfo, currencyOptions])
+  }
 
-  // Pre-populate custom fields from per-symbol values when entering a new transaction
-  useEffect(() => {
+  // Pre-populate custom fields from per-symbol values when entering a new
+  // transaction — re-applied when the symbol or the stored fields change.
+  const [fieldsAppliedFor, setFieldsAppliedFor] = useState<{ symbol: string; fields: typeof holdingsSymbolFields } | null>(null)
+  if (fieldsAppliedFor?.symbol !== symbol || fieldsAppliedFor.fields !== holdingsSymbolFields) {
+    setFieldsAppliedFor({ symbol, fields: holdingsSymbolFields })
     const sym = symbol.trim().toUpperCase()
-    if (prefillAppliedSymbol.current) {
-      // The prefilled values win while their symbol is in the form. An empty
-      // symbol is the render before the prefill's setSymbol lands (or a form
-      // reset) — not a user edit, so keep the guard armed through it.
-      if (prefillAppliedSymbol.current === sym || sym === '') return
-      prefillAppliedSymbol.current = null
+    // The prefilled values win while their symbol is in the form. An empty
+    // symbol is the render before the prefill's symbol lands (or a form
+    // reset) — not a user edit, so keep the guard armed through it.
+    const prefilledSymbol = prefilledThisRender ?? prefillAppliedSymbol
+    const keepPrefill = prefilledSymbol !== null && (prefilledSymbol === sym || sym === '')
+    if (!keepPrefill) {
+      if (prefilledSymbol !== null) setPrefillAppliedSymbol(null)
+      const symFields = holdingsSymbolFields[sym]
+      if (symFields) {
+        // Built-in symbol-level fields (_notes, stop_loss, sector, ...) have
+        // dedicated inputs — only user-defined fields go into the custom inputs.
+        const custom: Record<string, string> = {}
+        Object.entries(symFields).forEach(([k, v]) => {
+          if (!BUILT_IN_HOLDINGS_KEYS.includes(k) && k !== '_notes') custom[k] = v
+        })
+        setCustomFieldValues(custom)
+        setSector(symFields['sector'] ?? '')
+      } else {
+        setCustomFieldValues({})
+        setSector('')
+      }
     }
-    const symFields = holdingsSymbolFields[sym]
-    if (symFields) {
-      // Built-in symbol-level fields (_notes, stop_loss, sector, ...) have
-      // dedicated inputs — only user-defined fields go into the custom inputs.
-      const custom: Record<string, string> = {}
-      Object.entries(symFields).forEach(([k, v]) => {
-        if (!BUILT_IN_HOLDINGS_KEYS.includes(k) && k !== '_notes') custom[k] = v
-      })
-      setCustomFieldValues(custom)
-      setSector(symFields['sector'] ?? '')
-    } else {
-      setCustomFieldValues({})
-      setSector('')
-    }
-  }, [symbol, holdingsSymbolFields])
+  }
+
+  // The form's exchange rate: none for AUD, otherwise the rate looked up for
+  // the current currency and date — loading until it arrives.
+  const fxKey = `${currency}|${date}`
+  const fxMatches = currency !== 'AUD' && fetchedFx !== null && fetchedFx.key === fxKey
+  const fxRate = fxMatches ? fetchedFx.rate : null
+  const fxRateDate = fxMatches ? fetchedFx.date : null
+  const fxLoading = currency !== 'AUD' && !fxMatches
 
   useEffect(() => {
-    if (currency === 'AUD') {
-      setFxRate(null)
-      setFxRateDate(null)
-      return
-    }
-    setFxLoading(true)
-    apiClient.getFxRateForDate(currency, date).then((result) => {
-      if (result) {
-        setFxRate(result.rate)
-        setFxRateDate(result.date)
-      } else {
-        setFxRate(null)
-        setFxRateDate(null)
-      }
-    }).finally(() => setFxLoading(false))
+    if (currency === 'AUD') return
+    let cancelled = false
+    const key = `${currency}|${date}`
+    apiClient
+      .getFxRateForDate(currency, date)
+      .then((result) => {
+        if (!cancelled) setFetchedFx({ key, rate: result?.rate ?? null, date: result?.date ?? null })
+      })
+      .catch(() => {
+        if (!cancelled) setFetchedFx({ key, rate: null, date: null })
+      })
+    return () => { cancelled = true }
   }, [currency, date])
 
   const loadPortfolioData = async () => {
@@ -366,40 +386,63 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     setSelectedChartSymbol((prev) => prev || ph.holdings.find(inScope)?.symbol || '')
   }
 
-  const loadHoldings = async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      onLoading(true)
-      apiClient.getMeta().then((m) => {
-        if (m.sectors?.length) setSectorOptions(m.sectors)
-        if (m.currencies?.length) setCurrencyOptions(m.currencies)
-        setHoldingsFieldDefs(((m.holdings_custom_fields ?? []) as HoldingsFieldDef[]).filter((d) => !BUILT_IN_HOLDINGS_KEYS.includes(d.key)))
-      }).catch(() => {})
-      // Settlement accounts for the picker; an empty list simply hides it.
-      apiClient.getCashAccounts().then(setCashAccounts).catch(() => setCashAccounts([]))
-      const data = await apiClient.getHoldings()
-      setTransactions(data)
-      try {
-        const [infoData, symFields] = await Promise.all([
-          apiClient.getSymbolInfo(),
-          apiClient.getHoldingsSymbolFields(),
-        ])
-        const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
-        infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
-        setSymbolInfo(infoMap)
-        setHoldingsSymbolFields(symFields)
-        await loadPortfolioData()
-      } catch (err) {
-        console.error('Failed to fetch portfolio data:', err)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load holdings')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
+  /**
+   * Fetch holdings, symbol data and portfolio figures. State is set only in
+   * the promise callbacks, so the reload effect below never sets state
+   * synchronously; a handler that wants the controls disabled while it runs
+   * calls `loadHoldings`, which marks the screen loading first.
+   */
+  const fetchHoldings = () => {
+    onLoading(true)
+    apiClient.getMeta().then((m) => {
+      if (m.sectors?.length) setSectorOptions(m.sectors)
+      if (m.currencies?.length) setCurrencyOptions(m.currencies)
+      setHoldingsFieldDefs(((m.holdings_custom_fields ?? []) as HoldingsFieldDef[]).filter((d) => !BUILT_IN_HOLDINGS_KEYS.includes(d.key)))
+    }).catch(() => {})
+    // Settlement accounts for the picker; an empty list simply hides it.
+    apiClient.getCashAccounts().then(setCashAccounts).catch(() => setCashAccounts([]))
+    return apiClient
+      .getHoldings()
+      .then(async (data) => {
+        setError(null)
+        setTransactions(data)
+        try {
+          const [infoData, symFields] = await Promise.all([
+            apiClient.getSymbolInfo(),
+            apiClient.getHoldingsSymbolFields(),
+          ])
+          const infoMap: Record<string, { instrument_type: string | null; long_name: string | null; currency: string | null }> = {}
+          infoData.forEach((i) => { infoMap[i.symbol] = { instrument_type: i.instrument_type, long_name: i.long_name, currency: i.currency } })
+          setSymbolInfo(infoMap)
+          setHoldingsSymbolFields(symFields)
+          await loadPortfolioData()
+        } catch (err) {
+          console.error('Failed to fetch portfolio data:', err)
+        }
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load holdings'))
+      .finally(() => {
+        setLoading(false)
+        onLoading(false)
+      })
   }
+
+  const loadHoldings = () => {
+    setLoading(true)
+    return fetchHoldings()
+  }
+
+  // holdingsVersion, not just configVersion: a holding recorded on the other
+  // screen belongs to this one whenever its currency says so, and that screen
+  // is already mounted behind this one rather than remounted on the way in.
+  // An effect event, so the scope and callbacks are read without becoming
+  // dependencies.
+  const reloadHoldings = useEffectEvent(() => {
+    void fetchHoldings()
+  })
+  useEffect(() => {
+    reloadHoldings()
+  }, [configVersion, holdingsVersion])
 
   const handleSaveTransaction = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -502,7 +545,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
       // A stock arriving via "Move to Holdings" is recorded atomically —
       // the server creates the transaction and removes the watchlist entries
       // in one call.
-      const fromWatchlist = prefillPendingSymbol.current === symbol.trim().toUpperCase()
+      const fromWatchlist = prefillPendingSymbol === symbol.trim().toUpperCase()
       const result = fromWatchlist
         ? (await apiClient.addHoldingFromWatchlist(payload)).transaction
         : await apiClient.addHoldingTransaction(payload)
@@ -528,9 +571,9 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
       onTransactionsChanged?.()
       // If this symbol came from "Move to Holdings", the watchlist entry can
       // now be removed safely — the holding actually exists.
-      if (prefillPendingSymbol.current && prefillPendingSymbol.current === result.symbol) {
+      if (prefillPendingSymbol && prefillPendingSymbol === result.symbol) {
         onPrefillSaved?.(result.symbol)
-        prefillPendingSymbol.current = null
+        setPrefillPendingSymbol(null)
       }
       // Refresh transactions and server-computed portfolio data
       const refreshed = await apiClient.getHoldings()
@@ -539,7 +582,7 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
       setSuccess('Transaction recorded successfully')
       // The prefill is consumed by the save — later manual entry of the same
       // symbol should pre-populate from its stored fields again
-      prefillAppliedSymbol.current = null
+      setPrefillAppliedSymbol(null)
       resetTransactionForm()
       // Only a success closes the dialog: validation and API failures below
       // must leave it open with the user's input intact.
@@ -682,12 +725,19 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
   const [sortColumn, setSortColumn] = useState<string | null>(null)
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc')
 
-  // When navigated to from the Dashboard, focus that holding's chart.
-  useEffect(() => {
-    if (!focusSymbol) return
+  // When navigated to from the Dashboard, focus that holding's chart. Applied
+  // during render, keyed on the symbol last applied; telling the parent it was
+  // used is an effect, since a parent can't be updated mid-render.
+  const [appliedFocusSymbol, setAppliedFocusSymbol] = useState<string | null>(null)
+  if (!focusSymbol && appliedFocusSymbol !== null) setAppliedFocusSymbol(null)
+  if (focusSymbol && focusSymbol !== appliedFocusSymbol) {
+    setAppliedFocusSymbol(focusSymbol)
     setSelectedChartSymbol(focusSymbol)
-    onFocusSymbolConsumed?.()
-  }, [focusSymbol])
+  }
+  const consumeFocusSymbol = useEffectEvent(() => onFocusSymbolConsumed?.())
+  useEffect(() => {
+    if (appliedFocusSymbol) consumeFocusSymbol()
+  }, [appliedFocusSymbol])
 
   const handleSort = (column: string) => {
     if (sortColumn === column) {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { apiClient, downloadCashAccountCsv, type CashAccount, type CashTransaction } from '../services/api'
 
 /**
@@ -67,28 +67,43 @@ export default function CashManager({ onLoading, onCashChanged }: { onLoading: (
   const [toAmount, setToAmount] = useState('')
   const [transferDate, setTransferDate] = useState(today())
 
+  /**
+   * Fetch accounts and transactions; the caller has already shown loading.
+   * State is only set in the promise callbacks, so the mount effect can start
+   * it without setting state synchronously.
+   */
+  const fetchAll = () =>
+    Promise.all([
+      apiClient.getCashAccounts(),
+      apiClient.getCashTransactions(filterAccount ? Number(filterAccount) : undefined),
+    ])
+      .then(([accountRows, txRows]) => {
+        setAccounts(accountRows)
+        setTransactions(txRows)
+        if (!txAccount && accountRows.length > 0) setTxAccount(String(accountRows[0].id))
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load cash accounts'))
+      .finally(() => {
+        setLoading(false)
+        onLoading(false)
+      })
+
   const loadAll = async () => {
-    try {
-      setLoading(true)
-      onLoading(true)
-      setError(null)
-      const [accountRows, txRows] = await Promise.all([
-        apiClient.getCashAccounts(),
-        apiClient.getCashTransactions(filterAccount ? Number(filterAccount) : undefined),
-      ])
-      setAccounts(accountRows)
-      setTransactions(txRows)
-      if (!txAccount && accountRows.length > 0) setTxAccount(String(accountRows[0].id))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load cash accounts')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
+    setLoading(true)
+    onLoading(true)
+    setError(null)
+    await fetchAll()
   }
 
+  // An effect event: the first load reads the current filter and callbacks
+  // without making them dependencies, so it runs once on mount, as intended.
+  // Loading already starts true, so nothing is set synchronously here.
+  const loadOnMount = useEffectEvent(() => {
+    onLoading(true)
+    void fetchAll()
+  })
   useEffect(() => {
-    loadAll()
+    loadOnMount()
   }, [])
 
   useEffect(() => {

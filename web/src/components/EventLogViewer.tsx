@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useEffectEvent, useState } from 'react'
 import { apiClient } from '../services/api'
 
 interface EventLogEntry {
@@ -27,12 +27,13 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const loadEvents = async (opts: { page: number; level: string; source: string; eventType: string; symbol: string }) => {
-    try {
-      setLoading(true)
-      setError(null)
-      onLoading(true)
-      const result = await apiClient.getEventLog({
+  // Fetch one page. State is set only in the promise callbacks; whoever starts
+  // a load marks it loading first — a handler directly, a page change in the
+  // page handlers — so the effect below never sets state synchronously.
+  const loadEvents = (opts: { page: number; level: string; source: string; eventType: string; symbol: string }) => {
+    onLoading(true)
+    return apiClient
+      .getEventLog({
         page: opts.page,
         size,
         level: opts.level || undefined,
@@ -40,22 +41,30 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
         event_type: opts.eventType || undefined,
         symbol: opts.symbol || undefined,
       })
-      setEvents(result.items)
-      setTotal(result.total)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load event log')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
+      .then((result) => {
+        setError(null)
+        setEvents(result.items)
+        setTotal(result.total)
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load event log'))
+      .finally(() => {
+        setLoading(false)
+        onLoading(false)
+      })
   }
 
+  // A page change reloads with the filters as they stand. An effect event, so
+  // typing in a filter doesn't refetch — only submitting it does.
+  const loadPage = useEffectEvent(() => {
+    void loadEvents({ page, level, source, eventType, symbol })
+  })
   useEffect(() => {
-    loadEvents({ page, level, source, eventType, symbol })
+    loadPage()
   }, [page])
 
   const handleFilterSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    setLoading(true)
     setPage(1)
     await loadEvents({ page: 1, level, source, eventType, symbol })
   }
@@ -65,18 +74,21 @@ export default function EventLogViewer({ onLoading }: EventLogViewerProps) {
     setSource('')
     setEventType('')
     setSymbol('')
+    setLoading(true)
     setPage(1)
     await loadEvents({ page: 1, level: '', source: '', eventType: '', symbol: '' })
   }
 
   const handlePrevPage = () => {
     if (page > 1) {
+      setLoading(true)
       setPage(page - 1)
     }
   }
 
   const handleNextPage = () => {
     if (page * size < total) {
+      setLoading(true)
       setPage(page + 1)
     }
   }

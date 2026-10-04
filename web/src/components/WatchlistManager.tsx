@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useEffectEvent } from 'react'
 import { apiClient, type EnrichedWatchlistItem } from '../services/api'
 import { formatPrice } from '../utils/priceDisplay'
 import { SECTORS } from '../utils/sectors'
@@ -134,74 +134,90 @@ export default function WatchlistManager({ onLoading, initialSymbol, onInitialSy
     if (data.prices_updated_at) setPricesUpdatedAt(data.prices_updated_at)
   }
 
-  const loadWatchlistData = async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      apiClient.getMeta().then((m) => {
-        if (m.sectors?.length) setSectorOptions(m.sectors)
-        // Field definitions come pre-parsed from /api/meta
-        setCustomFieldDefs((m.watchlist_custom_fields ?? []) as CustomFieldDef[])
-      }).catch(() => {})
-      const [listsData, enriched, configData] = await Promise.all([
-        apiClient.getWatchlistLists(),
-        apiClient.getWatchlistEnriched(),
-        apiClient.getConfig(),
-      ])
-      setPricesUpdatedAt(configData['watchlist_prices_updated_at'] ?? null)
-      const savedDefault = configData['default_watchlist'] ?? ''
-      const effectiveLists = listsData.length > 0 ? listsData : ['Default']
-      const effectiveDefault = effectiveLists.includes(savedDefault) ? savedDefault : effectiveLists[0]
-      setDefaultList(effectiveDefault)
-      if (!selectedSymbol) setSelectedList(effectiveDefault)
-      setLists(effectiveLists)
-      applyEnriched(enriched)
-      if (enriched.items.length && !selectedSymbol) {
-        setSelectedSymbol(enriched.items[0].symbol)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load watchlist')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
-  }
+  // Loaded once, on mount. Loading starts true and errors start null, and the
+  // state is only set in the promise callbacks — never synchronously in the
+  // effect. An effect event, so the selection it reads isn't a dependency.
+  const loadWatchlistData = useEffectEvent(() => {
+    apiClient.getMeta().then((m) => {
+      if (m.sectors?.length) setSectorOptions(m.sectors)
+      // Field definitions come pre-parsed from /api/meta
+      setCustomFieldDefs((m.watchlist_custom_fields ?? []) as CustomFieldDef[])
+    }).catch(() => {})
+    Promise.all([
+      apiClient.getWatchlistLists(),
+      apiClient.getWatchlistEnriched(),
+      apiClient.getConfig(),
+    ])
+      .then(([listsData, enriched, configData]) => {
+        setPricesUpdatedAt(configData['watchlist_prices_updated_at'] ?? null)
+        const savedDefault = configData['default_watchlist'] ?? ''
+        const effectiveLists = listsData.length > 0 ? listsData : ['Default']
+        const effectiveDefault = effectiveLists.includes(savedDefault) ? savedDefault : effectiveLists[0]
+        setDefaultList(effectiveDefault)
+        if (!selectedSymbol) setSelectedList(effectiveDefault)
+        setLists(effectiveLists)
+        applyEnriched(enriched)
+        if (enriched.items.length && !selectedSymbol) {
+          setSelectedSymbol(enriched.items[0].symbol)
+        }
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load watchlist'))
+      .finally(() => {
+        setLoading(false)
+        onLoading(false)
+      })
+  })
 
   useEffect(() => {
     loadWatchlistData()
   }, [])
 
-  useEffect(() => {
-    if (!initialSymbol) return
+  // Arriving from another screen with a symbol to show: select it once its row
+  // has loaded. Adjusted during render, keyed on the symbol last applied, so
+  // it needs no effect setting state; telling the parent it was used is a
+  // separate effect, since a parent can't be updated mid-render.
+  const [appliedInitialSymbol, setAppliedInitialSymbol] = useState<string | null>(null)
+  // Once the parent clears it, forget it — so arriving again with the same
+  // symbol later selects it again.
+  if (!initialSymbol && appliedInitialSymbol !== null) setAppliedInitialSymbol(null)
+  if (initialSymbol && initialSymbol !== appliedInitialSymbol) {
     const entry = symbols.find((s) => s.symbol === initialSymbol)
     if (entry) {
+      setAppliedInitialSymbol(initialSymbol)
       setSelectedList(entry.list_name)
       setSelectedSymbol(initialSymbol)
-      onInitialSymbolConsumed?.()
     }
-  }, [initialSymbol, symbols])
+  }
+  const consumeInitialSymbol = useEffectEvent(() => onInitialSymbolConsumed?.())
+  useEffect(() => {
+    if (appliedInitialSymbol) consumeInitialSymbol()
+  }, [appliedInitialSymbol])
 
   // A "Move to Holdings" transaction was saved. The server removed the
   // memberships atomically (POST /api/holdings/from-watchlist) — just resync.
-  useEffect(() => {
-    if (!removeSymbolRequest) return
+  // An effect event, so the current selection and callback are read without
+  // becoming dependencies: only a new request triggers it.
+  const resyncAfterMove = useEffectEvent((moved: string) => {
     onRemoveSymbolConsumed?.()
     const resync = async () => {
       try {
-        if (selectedSymbol === removeSymbolRequest) setSelectedSymbol('')
+        if (selectedSymbol === moved) setSelectedSymbol('')
         const [listsData, enriched] = await Promise.all([
           apiClient.getWatchlistLists(),
           apiClient.getWatchlistEnriched(),
         ])
         setLists(listsData.length > 0 ? listsData : ['Default'])
         applyEnriched(enriched)
-        setSuccess(`${removeSymbolRequest} moved to Holdings and removed from watchlist`)
+        setSuccess(`${moved} moved to Holdings and removed from watchlist`)
         setTimeout(() => setSuccess(null), 3000)
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to refresh watchlist')
       }
     }
-    resync()
+    void resync()
+  })
+  useEffect(() => {
+    if (removeSymbolRequest) resyncAfterMove(removeSymbolRequest)
   }, [removeSymbolRequest])
 
   const handleCreateList = () => {

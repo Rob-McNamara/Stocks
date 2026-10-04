@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { apiClient, type CashAccount, type PortfolioOverview, type CustomListEntry, type CustomListResult, type PortfolioHistory, type PortfolioHolding } from '../services/api'
 import PortfolioHistoryChart from './PortfolioHistoryChart'
 import HoldingsHeatMap from './HoldingsHeatMap'
@@ -146,32 +146,37 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
     ? historyRange
     : 'all'
 
-  // `quiet` keeps the rendered dashboard on screen while refetching — a sort
-  // click should re-rank a table, not blank the entire page.
-  const load = async (listSort: Record<string, 'asc' | 'desc'> = diffSort, quiet = false) => {
-    try {
-      if (!quiet) {
-        setLoading(true)
-        onLoading(true)
-      }
-      setError(null)
-      setOverview(await apiClient.getPortfolioOverview(listSort))
-      // Separate call, and a failure only empties the cash card: the rest of
-      // the dashboard predates cash tracking and must not depend on it.
-      apiClient.getCashAccounts?.().then(setCashAccounts).catch(() => setCashAccounts([]))
-      apiClient.getPortfolioHoldings().then((r) => setHeatMapHoldings(r.holdings)).catch(() => setHeatMapHoldings([]))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load dashboard')
-    } finally {
-      if (!quiet) {
+  // State is set only in the promise callbacks, so the effect below can start
+  // a load without a synchronous, cascading render. The dashboard therefore
+  // stays on screen while it refetches — the placeholder only shows on the
+  // very first load — and `quiet` additionally skips the app-wide loading
+  // indicator, for a sort click that should simply re-rank a table.
+  const load = (listSort: Record<string, 'asc' | 'desc'> = diffSort, quiet = false) => {
+    if (!quiet) onLoading(true)
+    return apiClient
+      .getPortfolioOverview(listSort)
+      .then((nextOverview) => {
+        setError(null)
+        setOverview(nextOverview)
+        // Separate call, and a failure only empties the cash card: the rest of
+        // the dashboard predates cash tracking and must not depend on it.
+        apiClient.getCashAccounts?.().then(setCashAccounts).catch(() => setCashAccounts([]))
+        apiClient.getPortfolioHoldings().then((r) => setHeatMapHoldings(r.holdings)).catch(() => setHeatMapHoldings([]))
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load dashboard'))
+      .finally(() => {
         setLoading(false)
-        onLoading(false)
-      }
-    }
+        if (!quiet) onLoading(false)
+      })
   }
 
+  // An effect event, so the current sort and callbacks are read without
+  // becoming dependencies: a change of holdings reloads, nothing else does.
+  const reload = useEffectEvent(() => {
+    void load()
+  })
   useEffect(() => {
-    load()
+    reload()
   }, [holdingsVersion])
 
   // Loaded separately from the overview: the overview carries only aggregates,
@@ -187,10 +192,12 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
   // slow response should not hold up the rest of the dashboard.
   useEffect(() => {
     const from = rangeStart(activeRange)
-    setHistoryError(null)
     apiClient
       .getPortfolioHistory(from)
-      .then(setHistory)
+      .then((nextHistory) => {
+        setHistoryError(null)
+        setHistory(nextHistory)
+      })
       .catch((err) => setHistoryError(err instanceof Error ? err.message : 'Failed to load portfolio history'))
   }, [holdingsVersion, activeRange])
 

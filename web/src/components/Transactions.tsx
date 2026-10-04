@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { apiClient, OversellError, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
 import { settlementAccountsFor, settlesByConversion } from '../utils/cash'
 
@@ -63,13 +63,12 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const [symbolFilter, setSymbolFilter] = useState('')
   const [editing, setEditing] = useState<EditState | null>(null)
   const [cashAccounts, setCashAccounts] = useState<CashAccount[]>([])
-  const [editFxRate, setEditFxRate] = useState<number | null>(null)
-  const [editFxDate, setEditFxDate] = useState<string | null>(null)
-  const [editFxLoading, setEditFxLoading] = useState(false)
   // FX rate stored on the transaction being edited — reused as long as the
   // user doesn't change currency or date, so editing other fields never
   // silently rewrites the historical rate.
-  const editFxSeed = useRef<{ currency: string; date: string; rate: number | null } | null>(null)
+  const [editFxSeed, setEditFxSeed] = useState<{ currency: string; date: string; rate: number | null } | null>(null)
+  // The last rate looked up, keyed by the currency and date it is for.
+  const [fetchedFx, setFetchedFx] = useState<{ key: string; rate: number | null; date: string | null } | null>(null)
   const [holdingsFieldDefs, setHoldingsFieldDefs] = useState<HoldingsFieldDef[]>([])
   // Server-driven currency list from /api/meta; static list is the offline fallback
   const [currencyOptions, setCurrencyOptions] = useState<string[]>([...SUPPORTED_CURRENCIES])
@@ -82,12 +81,17 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     apiClient.getCashAccounts?.().then(setCashAccounts).catch(() => setCashAccounts([]))
   }
 
+  // The parent's loading callback, read through an effect event: it is a new
+  // function on every parent render, and as a dependency it would refetch
+  // each time. Only a change of holdings should.
+  const reportLoading = useEffectEvent((busy: boolean) => onLoading(busy))
+
   useEffect(() => {
     const load = async () => {
       try {
         setLoading(true)
         setError(null)
-        onLoading(true)
+        reportLoading(true)
         const [, meta] = await Promise.all([
           loadLedger(),
           apiClient.getMeta(),
@@ -98,35 +102,42 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         setError(err instanceof Error ? err.message : 'Failed to load transactions')
       } finally {
         setLoading(false)
-        onLoading(false)
+        reportLoading(false)
       }
     }
     load()
   }, [holdingsVersion])
 
+  // The edit form's rate, worked out during render rather than copied into
+  // state by an effect: none for AUD or a dividend, the transaction's own
+  // stored rate while its currency and date are unchanged, otherwise the rate
+  // looked up for the current currency and date — loading until it arrives.
+  const editCurrency = editing?.currency ?? 'AUD'
+  const editDate = editing?.date ?? ''
+  const fxNeeded = editing !== null && editCurrency !== 'AUD' && editing.type !== 'dividend'
+  const fxKey = `${editCurrency}|${editDate}`
+  const seedMatches = fxNeeded && editFxSeed !== null && editFxSeed.rate != null
+    && editFxSeed.currency === editCurrency && editFxSeed.date === editDate
+  const fetchedMatches = fetchedFx !== null && fetchedFx.key === fxKey
+  const editFxRate = !fxNeeded ? null : seedMatches ? editFxSeed.rate : fetchedMatches ? fetchedFx.rate : null
+  const editFxDate = !fxNeeded ? null : seedMatches ? editDate : fetchedMatches ? fetchedFx.date : null
+  const editFxLoading = fxNeeded && !seedMatches && !fetchedMatches
+
   useEffect(() => {
-    if (!editing || editing.currency === 'AUD' || editing.type === 'dividend') {
-      setEditFxRate(null)
-      setEditFxDate(null)
-      return
-    }
-    const seed = editFxSeed.current
-    if (seed && seed.rate != null && seed.currency === editing.currency && seed.date === editing.date) {
-      setEditFxRate(seed.rate)
-      setEditFxDate(editing.date)
-      return
-    }
-    setEditFxLoading(true)
-    apiClient.getFxRateForDate(editing.currency, editing.date).then((result) => {
-      if (result) {
-        setEditFxRate(result.rate)
-        setEditFxDate(result.date)
-      } else {
-        setEditFxRate(null)
-        setEditFxDate(null)
-      }
-    }).finally(() => setEditFxLoading(false))
-  }, [editing?.currency, editing?.date, editing?.type])
+    if (!fxNeeded || seedMatches) return
+    let cancelled = false
+    const key = `${editCurrency}|${editDate}`
+    apiClient
+      .getFxRateForDate(editCurrency, editDate)
+      .then((result) => {
+        if (!cancelled) setFetchedFx({ key, rate: result?.rate ?? null, date: result?.date ?? null })
+      })
+      .catch(() => {
+        // No rate: the form says so and refuses to save a foreign trade.
+        if (!cancelled) setFetchedFx({ key, rate: null, date: null })
+      })
+    return () => { cancelled = true }
+  }, [fxNeeded, seedMatches, editCurrency, editDate])
 
   const [sortColumn, setSortColumn] = useState<SortColumn | null>(null)
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc')
@@ -216,9 +227,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
     const displayPrice = currency !== 'AUD' && tx?.original_price != null
       ? tx.original_price.toString()
       : (row.price !== null ? row.price.toString() : '')
-    editFxSeed.current = { currency, date: row.date, rate: tx?.fx_rate ?? null }
-    setEditFxRate(tx?.fx_rate ?? null)
-    setEditFxDate(currency !== 'AUD' ? row.date : null)
+    setEditFxSeed({ currency, date: row.date, rate: tx?.fx_rate ?? null })
     setEditing({
       id: row.id,
       symbol: row.symbol,

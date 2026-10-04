@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useEffectEvent, useState } from 'react'
 import { apiClient, type SoldEntry } from '../services/api'
 
 // Thin client: all FIFO/P&L math for sold positions is computed by the API
@@ -20,18 +20,23 @@ export default function SoldStocks({ onLoading, holdingsVersion }: { onLoading: 
     setTotalRealisedCost(data.total_cost)
   }
 
+  // The parent's loading callback, read through an effect event: it is a new
+  // function on every parent render, and as a dependency it would refetch
+  // each time. Only a change of holdings should.
+  const reportLoading = useEffectEvent((busy: boolean) => onLoading(busy))
+
   useEffect(() => {
     const load = async () => {
       try {
         setLoading(true)
         setError(null)
-        onLoading(true)
+        reportLoading(true)
         await loadSold()
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load sold stocks')
       } finally {
         setLoading(false)
-        onLoading(false)
+        reportLoading(false)
       }
     }
     load()

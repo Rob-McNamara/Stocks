@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useEffectEvent } from 'react'
 import { apiClient } from '../services/api'
 import { OVERLAYS } from '../utils/chartOverlays'
 import {
@@ -154,31 +154,33 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
     }
   }
 
-  const loadConfig = async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      const data = await apiClient.getConfig()
-      setHistoryStart(data['portfolio_history_start'] ?? '')
-      setConfig(data)
-      try {
-        setCustomFieldDefs((JSON.parse(data['watchlist_custom_fields'] ?? '[]') as typeof customFieldDefs).filter((d) => !builtInWatchlistKeys.includes(d.key)))
-      } catch { setCustomFieldDefs([]) }
-      try {
-        setHoldingsFieldDefs((JSON.parse(data['holdings_custom_fields'] ?? '[]') as typeof holdingsFieldDefs).filter((d) => !builtInHoldingsKeys.includes(d.key)))
-      } catch { setHoldingsFieldDefs([]) }
-      try {
-        setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
-      } catch { setDashboardLists([]) }
-      setChartDefaults(parseChartDefaults(data[CHART_DEFAULTS_KEY], OVERLAYS.map((o) => o.id)))
-      setLayoutWidth(parseLayoutWidth(data[LAYOUT_WIDTH_KEY]))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load configuration')
-    } finally {
-      setLoading(false)
-      onLoading(false)
-    }
-  }
+  // Loaded once, on mount. Loading starts true and errors start null, so the
+  // state is only set in the promise callbacks — never synchronously in the
+  // effect. An effect event, so the callbacks it reads aren't dependencies.
+  const loadConfig = useEffectEvent(() => {
+    apiClient
+      .getConfig()
+      .then((data) => {
+        setHistoryStart(data['portfolio_history_start'] ?? '')
+        setConfig(data)
+        try {
+          setCustomFieldDefs((JSON.parse(data['watchlist_custom_fields'] ?? '[]') as typeof customFieldDefs).filter((d) => !builtInWatchlistKeys.includes(d.key)))
+        } catch { setCustomFieldDefs([]) }
+        try {
+          setHoldingsFieldDefs((JSON.parse(data['holdings_custom_fields'] ?? '[]') as typeof holdingsFieldDefs).filter((d) => !builtInHoldingsKeys.includes(d.key)))
+        } catch { setHoldingsFieldDefs([]) }
+        try {
+          setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
+        } catch { setDashboardLists([]) }
+        setChartDefaults(parseChartDefaults(data[CHART_DEFAULTS_KEY], OVERLAYS.map((o) => o.id)))
+        setLayoutWidth(parseLayoutWidth(data[LAYOUT_WIDTH_KEY]))
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load configuration'))
+      .finally(() => {
+        setLoading(false)
+        onLoading(false)
+      })
+  })
 
   useEffect(() => {
     loadConfig()

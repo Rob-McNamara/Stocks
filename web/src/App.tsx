@@ -66,15 +66,10 @@ function App() {
     setActiveTab(holdingsTabFor(data.symbol, data.currency))
   }
 
-  const testBackendConnection = async () => {
-    const healthy = await apiClient.checkHealth()
-    if (!healthy) {
-      setError('Cannot connect to backend. Make sure the API server is running.')
-    }
-  }
-
   useEffect(() => {
-    testBackendConnection()
+    apiClient.checkHealth().then((healthy) => {
+      if (!healthy) setError('Cannot connect to backend. Make sure the API server is running.')
+    })
   }, [])
 
   // Applied before anything renders width-sensitive content, so the layout does
