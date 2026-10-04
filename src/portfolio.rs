@@ -399,35 +399,6 @@ pub fn shares_on_date(txs: &[PortfolioTx], date: &str) -> f64 {
     settle_shares(shares).max(0.0)
 }
 
-/// A payment implied by a per-share dividend event.
-#[derive(Debug, Clone)]
-pub struct ImpliedDividendPayment {
-    /// YYYY-MM-DD ex-dividend date
-    pub ex_date: String,
-    pub amount_per_share: f64,
-    pub shares_held: f64,
-    pub total_payment: f64,
-}
-
-/// Payments implied by per-share dividend events, given as
-/// `(ex_date, amount_per_share)` pairs: shares held at each ex-date ×
-/// amount. Events on dates with no shares held yield no payment.
-pub fn implied_dividend_payments(txs: &[PortfolioTx], events: &[(String, f64)]) -> Vec<ImpliedDividendPayment> {
-    let sorted = sort_transactions(txs);
-    events
-        .iter()
-        .filter_map(|(ex_date, amount)| {
-            let shares_held = shares_on_date(&sorted, ex_date);
-            (shares_held > 0.0).then(|| ImpliedDividendPayment {
-                ex_date: ex_date.clone(),
-                amount_per_share: *amount,
-                shares_held,
-                total_payment: shares_held * amount,
-            })
-        })
-        .collect()
-}
-
 /// Full per-symbol position: remaining lots plus the sold-side aggregates,
 /// with dividends attributed once (holdings side while shares remain, sold
 /// side once fully closed).
@@ -1611,8 +1582,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // shares_on_date / implied_dividend_payments — the dividend-eligibility
-    // ledger walk shared by the API and the dividends daemon.
+    // shares_on_date — the dividend-eligibility ledger walk.
     // -------------------------------------------------------------------------
 
     #[test]
@@ -1636,23 +1606,5 @@ mod tests {
             make_tx(2, "sale", "2026-02-01", Some(15.0), Some(12.0)), // recorded over-sell
         ];
         assert!(close(shares_on_date(&txs, "2026-03-01"), 0.0));
-    }
-
-    #[test]
-    fn implied_payments_skip_ineligible_ex_dates() {
-        let txs = vec![
-            make_tx(1, "purchase", "2026-01-05", Some(100.0), Some(10.0)),
-            make_tx(2, "sale", "2026-03-02", Some(100.0), Some(12.0)),
-        ];
-        let events = vec![
-            ("2026-01-01".to_string(), 0.50), // before purchase — no shares
-            ("2026-02-01".to_string(), 0.50), // 100 shares held
-            ("2026-04-01".to_string(), 0.50), // fully sold — no shares
-        ];
-        let payments = implied_dividend_payments(&txs, &events);
-        assert_eq!(payments.len(), 1);
-        assert_eq!(payments[0].ex_date, "2026-02-01");
-        assert!(close(payments[0].shares_held, 100.0));
-        assert!(close(payments[0].total_payment, 50.0));
     }
 }

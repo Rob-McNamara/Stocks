@@ -54,8 +54,8 @@ pub(crate) struct DividendRefreshResult {
     pub(crate) errors: Vec<String>,
 }
 
-/// Thin wrappers over `stocks::dividends`, shared with the dividends daemon so
-/// the two can never again store events differently.
+/// Thin wrappers over `stocks::dividends`, which holds the fetching and
+/// storing rules.
 pub(crate) async fn fetch_dividend_events_for_symbol(client: &Client, symbol: &str) -> Result<Vec<DividendEvent>, String> {
     stocks::dividends::fetch_events(client, symbol).await
 }
@@ -631,8 +631,8 @@ pub(crate) fn load_dividend_events(db_path: &PathBuf, symbols: &std::collections
     Ok(events)
 }
 
-// The shares-held ledger walk lives in stocks::portfolio (shared with the
-// dividends daemon); these wrappers only adapt the API's row types.
+// The shares-held ledger walk lives in stocks::portfolio; these wrappers only
+// adapt the API's row types.
 pub(crate) fn calculate_dividend_payments(
     transactions: &[HoldingTransaction],
     events: &[DividendEvent],

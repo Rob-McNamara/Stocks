@@ -11,7 +11,7 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 
 /// Open the SQLite database with WAL mode and a busy timeout so the API,
-/// price daemon and dividends daemon can write concurrently without
+/// price daemon and backfill tools can write concurrently without
 /// intermittent "database is locked" failures.
 pub fn open_db<P: AsRef<Path>>(path: P) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(path)?;

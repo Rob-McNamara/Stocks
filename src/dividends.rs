@@ -1,11 +1,10 @@
-//! Fetching and storing dividend events — shared by the API and the dividends
-//! daemon.
+//! Fetching and storing dividend events.
 //!
-//! These used to be written twice. The API's copy learned to collapse Yahoo's
-//! repeated events and to replace a symbol's set rather than grow it; the
-//! daemon's copy did neither, so every daemon run put the duplicates back and
-//! the API then recorded the second copy as a real payment. One implementation
-//! means a fix to either reaches both.
+//! Yahoo repeats some events and its history moves, so a fetch is
+//! de-duplicated and replaces the symbol's stored set rather than adding to
+//! it. A separate dividends daemon once wrote events its own way, putting the
+//! duplicates back after every refresh; the API's refresh now does that job,
+//! and this is the only writer.
 
 use chrono::{NaiveDate, Utc};
 use reqwest::Client;
@@ -195,9 +194,7 @@ mod tests {
         stmt.query_map([], |r| r.get(0)).unwrap().flatten().collect()
     }
 
-    /// The store both binaries use collapses Yahoo's repeated event. The
-    /// daemon used to write it raw, re-creating the duplicate after every API
-    /// refresh had removed it.
+    /// Storing collapses Yahoo's repeated event, so it is paid once.
     #[test]
     fn storing_collapses_a_repeated_event() {
         let mut conn = memory_db();
