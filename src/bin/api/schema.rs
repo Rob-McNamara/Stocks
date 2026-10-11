@@ -256,6 +256,38 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
+    // A trust's annual tax statement (AMMA statement), one per symbol per
+    // income year, copied from its "Part A" summary.
+    //
+    // The cash a trust or ETF pays is not what goes on the return: the
+    // statement splits it into franked, foreign and capital-gain components and
+    // adjusts the units' cost base. None of that can be derived from the
+    // distributions themselves, so it is typed in. `fy` is the year the income
+    // year ends in (2026 = 2025–26); the column comments name the return labels.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tax_statements (
+            symbol TEXT NOT NULL,
+            fy INTEGER NOT NULL,
+            non_primary_income REAL,          -- 13U
+            franked_distributions REAL,       -- 13C
+            franking_credits REAL,            -- 13Q
+            tfn_withheld REAL,                -- 13R
+            total_capital_gains REAL,         -- 18H, discounted gains grossed up
+            net_capital_gain REAL,            -- 18A
+            assessable_foreign_income REAL,   -- 20E
+            other_net_foreign_income REAL,    -- 20M
+            foreign_tax_offset REAL,          -- 20O
+            -- AMIT cost base net amount: a shortfall raises the cost base of
+            -- the units held at 30 June, an excess lowers it.
+            amit_increase REAL,
+            amit_decrease REAL,
+            notes TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (symbol, fy)
+        );",
+    )
+    .map_err(|err| err.to_string())?;
+
     // Migrate: add columns if they don't exist
     add_column_if_missing(&conn, "holdings_transactions", "brokerage", "REAL")?;
     // Which cash account a trade settles against — the source of funds on a
@@ -268,6 +300,12 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
     // a single distribution, which varies with each payment's franking and
     // stops once a TFN is quoted.
     add_column_if_missing(&conn, "holdings_transactions", "withholding_amount", "REAL")?;
+    // A dividend's franking as its statement gives it, in AUD. Both null means
+    // "not entered": the tax report then falls back to the symbol's standing
+    // `symbol_info.franking_pct`, and failing that reports the franking as
+    // unknown rather than guessing. The unfranked amount is the remainder.
+    add_column_if_missing(&conn, "holdings_transactions", "franked_amount", "REAL")?;
+    add_column_if_missing(&conn, "holdings_transactions", "franking_credit", "REAL")?;
     // A trendline's two anchors. `price` above is the first anchor's price, so
     // an existing horizontal level needs no migration: its extra columns are
     // simply null.
@@ -283,6 +321,21 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
     // and Yahoo reports the gross distribution, so without this the ledger
     // credits money that never arrived.
     add_column_if_missing(&conn, "symbol_info", "dividend_withholding_pct", "REAL")?;
+    // How much of a symbol's dividends is usually franked, 0–100. A standing
+    // default, like the withholding rate: a dividend's own franked amount wins.
+    add_column_if_missing(&conn, "symbol_info", "franking_pct", "REAL")?;
+    // What the symbol's income is for tax: 'company' (an Australian company's
+    // dividends), 'trust' (a trust or ETF's distributions, reported from its
+    // annual tax statement) or 'foreign'. Null means the tax report guesses
+    // from the currency, withholding and instrument type, and says so.
+    add_column_if_missing(&conn, "symbol_info", "income_kind", "TEXT")?;
+    // How much of a holding is the user's for tax, 0–100; null is all of it.
+    // 0 leaves the symbol out of the tax report — a partner's shares tracked
+    // here but taxed on their return — and 50 suits one held jointly.
+    add_column_if_missing(&conn, "symbol_info", "tax_share_pct", "REAL")?;
+    // The same for a cash account: a joint account's interest is taxed half
+    // to each holder, so its interest and fees are reported at this share.
+    add_column_if_missing(&conn, "cash_accounts", "tax_share_pct", "REAL")?;
     // Session OHLC for the cached live price, so today's candle is complete
     // before the daily bar lands in `prices`.
     add_column_if_missing(&conn, "cached_current_prices", "day_open", "REAL")?;
@@ -473,6 +526,9 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
         DROP TRIGGER IF EXISTS audit_cash_transactions_insert;
         DROP TRIGGER IF EXISTS audit_cash_transactions_update;
         DROP TRIGGER IF EXISTS audit_cash_transactions_delete;
+        DROP TRIGGER IF EXISTS audit_tax_statements_insert;
+        DROP TRIGGER IF EXISTS audit_tax_statements_update;
+        DROP TRIGGER IF EXISTS audit_tax_statements_delete;
     ";
     conn.execute_batch(drop_trigger_sql).map_err(|err| err.to_string())?;
 
@@ -555,7 +611,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'INSERT', CAST(NEW.id AS TEXT), NULL,
                 json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
                     'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
-                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount));
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount, 'franked_amount', NEW.franked_amount, 'franking_credit', NEW.franking_credit));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_update AFTER UPDATE ON holdings_transactions
         BEGIN
@@ -563,10 +619,10 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'UPDATE', CAST(NEW.id AS TEXT),
                 json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
                     'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
-                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount),
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount, 'franked_amount', OLD.franked_amount, 'franking_credit', OLD.franking_credit),
                 json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
                     'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
-                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount));
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount, 'franked_amount', NEW.franked_amount, 'franking_credit', NEW.franking_credit));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_delete AFTER DELETE ON holdings_transactions
         BEGIN
@@ -574,7 +630,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'DELETE', CAST(OLD.id AS TEXT),
                 json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
                     'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
-                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount), NULL);
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount, 'franked_amount', OLD.franked_amount, 'franking_credit', OLD.franking_credit), NULL);
         END;
 
         -- holdings_custom_fields
@@ -652,7 +708,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_accounts', 'INSERT', CAST(NEW.id AS TEXT), NULL,
                 json_object('id', NEW.id, 'name', NEW.name, 'currency', NEW.currency,
                     'interest_rate', NEW.interest_rate, 'include_in_portfolio', NEW.include_in_portfolio,
-                    'notes', NEW.notes, 'created_at', NEW.created_at));
+                    'notes', NEW.notes, 'created_at', NEW.created_at, 'tax_share_pct', NEW.tax_share_pct));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_cash_accounts_update AFTER UPDATE ON cash_accounts
         BEGIN
@@ -660,10 +716,10 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_accounts', 'UPDATE', CAST(NEW.id AS TEXT),
                 json_object('id', OLD.id, 'name', OLD.name, 'currency', OLD.currency,
                     'interest_rate', OLD.interest_rate, 'include_in_portfolio', OLD.include_in_portfolio,
-                    'notes', OLD.notes, 'created_at', OLD.created_at),
+                    'notes', OLD.notes, 'created_at', OLD.created_at, 'tax_share_pct', OLD.tax_share_pct),
                 json_object('id', NEW.id, 'name', NEW.name, 'currency', NEW.currency,
                     'interest_rate', NEW.interest_rate, 'include_in_portfolio', NEW.include_in_portfolio,
-                    'notes', NEW.notes, 'created_at', NEW.created_at));
+                    'notes', NEW.notes, 'created_at', NEW.created_at, 'tax_share_pct', NEW.tax_share_pct));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_cash_accounts_delete AFTER DELETE ON cash_accounts
         BEGIN
@@ -671,7 +727,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'cash_accounts', 'DELETE', CAST(OLD.id AS TEXT),
                 json_object('id', OLD.id, 'name', OLD.name, 'currency', OLD.currency,
                     'interest_rate', OLD.interest_rate, 'include_in_portfolio', OLD.include_in_portfolio,
-                    'notes', OLD.notes, 'created_at', OLD.created_at), NULL);
+                    'notes', OLD.notes, 'created_at', OLD.created_at, 'tax_share_pct', OLD.tax_share_pct), NULL);
         END;
 
         -- cash_transactions
@@ -755,7 +811,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'INSERT', NEW.symbol, NULL,
                 json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name,
-                    'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'updated_at', NEW.updated_at));
+                    'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'franking_pct', NEW.franking_pct, 'income_kind', NEW.income_kind, 'tax_share_pct', NEW.tax_share_pct, 'updated_at', NEW.updated_at));
         END;
         -- Only a real change is recorded. Every quote upserts the row and
         -- bumps updated_at; recording those wrote ~16,000 identical rows a
@@ -765,20 +821,68 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
           OR OLD.long_name IS NOT NEW.long_name
           OR OLD.currency IS NOT NEW.currency
           OR OLD.dividend_withholding_pct IS NOT NEW.dividend_withholding_pct
+          OR OLD.franking_pct IS NOT NEW.franking_pct
+          OR OLD.income_kind IS NOT NEW.income_kind
+          OR OLD.tax_share_pct IS NOT NEW.tax_share_pct
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'UPDATE', NEW.symbol,
                 json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name,
-                    'currency', OLD.currency, 'dividend_withholding_pct', OLD.dividend_withholding_pct, 'updated_at', OLD.updated_at),
+                    'currency', OLD.currency, 'dividend_withholding_pct', OLD.dividend_withholding_pct, 'franking_pct', OLD.franking_pct, 'income_kind', OLD.income_kind, 'tax_share_pct', OLD.tax_share_pct, 'updated_at', OLD.updated_at),
                 json_object('symbol', NEW.symbol, 'instrument_type', NEW.instrument_type, 'long_name', NEW.long_name,
-                    'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'updated_at', NEW.updated_at));
+                    'currency', NEW.currency, 'dividend_withholding_pct', NEW.dividend_withholding_pct, 'franking_pct', NEW.franking_pct, 'income_kind', NEW.income_kind, 'tax_share_pct', NEW.tax_share_pct, 'updated_at', NEW.updated_at));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_symbol_info_delete AFTER DELETE ON symbol_info
         BEGIN
             INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'symbol_info', 'DELETE', OLD.symbol,
                 json_object('symbol', OLD.symbol, 'instrument_type', OLD.instrument_type, 'long_name', OLD.long_name,
-                    'currency', OLD.currency, 'dividend_withholding_pct', OLD.dividend_withholding_pct, 'updated_at', OLD.updated_at), NULL);
+                    'currency', OLD.currency, 'dividend_withholding_pct', OLD.dividend_withholding_pct, 'franking_pct', OLD.franking_pct, 'income_kind', OLD.income_kind, 'tax_share_pct', OLD.tax_share_pct, 'updated_at', OLD.updated_at), NULL);
+        END;
+
+        -- tax_statements
+        CREATE TRIGGER IF NOT EXISTS audit_tax_statements_insert AFTER INSERT ON tax_statements
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'tax_statements', 'INSERT', NEW.symbol || ':' || NEW.fy, NULL,
+                json_object('symbol', NEW.symbol, 'fy', NEW.fy, 'non_primary_income', NEW.non_primary_income,
+                    'franked_distributions', NEW.franked_distributions, 'franking_credits', NEW.franking_credits,
+                    'tfn_withheld', NEW.tfn_withheld, 'total_capital_gains', NEW.total_capital_gains,
+                    'net_capital_gain', NEW.net_capital_gain, 'assessable_foreign_income', NEW.assessable_foreign_income,
+                    'other_net_foreign_income', NEW.other_net_foreign_income, 'foreign_tax_offset', NEW.foreign_tax_offset,
+                    'amit_increase', NEW.amit_increase, 'amit_decrease', NEW.amit_decrease, 'notes', NEW.notes,
+                    'updated_at', NEW.updated_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_tax_statements_update AFTER UPDATE ON tax_statements
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'tax_statements', 'UPDATE', NEW.symbol || ':' || NEW.fy,
+                json_object('symbol', OLD.symbol, 'fy', OLD.fy, 'non_primary_income', OLD.non_primary_income,
+                    'franked_distributions', OLD.franked_distributions, 'franking_credits', OLD.franking_credits,
+                    'tfn_withheld', OLD.tfn_withheld, 'total_capital_gains', OLD.total_capital_gains,
+                    'net_capital_gain', OLD.net_capital_gain, 'assessable_foreign_income', OLD.assessable_foreign_income,
+                    'other_net_foreign_income', OLD.other_net_foreign_income, 'foreign_tax_offset', OLD.foreign_tax_offset,
+                    'amit_increase', OLD.amit_increase, 'amit_decrease', OLD.amit_decrease, 'notes', OLD.notes,
+                    'updated_at', OLD.updated_at),
+                json_object('symbol', NEW.symbol, 'fy', NEW.fy, 'non_primary_income', NEW.non_primary_income,
+                    'franked_distributions', NEW.franked_distributions, 'franking_credits', NEW.franking_credits,
+                    'tfn_withheld', NEW.tfn_withheld, 'total_capital_gains', NEW.total_capital_gains,
+                    'net_capital_gain', NEW.net_capital_gain, 'assessable_foreign_income', NEW.assessable_foreign_income,
+                    'other_net_foreign_income', NEW.other_net_foreign_income, 'foreign_tax_offset', NEW.foreign_tax_offset,
+                    'amit_increase', NEW.amit_increase, 'amit_decrease', NEW.amit_decrease, 'notes', NEW.notes,
+                    'updated_at', NEW.updated_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_tax_statements_delete AFTER DELETE ON tax_statements
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'tax_statements', 'DELETE', OLD.symbol || ':' || OLD.fy,
+                json_object('symbol', OLD.symbol, 'fy', OLD.fy, 'non_primary_income', OLD.non_primary_income,
+                    'franked_distributions', OLD.franked_distributions, 'franking_credits', OLD.franking_credits,
+                    'tfn_withheld', OLD.tfn_withheld, 'total_capital_gains', OLD.total_capital_gains,
+                    'net_capital_gain', OLD.net_capital_gain, 'assessable_foreign_income', OLD.assessable_foreign_income,
+                    'other_net_foreign_income', OLD.other_net_foreign_income, 'foreign_tax_offset', OLD.foreign_tax_offset,
+                    'amit_increase', OLD.amit_increase, 'amit_decrease', OLD.amit_decrease, 'notes', OLD.notes,
+                    'updated_at', OLD.updated_at), NULL);
         END;
     ";
     conn.execute_batch(trigger_sql).map_err(|err| err.to_string())?;

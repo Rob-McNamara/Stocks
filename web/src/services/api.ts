@@ -444,6 +444,11 @@ export interface LedgerRow {
   notes: string | null
   /** Settlement account the trade draws on; null for dividend events and unlinked trades */
   cash_account_id: number | null
+  /** Tax withheld from a dividend, in its currency; null when not recorded */
+  withholding_amount?: number | null
+  /** A dividend's franked amount and franking credit (AUD) from its statement */
+  franked_amount?: number | null
+  franking_credit?: number | null
   /** true for fetched dividend events (per-share amounts); false for manual rows (totals) */
   per_share: boolean
   payment_date: string | null
@@ -495,6 +500,13 @@ export interface HoldingTransactionPayload {
    * The account's currency must match the trade's.
    */
   cash_account_id?: number | null
+  /**
+   * A dividend's tax figures from its statement. Omit to keep what is stored;
+   * null clears it.
+   */
+  withholding_amount?: number | null
+  franked_amount?: number | null
+  franking_credit?: number | null
   /** Acknowledge an over-sell warning (server responds 409 otherwise) */
   confirm?: boolean
 }
@@ -522,6 +534,188 @@ export async function downloadCashAccountCsv(accountId: number): Promise<void> {
   link.remove()
   // Revoked after a beat: Safari starts the download asynchronously and fails
   // it if the URL is already gone.
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// ---------------------------------------------------------------------------
+// Tax report
+// ---------------------------------------------------------------------------
+
+export const TAX_SECTION_KEYS = ['checks', 'cgt', 'dividends', 'foreign', 'interest', 'trusts', 'deductions', 'planning'] as const
+export type TaxSectionKey = (typeof TAX_SECTION_KEYS)[number]
+
+export interface TaxYearOption {
+  /** The year the income year ends in: 2026 is 2025–26 */
+  fy: number
+  label: string
+  start: string
+  end: string
+  in_progress: boolean
+}
+
+/** 'entry' is a blank box for the user to fill in; its cells are always null. */
+export type TaxColumnKind = 'text' | 'date' | 'quantity' | 'money' | 'price' | 'rate' | 'integer' | 'entry'
+
+export interface TaxTable {
+  title: string
+  columns: { label: string; kind: TaxColumnKind }[]
+  rows: (string | number | null)[][]
+}
+
+export interface TaxSummaryLine {
+  /** The return label, such as "18A"; null for a working figure */
+  item: string | null
+  label: string
+  amount: number | null
+  /** A non-numeric answer, such as "Yes" */
+  value: string | null
+  note: string | null
+}
+
+export interface TaxReportSection {
+  key: string
+  title: string
+  summary: TaxSummaryLine[]
+  tables: TaxTable[]
+  notes: string[]
+  /** The section as plain text, ready to copy */
+  text: string
+}
+
+export interface TaxCheck {
+  severity: 'warn' | 'info'
+  section: string
+  message: string
+}
+
+export type IncomeKind = 'company' | 'trust' | 'foreign'
+
+export interface SymbolTaxSettings {
+  symbol: string
+  name: string | null
+  currency: string
+  income_kind: IncomeKind
+  /** false when the income type was worked out rather than chosen */
+  income_kind_set: boolean
+  franking_pct: number | null
+  withholding_pct: number | null
+  /** The user's share of the holding, 0–100; null is all of it. 0 leaves it out. */
+  share_pct: number | null
+}
+
+export interface AccountTaxSettings {
+  id: number
+  name: string
+  currency: string
+  /** The user's share of the account, 0–100; null is all of it. */
+  share_pct: number | null
+  /** Interest credited in the year (AUD), before the share is applied */
+  interest_aud: number
+}
+
+/** A symbol or cash account set to less than 100% the user's. */
+export interface PartialOwnership {
+  kind: 'symbol' | 'account'
+  name: string
+  share_pct: number
+}
+
+/** A trust's annual tax statement, AUD, keyed by return label. */
+export interface TaxStatementFigures {
+  non_primary_income?: number | null
+  franked_distributions?: number | null
+  franking_credits?: number | null
+  tfn_withheld?: number | null
+  total_capital_gains?: number | null
+  net_capital_gain?: number | null
+  assessable_foreign_income?: number | null
+  other_net_foreign_income?: number | null
+  foreign_tax_offset?: number | null
+  amit_increase?: number | null
+  amit_decrease?: number | null
+  notes?: string | null
+}
+
+export interface TaxStatement extends TaxStatementFigures {
+  symbol: string
+  fy: number
+  updated_at: string
+}
+
+export interface TaxStatementRow {
+  symbol: string
+  name: string | null
+  /** Distributions assessed in the year, AUD */
+  cash_aud: number
+  distributions: number
+  statement: TaxStatement | null
+}
+
+export interface TaxReport {
+  fy: number
+  label: string
+  start: string
+  end: string
+  entity: string
+  generated_at: string
+  in_progress: boolean
+  detail: 'full' | 'summary'
+  last_exported_at: string | null
+  losses_carried_in: number
+  losses_carried_in_source: 'computed' | 'entered'
+  included: TaxSectionKey[]
+  checks: TaxCheck[]
+  sections: TaxReportSection[]
+  symbols: SymbolTaxSettings[]
+  statements: TaxStatementRow[]
+  accounts: AccountTaxSettings[]
+  /** What is left out or counted only in part, because it isn't all the user's */
+  ownership: string[]
+  /** What the user still has to fill in: tables with blank 'entry' columns */
+  worksheet: TaxTable[]
+  /** The whole report as plain text, ready to copy */
+  text: string
+}
+
+export interface TaxReportParams {
+  fy: number
+  sections: TaxSectionKey[]
+  detail: 'full' | 'summary'
+  /** Net capital losses carried in; omit to have them worked out */
+  lossesCarriedIn?: number | null
+}
+
+function taxReportUrl(params: TaxReportParams, format: 'json' | 'csv'): string {
+  const qs = new URLSearchParams({
+    fy: String(params.fy),
+    sections: params.sections.join(','),
+    detail: params.detail,
+    format,
+  })
+  if (params.lossesCarriedIn != null) qs.set('losses_carried_in', String(params.lossesCarriedIn))
+  return `${API_BASE_URL}/tax/report?${qs.toString()}`
+}
+
+/**
+ * Download a year's tax report as CSV, saved under the server's filename.
+ * Fetched rather than linked, for the same reason as the cash export: a link
+ * cannot carry the bearer token.
+ */
+export async function downloadTaxReportCsv(params: TaxReportParams): Promise<void> {
+  const response = await apiFetch(taxReportUrl(params, 'csv'))
+  if (!response.ok) {
+    throw new Error((await apiErrorMessage(response)) || 'Failed to download the tax report')
+  }
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? `tax-report-${params.fy}.csv`
+  const url = URL.createObjectURL(await response.blob())
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  // Revoked after a beat: Safari starts the download asynchronously.
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
@@ -869,6 +1063,72 @@ export const apiClient = {
   },
 
   /** Unified transaction + dividend-event ledger, merged and deduped server-side. */
+  async getTaxYears(): Promise<{ years: TaxYearOption[]; default_fy: number; ownership?: PartialOwnership[] }> {
+    const response = await apiFetch(`${API_BASE_URL}/tax/years`)
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to load tax years')
+    return response.json()
+  },
+
+  async getTaxReport(params: TaxReportParams): Promise<TaxReport> {
+    const response = await apiFetch(taxReportUrl(params, 'json'))
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to generate the tax report')
+    return response.json()
+  },
+
+  /** Absent fields are left alone; null clears one (an income type returns to the guess). */
+  async updateSymbolTaxSettings(
+    symbol: string,
+    payload: {
+      income_kind?: IncomeKind | null
+      franking_pct?: number | null
+      dividend_withholding_pct?: number | null
+      /** 0–100; 0 leaves the symbol out of the report, null makes it all the user's */
+      tax_share_pct?: number | null
+    },
+  ): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/tax/symbols/${encodeURIComponent(symbol)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || `Failed to save tax settings for ${symbol}`)
+  },
+
+  /** The user's share of a cash account's interest and fees; null makes it all theirs. */
+  async updateAccountTaxShare(accountId: number, sharePct: number | null): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/tax/accounts/${accountId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tax_share_pct: sharePct }),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to save the account share')
+  },
+
+  async saveTaxStatement(symbol: string, fy: number, figures: TaxStatementFigures): Promise<TaxStatement> {
+    const response = await apiFetch(`${API_BASE_URL}/tax/statements/${encodeURIComponent(symbol)}/${fy}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(figures),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || `Failed to save the ${symbol} statement`)
+    return response.json()
+  },
+
+  async deleteTaxStatement(symbol: string, fy: number): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/tax/statements/${encodeURIComponent(symbol)}/${fy}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || `Failed to delete the ${symbol} statement`)
+  },
+
+  /** Note that a year's report was copied or downloaded, so later edits to that year are flagged. */
+  async recordTaxExport(fy: number): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/tax/exports`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fy }),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to record the export')
+  },
+
   async getTransactionsLedger(): Promise<{ rows: LedgerRow[] }> {
     const response = await apiFetch(`${API_BASE_URL}/transactions/ledger`)
     if (!response.ok) {

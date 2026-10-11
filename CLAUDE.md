@@ -45,7 +45,7 @@ database and is **not** one of them:
 
 - `watchlist_prices` — daily OHLC bars, superseded by `prices`. `init_db()` has
   not created it for some time and nothing writes to it, so a database created
-  today has 18 tables and no such table; one carried forward from an older
+  today has 19 tables and no such table; one carried forward from an older
   version still has it, holding whatever it held when writes stopped.
 
 It needs no triggers, and adding them would be wrong: a fresh database would
@@ -65,9 +65,10 @@ Shared by every binary, in `src/` (the `stocks` library):
 - `yahoo.rs` — Yahoo chart response types and `local_date` (bars and events are dated in exchange time).
 - `prices.rs` — `upsert_daily_bar`, the one writer for `prices` (refuses zero closes, keeps backfilled OHLC).
 - `dividends.rs` — fetching, de-duplicating and storing dividend events.
-- `portfolio.rs`, `indicators.rs`, `hindsight.rs` — the calculation engines.
+- `portfolio.rs`, `indicators.rs`, `hindsight.rs` — the calculation engines. `portfolio::walk_parcels` is the one FIFO walk that matches sales to purchases parcel by parcel; reuse it rather than keeping another lot queue.
+- `tax.rs` — Australian income-tax rules for the tax report: income years, the 12-month CGT discount, loss ordering, franking gross-up.
 
-The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `charts`, `analysis`, `refresh`, `config`, plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
+The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
 
 A write that touches more than one row goes through `with_tx`, so it commits all-or-nothing.
 

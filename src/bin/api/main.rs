@@ -20,6 +20,7 @@ mod refresh;
 mod analysis;
 mod cash;
 mod charts;
+mod tax;
 mod valuation;
 use market::{
     fetch_current_price, fetch_histories, http_client, fetch_price_history, fx_pair_symbol, fx_rate_on,
@@ -42,6 +43,7 @@ use refresh::*;
 use analysis::*;
 use cash::*;
 use charts::*;
+use tax::*;
 use valuation::*;
 use stocks::db::{insert_event_log, open_db};
 
@@ -233,6 +235,9 @@ impl utoipa::Modify for SecurityAddon {
         get_dividends, refresh_dividends, refresh_sold_dividends, refresh_all,
         get_analysis_history, post_stock_analysis, delete_analysis_history,
         get_config, update_config, get_events,
+        get_tax_years, get_tax_report, update_symbol_tax_settings,
+        save_tax_statement, delete_tax_statement, record_tax_export,
+        update_account_tax_share,
     ),
     modifiers(&SecurityAddon)
 )]
@@ -384,6 +389,13 @@ async fn main() -> std::io::Result<()> {
             .service(get_portfolio_sold)
             .service(get_portfolio_risk)
             .service(get_hindsight)
+            .service(get_tax_years)
+            .service(get_tax_report)
+            .service(update_symbol_tax_settings)
+            .service(save_tax_statement)
+            .service(delete_tax_statement)
+            .service(record_tax_export)
+            .service(update_account_tax_share)
             .service(get_meta)
             .service(get_sync_state)
             .service(openapi_spec)

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react'
 import Transactions from './Transactions'
 
 vi.mock('../services/api', async (importOriginal) => {
@@ -14,6 +14,7 @@ vi.mock('../services/api', async (importOriginal) => {
       getFxRateForDate: vi.fn(),
       updateHoldingTransaction: vi.fn(),
       removeHoldingTransaction: vi.fn(),
+      getTaxYears: vi.fn(),
     },
   }
 })
@@ -54,7 +55,7 @@ function row(overrides: Record<string, unknown> = {}) {
 const LEDGER = [
   row({ key: 'a', id: 1, symbol: 'ZZZ.AX', date: '2026-03-01', quantity: 10, price: 5, brokerage: 9.5, cash_account_id: 6 }),
   row({ key: 'b', id: 2, symbol: 'AAA.AX', date: '2026-01-15', quantity: 2, price: 3, brokerage: 1.25, cash_account_id: 2, notes: 'zebra' }),
-  row({ key: 'c', id: 3, symbol: 'MMM.AX', date: '2026-02-10', transaction_type: 'dividend', quantity: null, price: null, amount: 300, brokerage: null, cash_account_id: 6, notes: 'apple' }),
+  row({ key: 'c', id: 3, symbol: 'MMM.AX', date: '2026-02-10', transaction_type: 'dividend', quantity: null, price: null, amount: 300, brokerage: null, cash_account_id: 6, notes: 'apple', franked_amount: 300, franking_credit: 128.57 }),
   row({ key: 'd', id: null, symbol: 'DDD.AX', date: '2026-02-20', transaction_type: 'dividend', quantity: null, price: null, amount: 0.5, per_share: true, brokerage: null, cash_account_id: null }),
 ]
 
@@ -140,5 +141,36 @@ describe('transactions table sorting', () => {
     await renderScreen()
     fireEvent.click(header('Notes'))
     expect(column(1).slice(0, 2)).toEqual(['MMM.AX', 'AAA.AX'])
+  })
+})
+
+describe('tax figures', () => {
+  it('opens the tax report from the screen header', async () => {
+    mocked.getTaxYears.mockResolvedValue({ default_fy: 2026, years: [] })
+    await renderScreen()
+    fireEvent.click(screen.getByText('Tax report…'))
+    expect(await screen.findByRole('dialog', { name: 'Tax report' })).toBeTruthy()
+  })
+
+  /** The form shows what is stored, so what it sends back is the whole truth:
+   *  a kept figure, a changed one, and a blank sent as null to clear. */
+  it("edits a dividend's franking and withholding from its statement", async () => {
+    mocked.updateHoldingTransaction.mockResolvedValue({})
+    await renderScreen()
+    const dividendRow = screen.getByText('MMM.AX').closest('tr')!
+    fireEvent.click(within(dividendRow).getByText('Edit'))
+
+    const field = (label: string) => screen.getByText(label).parentElement!.querySelector('input') as HTMLInputElement
+    expect(field('Franked amount').value).toBe('300')
+    expect(field('Franking credit').value).toBe('128.57')
+    expect(field('Tax withheld').value).toBe('')
+    fireEvent.change(field('Franking credit'), { target: { value: '128.58' } })
+    fireEvent.click(screen.getByText('Save'))
+
+    await waitFor(() => expect(mocked.updateHoldingTransaction).toHaveBeenCalled())
+    const payload = mocked.updateHoldingTransaction.mock.calls[0][1]
+    expect(payload.franked_amount).toBe(300)
+    expect(payload.franking_credit).toBe(128.58)
+    expect(payload.withholding_amount).toBeNull()
   })
 })

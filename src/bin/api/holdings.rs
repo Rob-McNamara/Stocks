@@ -22,6 +22,12 @@ pub(crate) struct HoldingTransaction {
     pub(crate) fx_rate: Option<f64>,
     /// Cash account this trade settles against, when it has one.
     pub(crate) cash_account_id: Option<i64>,
+    /// Tax withheld from a dividend, in the transaction's currency.
+    pub(crate) withholding_amount: Option<f64>,
+    /// A dividend's franked amount and franking credit, AUD, as its statement
+    /// gives them. Null when not entered.
+    pub(crate) franked_amount: Option<f64>,
+    pub(crate) franking_credit: Option<f64>,
     #[serde(default)]
     pub(crate) custom_fields: std::collections::HashMap<String, String>,
 }
@@ -49,6 +55,13 @@ pub(crate) struct NewHoldingTransaction {
     /// TFN-withheld payment can be corrected back to none.
     #[serde(default, deserialize_with = "deserialize_explicit_null")]
     pub(crate) withholding_amount: Option<Option<f64>>,
+    /// A dividend's franked amount from its statement, AUD. Absent keeps the
+    /// stored figure on an edit; `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_explicit_null")]
+    pub(crate) franked_amount: Option<Option<f64>>,
+    /// The franking credit from the statement, AUD. Same semantics.
+    #[serde(default, deserialize_with = "deserialize_explicit_null")]
+    pub(crate) franking_credit: Option<Option<f64>>,
     /// Set true to record a sale of more shares than currently held
     /// (the API responds 409 with a warning otherwise).
     pub(crate) confirm: Option<bool>,
@@ -278,6 +291,7 @@ pub(crate) const SYMBOL_KEYED_TABLES: &[&str] = &[
     "watchlist_prices",
     "watchlist_symbol_fields",
     "stock_analysis_messages",
+    "tax_statements",
 ];
 
 /// app_config keys that end in a symbol, and so follow it on a rename.
@@ -521,6 +535,9 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
             "brokerage": tx.brokerage,
             "notes": tx.notes,
             "cash_account_id": tx.cash_account_id,
+            "withholding_amount": tx.withholding_amount,
+            "franked_amount": tx.franked_amount,
+            "franking_credit": tx.franking_credit,
             "per_share": false,
             "payment_date": serde_json::Value::Null,
             "custom_fields": tx.custom_fields,
@@ -588,6 +605,9 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
                     // Synthetic rows from dividend_events, not stored trades, so
                     // they have no settlement account to carry.
                     "cash_account_id": serde_json::Value::Null,
+                    "withholding_amount": serde_json::Value::Null,
+                    "franked_amount": serde_json::Value::Null,
+                    "franking_credit": serde_json::Value::Null,
                     "per_share": true,
                     "payment_date": payment_date,
                     "custom_fields": serde_json::json!({}),
@@ -605,7 +625,7 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
 }
 
 /// The columns `HoldingTransaction::from_row` reads, in its order.
-pub(crate) const HOLDING_COLUMNS: &str = "id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id";
+pub(crate) const HOLDING_COLUMNS: &str = "id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount, franked_amount, franking_credit";
 
 impl HoldingTransaction {
     /// One row selected with `HOLDING_COLUMNS`. The one place the mapping is
@@ -628,6 +648,9 @@ impl HoldingTransaction {
             original_price: row.get(11)?,
             fx_rate: row.get(12)?,
             cash_account_id: row.get(13)?,
+            withholding_amount: row.get(14)?,
+            franked_amount: row.get(15)?,
+            franking_credit: row.get(16)?,
             custom_fields: std::collections::HashMap::new(),
         })
     }
@@ -722,8 +745,8 @@ pub(crate) fn insert_holding_transaction(
         let created_at = Utc::now().to_rfc3339();
         let currency = transaction.currency.as_deref().unwrap_or("AUD");
         conn.execute(
-            "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount, franked_amount, franking_credit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 symbol,
                 tx_type,
@@ -739,6 +762,8 @@ pub(crate) fn insert_holding_transaction(
                 transaction.fx_rate,
                 transaction.cash_account_id,
                 transaction.withholding_amount.flatten(),
+                transaction.franked_amount.flatten(),
+                transaction.franking_credit.flatten(),
             ],
         )
         .map_err(|err| err.to_string())?;
@@ -884,7 +909,7 @@ pub(crate) fn modify_holding_transaction(
 
         let currency = transaction.currency.as_deref().unwrap_or("AUD");
         conn.execute(
-            "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11, cash_account_id = ?13, withholding_amount = CASE WHEN ?15 THEN ?14 ELSE withholding_amount END WHERE id = ?12",
+            "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11, cash_account_id = ?13, withholding_amount = CASE WHEN ?15 THEN ?14 ELSE withholding_amount END, franked_amount = CASE WHEN ?17 THEN ?16 ELSE franked_amount END, franking_credit = CASE WHEN ?19 THEN ?18 ELSE franking_credit END WHERE id = ?12",
             params![
                 symbol,
                 tx_type,
@@ -901,6 +926,10 @@ pub(crate) fn modify_holding_transaction(
                 transaction.cash_account_id,
                 transaction.withholding_amount.flatten(),
                 transaction.withholding_amount.is_some(),
+                transaction.franked_amount.flatten(),
+                transaction.franked_amount.is_some(),
+                transaction.franking_credit.flatten(),
+                transaction.franking_credit.is_some(),
             ],
         )
         .map_err(|err| err.to_string())?;

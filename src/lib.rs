@@ -10,4 +10,5 @@ pub mod http;
 pub mod indicators;
 pub mod portfolio;
 pub mod prices;
+pub mod tax;
 pub mod yahoo;

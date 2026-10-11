@@ -355,6 +355,8 @@ pub(crate) fn record_new_dividends(db_path: &PathBuf) -> Result<DividendRecordRe
             custom_fields: None,
             cash_account_id: Some(account_id),
             withholding_amount: None,
+            franked_amount: None,
+            franking_credit: None,
             confirm: None,
         };
         if currency != "AUD" {

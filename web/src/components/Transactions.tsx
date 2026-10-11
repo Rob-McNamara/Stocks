@@ -1,6 +1,7 @@
 import { useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { apiClient, OversellError, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
 import { settlementAccountsFor, settlesByConversion } from '../utils/cash'
+import TaxReport from './TaxReport'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
@@ -38,6 +39,10 @@ interface EditState {
   notes: string
   /** Empty string means the trade settles against no account. */
   cash_account_id: string
+  /** A dividend's figures from its statement; empty means not recorded. */
+  withholding: string
+  franked: string
+  franking_credit: string
   custom_fields: Record<string, string>
 }
 
@@ -72,6 +77,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const [holdingsFieldDefs, setHoldingsFieldDefs] = useState<HoldingsFieldDef[]>([])
   // Server-driven currency list from /api/meta; static list is the offline fallback
   const [currencyOptions, setCurrencyOptions] = useState<string[]>([...SUPPORTED_CURRENCIES])
+  const [showTaxReport, setShowTaxReport] = useState(false)
 
   const loadLedger = async () => {
     const data = await apiClient.getTransactionsLedger()
@@ -240,6 +246,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       brokerage: row.brokerage !== null ? row.brokerage.toString() : '',
       notes: row.notes ?? '',
       cash_account_id: tx?.cash_account_id != null ? String(tx.cash_account_id) : '',
+      withholding: tx?.withholding_amount != null ? tx.withholding_amount.toString() : '',
+      franked: tx?.franked_amount != null ? tx.franked_amount.toString() : '',
+      franking_credit: tx?.franking_credit != null ? tx.franking_credit.toString() : '',
       custom_fields: tx?.custom_fields ?? {},
     })
   }
@@ -290,6 +299,14 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           payload.currency = 'AUD'
           payload.price = editing.price ? parseFloat(editing.price) : undefined
         }
+      }
+      if (editing.type === 'dividend') {
+        // Sent every time, as null when blank: the form shows what is stored,
+        // so a field emptied here is one the user means to clear.
+        const optional = (value: string) => (value.trim() === '' ? null : parseFloat(value))
+        payload.withholding_amount = optional(editing.withholding)
+        payload.franked_amount = optional(editing.franked)
+        payload.franking_credit = optional(editing.franking_credit)
       }
       if (Object.keys(editing.custom_fields).length > 0) {
         payload.custom_fields = editing.custom_fields
@@ -356,7 +373,12 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       <div className="manager-card">
         <div className="card-header">
           <h2>Transactions</h2>
-          <span style={{ color: '#888', fontSize: 14 }}>{rows.length} record{rows.length !== 1 ? 's' : ''}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span style={{ color: '#888', fontSize: 14 }}>{rows.length} record{rows.length !== 1 ? 's' : ''}</span>
+            <button className="btn btn-secondary btn-small" onClick={() => setShowTaxReport(true)}>
+              Tax report…
+            </button>
+          </div>
         </div>
 
         <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
@@ -562,10 +584,29 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                 </>
               )}
               {editing.type === 'dividend' && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  <label style={{ fontSize: 13, color: '#666' }}>Amount</label>
-                  <input type="number" min="0" step="0.01" className="config-input" value={editing.amount} onChange={(e) => setEditing({ ...editing, amount: e.target.value })} />
-                </div>
+                <>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: 13, color: '#666' }}>Amount</label>
+                    <input type="number" min="0" step="0.01" className="config-input" value={editing.amount} onChange={(e) => setEditing({ ...editing, amount: e.target.value })} />
+                  </div>
+                  <div style={{ display: 'flex', gap: 10 }}>
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <label style={{ fontSize: 13, color: '#666' }}>Tax withheld{editing.currency !== 'AUD' ? ` (${editing.currency})` : ''}</label>
+                      <input type="number" min="0" step="0.01" className="config-input" value={editing.withholding} placeholder="—" onChange={(e) => setEditing({ ...editing, withholding: e.target.value })} />
+                    </div>
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <label style={{ fontSize: 13, color: '#666' }}>Franked amount</label>
+                      <input type="number" min="0" step="0.01" className="config-input" value={editing.franked} placeholder="—" onChange={(e) => setEditing({ ...editing, franked: e.target.value })} />
+                    </div>
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <label style={{ fontSize: 13, color: '#666' }}>Franking credit</label>
+                      <input type="number" min="0" step="0.01" className="config-input" value={editing.franking_credit} placeholder="—" onChange={(e) => setEditing({ ...editing, franking_credit: e.target.value })} />
+                    </div>
+                  </div>
+                  <span style={{ fontSize: 12, color: '#888', marginTop: -6 }}>
+                    From the dividend statement. Leave blank to use the symbol&rsquo;s standing rates in the tax report.
+                  </span>
+                </>
               )}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <label style={{ fontSize: 13, color: '#666' }}>Notes</label>
@@ -593,6 +634,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           </div>
         </div>
       )}
+
+      {showTaxReport && <TaxReport onClose={() => setShowTaxReport(false)} />}
     </div>
   )
 }

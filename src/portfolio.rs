@@ -247,43 +247,209 @@ pub struct SaleCost {
     pub brokerage: Option<f64>,
 }
 
-/// Walk a symbol's transactions and cost each sale against the lots it consumed.
+/// A change to the cost base of every share held at the close of `date`,
+/// spread evenly across them. AUD; positive raises the cost base.
+///
+/// This is what an attribution managed investment trust (most ETFs) reports
+/// each year as its "AMIT cost base net amount": the gap between the cash it
+/// paid out and the income it attributed for tax, applied to the units held at
+/// the end of the income year. Ignoring it misstates the gain on every later
+/// sale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostBaseAdjustment {
+    pub date: String,
+    pub amount: f64,
+}
+
+/// The shares one sale took from one purchase.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParcelUse {
+    pub purchase_id: i64,
+    /// The purchase's date — what the CGT discount is measured from.
+    pub acquired: String,
+    pub quantity: f64,
+    /// AUD per share: the purchase price at its own rate, its brokerage, and
+    /// any cost-base adjustment made while the shares were held.
+    pub cost_per_share: f64,
+    /// The same cost in the symbol's own currency.
+    pub native_cost_per_share: f64,
+}
+
+/// One sale and the parcels it consumed, oldest first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaleMatch {
+    pub sale_id: i64,
+    pub date: String,
+    pub quantity: f64,
+    /// Sale price per share, AUD at the sale's own rate.
+    pub price: f64,
+    /// Sale price per share in the symbol's own currency.
+    pub native_price: f64,
+    /// AUD, for the whole sale.
+    pub brokerage: Option<f64>,
+    pub parcels: Vec<ParcelUse>,
+    /// Shares sold that no recorded purchase covers. Nonzero means part of the
+    /// sale has no cost base at all — a missing purchase, not a free one.
+    pub unmatched: f64,
+}
+
+/// Shares still held from one purchase after every sale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenParcel {
+    pub purchase_id: i64,
+    pub acquired: String,
+    pub quantity: f64,
+    pub cost_per_share: f64,
+    pub native_cost_per_share: f64,
+}
+
+/// Everything a FIFO walk of one symbol's history produces.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParcelWalk {
+    pub sales: Vec<SaleMatch>,
+    pub open: Vec<OpenParcel>,
+    /// Adjustments that could not be applied in full, as (date, AUD left
+    /// over): one dated when nothing was held, or a decrease larger than the
+    /// cost base it reduced. The excess of a decrease is a capital gain in its
+    /// own right, so it is reported rather than silently dropped.
+    pub unapplied: Vec<(String, f64)>,
+}
+
+/// Walk a symbol's transactions and match every sale to the parcels it
+/// consumed, first in first out.
 ///
 /// The FIFO queue is stateful, so which shares a sale consumes depends on every
 /// sale before it. That makes per-sale cost something only a full walk can
 /// answer, and the walk has to be this one — a second implementation would be
-/// free to disagree with the holdings screens about the same trade.
+/// free to disagree with the holdings screens about the same trade. The sale
+/// costs, the Sold Stocks screen and the tax report all read it.
 ///
-/// Native throughout: a sale and the purchase behind it are the same instrument
-/// on the same exchange, and converting either through a moving rate would put
-/// a currency move inside a comparison meant to isolate the stock's own.
-pub fn sale_costs(txs: &[PortfolioTx]) -> Vec<SaleCost> {
+/// Parcels keep their identity rather than being pooled, because the tax
+/// report needs each one's acquisition date: a single sale can take shares
+/// bought three years ago and shares bought last month, and only the first
+/// qualify for the CGT discount.
+///
+/// Purchases and sales enter on the same terms as `calc_symbol_summary`: a
+/// quantity and a price, and for a sale a positive quantity.
+pub fn walk_parcels(txs: &[PortfolioTx], adjustments: &[CostBaseAdjustment]) -> ParcelWalk {
     let sorted = sort_transactions(txs);
-    let mut native_lots: Vec<Lot> = Vec::new();
+    let mut pending: Vec<&CostBaseAdjustment> = adjustments.iter().collect();
+    pending.sort_by(|a, b| a.date.cmp(&b.date));
+    let mut pending = pending.into_iter().peekable();
+
+    let mut lots: Vec<OpenParcel> = Vec::new();
     let mut sales = Vec::new();
+    let mut unapplied = Vec::new();
 
     for tx in &sorted {
+        // An adjustment applies to what was held at the close of its date, so
+        // it lands before anything dated later and after anything that day.
+        while let Some(adjustment) = pending.next_if(|a| a.date < tx.date) {
+            apply_cost_adjustment(&mut lots, adjustment, &mut unapplied);
+        }
         match (tx.tx_type, tx.quantity, tx.price) {
             (TxType::Purchase, Some(qty), Some(price)) => {
-                let (_, native_lot) = purchase_lots(tx, qty, price);
-                native_lots.push(native_lot);
+                let (lot, native_lot) = purchase_lots(tx, qty, price);
+                lots.push(OpenParcel {
+                    purchase_id: tx.id,
+                    acquired: tx.date.clone(),
+                    quantity: qty,
+                    cost_per_share: lot.price,
+                    native_cost_per_share: native_lot.price,
+                });
             }
             (TxType::Sale, Some(qty), Some(price)) if qty > 0.0 => {
-                let cost = apply_fifo_sale(&mut native_lots, qty);
-                sales.push(SaleCost {
+                let mut remaining = qty;
+                let mut parcels = Vec::new();
+                while remaining > SHARE_EPSILON && !lots.is_empty() {
+                    let used = remaining.min(lots[0].quantity);
+                    if used > 0.0 {
+                        parcels.push(ParcelUse {
+                            purchase_id: lots[0].purchase_id,
+                            acquired: lots[0].acquired.clone(),
+                            quantity: used,
+                            cost_per_share: lots[0].cost_per_share,
+                            native_cost_per_share: lots[0].native_cost_per_share,
+                        });
+                    }
+                    lots[0].quantity -= used;
+                    remaining -= used;
+                    if lots[0].quantity <= SHARE_EPSILON {
+                        lots.remove(0);
+                    }
+                }
+                sales.push(SaleMatch {
+                    sale_id: tx.id,
                     date: tx.date.clone(),
                     quantity: qty,
+                    price,
                     native_price: tx.native_price.unwrap_or(price),
-                    // A sale with no lot behind it consumes nothing and costs
-                    // nothing, which is not the same as having cost zero.
-                    native_cost_per_share: if cost > 0.0 { Some(cost / qty) } else { None },
                     brokerage: tx.brokerage,
+                    parcels,
+                    unmatched: settle_shares(remaining.max(0.0)),
                 });
             }
             _ => {}
         }
     }
-    sales
+    for adjustment in pending {
+        apply_cost_adjustment(&mut lots, adjustment, &mut unapplied);
+    }
+
+    ParcelWalk { sales, open: lots, unapplied }
+}
+
+/// Spread one cost-base adjustment across the shares held, per share.
+fn apply_cost_adjustment(lots: &mut [OpenParcel], adjustment: &CostBaseAdjustment, unapplied: &mut Vec<(String, f64)>) {
+    let held: f64 = lots.iter().map(|l| l.quantity).sum();
+    if held <= SHARE_EPSILON {
+        if adjustment.amount.abs() >= 0.005 {
+            unapplied.push((adjustment.date.clone(), adjustment.amount));
+        }
+        return;
+    }
+    let per_share = adjustment.amount / held;
+    let mut excess = 0.0;
+    for lot in lots.iter_mut() {
+        // The native cost moves in proportion, so a lot keeps its own rate.
+        let ratio = if lot.cost_per_share > 0.0 { lot.native_cost_per_share / lot.cost_per_share } else { 1.0 };
+        let adjusted = lot.cost_per_share + per_share;
+        if adjusted < 0.0 {
+            excess += -adjusted * lot.quantity;
+            lot.cost_per_share = 0.0;
+            lot.native_cost_per_share = 0.0;
+        } else {
+            lot.cost_per_share = adjusted;
+            lot.native_cost_per_share += per_share * ratio;
+        }
+    }
+    if excess >= 0.005 {
+        unapplied.push((adjustment.date.clone(), -excess));
+    }
+}
+
+/// Cost each sale against the lots it consumed, in the symbol's own currency.
+///
+/// Native throughout: a sale and the purchase behind it are the same instrument
+/// on the same exchange, and converting either through a moving rate would put
+/// a currency move inside a comparison meant to isolate the stock's own.
+pub fn sale_costs(txs: &[PortfolioTx]) -> Vec<SaleCost> {
+    walk_parcels(txs, &[])
+        .sales
+        .into_iter()
+        .map(|sale| {
+            let cost: f64 = sale.parcels.iter().map(|p| p.quantity * p.native_cost_per_share).sum();
+            SaleCost {
+                date: sale.date,
+                quantity: sale.quantity,
+                native_price: sale.native_price,
+                // A sale with no lot behind it consumes nothing and costs
+                // nothing, which is not the same as having cost zero.
+                native_cost_per_share: if cost > 0.0 { Some(cost / sale.quantity) } else { None },
+                brokerage: sale.brokerage,
+            }
+        })
+        .collect()
 }
 
 /// Effective dividends for a symbol: the API-computed dividends_total when
@@ -592,59 +758,47 @@ pub fn calc_sold_entries(txs: &[PortfolioTx]) -> Vec<SoldEntry> {
         .filter_map(|t| t.quantity)
         .sum();
 
-    let mut lots: Vec<(f64, f64, String)> = Vec::new(); // (quantity, cost_per_share, date)
-    let mut sales: Vec<SoldEntry> = Vec::new();
+    let symbol = sorted.first().map(|t| t.symbol.clone()).unwrap_or_default();
 
-    for tx in &sorted {
-        match (tx.tx_type, tx.quantity, tx.price) {
-            (TxType::Purchase, Some(qty), Some(price)) if qty != 0.0 && price != 0.0 => {
-                // Same cost basis the rest of the engine uses: the fee is part
-                // of what the shares cost, so a sale is measured against it.
-                let (lot, _) = purchase_lots(tx, qty, price);
-                lots.push((qty, lot.price, tx.date.clone()));
+    // Same walk, and so the same cost basis, as the rest of the engine: the
+    // purchase fee is part of what the shares cost, so a sale is measured
+    // against it.
+    let walk = walk_parcels(txs, &[]);
+    let mut sales: Vec<SoldEntry> = walk
+        .sales
+        .iter()
+        .map(|sale| {
+            let cost_basis: f64 = sale.parcels.iter().map(|p| p.quantity * p.cost_per_share).sum();
+            let earliest = sale
+                .parcels
+                .iter()
+                .map(|p| p.acquired.as_str())
+                .min()
+                .filter(|acquired| *acquired < sale.date.as_str())
+                .unwrap_or(&sale.date);
+            let brokerage = sale.brokerage.unwrap_or(0.0);
+            let days_held = match (
+                NaiveDate::parse_from_str(&sale.date, "%Y-%m-%d"),
+                NaiveDate::parse_from_str(earliest, "%Y-%m-%d"),
+            ) {
+                (Ok(sale_date), Ok(purchase_date)) => (sale_date - purchase_date).num_days(),
+                _ => 0,
+            };
+            SoldEntry {
+                symbol: symbol.clone(),
+                date: sale.date.clone(),
+                quantity: sale.quantity,
+                avg_purchase_price: if sale.quantity > 0.0 { cost_basis / sale.quantity } else { 0.0 },
+                sale_price: sale.price,
+                brokerage,
+                dividends: 0.0,
+                days_held,
+                realised_pl: sale.quantity * sale.price - brokerage - cost_basis,
             }
-            (TxType::Sale, Some(qty), Some(price)) if qty != 0.0 && price != 0.0 => {
-                let mut remaining = qty;
-                let mut cost_basis = 0.0;
-                let mut earliest = tx.date.clone();
-                while remaining > SHARE_EPSILON && !lots.is_empty() {
-                    let used = remaining.min(lots[0].0);
-                    if lots[0].2 < earliest {
-                        earliest = lots[0].2.clone();
-                    }
-                    cost_basis += used * lots[0].1;
-                    remaining -= used;
-                    lots[0].0 -= used;
-                    if lots[0].0 <= SHARE_EPSILON {
-                        lots.remove(0);
-                    }
-                }
-                let brokerage = tx.brokerage.unwrap_or(0.0);
-                let sale_proceeds = qty * price - brokerage - cost_basis;
-                let days_held = match (
-                    NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d"),
-                    NaiveDate::parse_from_str(&earliest, "%Y-%m-%d"),
-                ) {
-                    (Ok(sale_date), Ok(purchase_date)) => (sale_date - purchase_date).num_days(),
-                    _ => 0,
-                };
-                sales.push(SoldEntry {
-                    symbol: tx.symbol.clone(),
-                    date: tx.date.clone(),
-                    quantity: qty,
-                    avg_purchase_price: if qty > 0.0 { cost_basis / qty } else { 0.0 },
-                    sale_price: price,
-                    brokerage,
-                    dividends: 0.0,
-                    days_held,
-                    realised_pl: sale_proceeds,
-                });
-            }
-            _ => {}
-        }
-    }
+        })
+        .collect();
 
-    let remaining_shares: f64 = settle_shares(lots.iter().map(|l| l.0).sum());
+    let remaining_shares: f64 = settle_shares(walk.open.iter().map(|l| l.quantity).sum());
     if remaining_shares == 0.0 && total_sold_qty > 0.0 && dividends > 0.0 {
         for sale in &mut sales {
             let share = (sale.quantity / total_sold_qty) * dividends;
@@ -1606,5 +1760,94 @@ mod tests {
             make_tx(2, "sale", "2026-02-01", Some(15.0), Some(12.0)), // recorded over-sell
         ];
         assert!(close(shares_on_date(&txs, "2026-03-01"), 0.0));
+    }
+
+    // -------------------------------------------------------------------------
+    // walk_parcels — sales matched to the purchases they consumed.
+    // -------------------------------------------------------------------------
+
+    /// One sale across two purchases has to keep them apart: they were bought
+    /// on different dates, and only one may qualify for the CGT discount.
+    #[test]
+    fn a_sale_spanning_two_purchases_reports_each_parcel() {
+        let mut first = make_tx(1, "purchase", "2023-03-01", Some(100.0), Some(10.0));
+        first.brokerage = Some(20.0);
+        let second = make_tx(2, "purchase", "2025-11-01", Some(100.0), Some(15.0));
+        let sale = make_tx(3, "sale", "2026-02-01", Some(150.0), Some(20.0));
+
+        let walk = walk_parcels(&[first, second, sale], &[]);
+        assert_eq!(walk.sales.len(), 1);
+        let parcels = &walk.sales[0].parcels;
+        assert_eq!(parcels.len(), 2);
+        assert_eq!(parcels[0].purchase_id, 1);
+        assert_eq!(parcels[0].acquired, "2023-03-01");
+        assert!(close(parcels[0].quantity, 100.0));
+        assert!(close(parcels[0].cost_per_share, 10.2), "the purchase fee is in the cost");
+        assert_eq!(parcels[1].acquired, "2025-11-01");
+        assert!(close(parcels[1].quantity, 50.0));
+        assert!(close(walk.sales[0].unmatched, 0.0));
+
+        assert_eq!(walk.open.len(), 1);
+        assert!(close(walk.open[0].quantity, 50.0));
+    }
+
+    #[test]
+    fn shares_sold_without_a_purchase_are_reported_unmatched() {
+        let walk = walk_parcels(
+            &[
+                make_tx(1, "purchase", "2025-01-01", Some(10.0), Some(5.0)),
+                make_tx(2, "sale", "2025-06-01", Some(25.0), Some(6.0)),
+            ],
+            &[],
+        );
+        assert!(close(walk.sales[0].unmatched, 15.0));
+        assert!(close(walk.sales[0].parcels[0].quantity, 10.0));
+    }
+
+    /// An AMIT adjustment lands on the units held at the end of its year and
+    /// nowhere else — not on units sold before it, nor bought after.
+    #[test]
+    fn a_cost_base_adjustment_reaches_only_the_shares_then_held() {
+        let txs = vec![
+            make_tx(1, "purchase", "2024-08-01", Some(100.0), Some(50.0)),
+            make_tx(2, "sale", "2025-03-01", Some(50.0), Some(60.0)),
+            make_tx(3, "purchase", "2025-08-01", Some(50.0), Some(55.0)),
+            make_tx(4, "sale", "2026-02-01", Some(100.0), Some(70.0)),
+        ];
+        let walk = walk_parcels(&txs, &[CostBaseAdjustment { date: "2025-06-30".into(), amount: -25.0 }]);
+        // The first sale predates the adjustment.
+        assert!(close(walk.sales[0].parcels[0].cost_per_share, 50.0));
+        // 50 units held on 30 June took $25 off: 50c each.
+        let later = &walk.sales[1].parcels;
+        assert!(close(later[0].cost_per_share, 49.5));
+        assert!(close(later[1].cost_per_share, 55.0), "bought after the adjustment");
+        assert!(walk.unapplied.is_empty());
+    }
+
+    #[test]
+    fn a_decrease_larger_than_the_cost_base_reports_the_excess() {
+        let txs = vec![make_tx(1, "purchase", "2024-08-01", Some(10.0), Some(1.0))];
+        let walk = walk_parcels(&txs, &[CostBaseAdjustment { date: "2025-06-30".into(), amount: -15.0 }]);
+        assert!(close(walk.open[0].cost_per_share, 0.0));
+        assert_eq!(walk.unapplied.len(), 1);
+        assert!(close(walk.unapplied[0].1, -5.0));
+    }
+
+    /// The walk replaced the queue each of these kept for itself, so they must
+    /// still answer exactly as before.
+    #[test]
+    fn sale_costs_and_sold_entries_agree_with_the_walk() {
+        let mut buy = make_tx(1, "purchase", "2025-01-01", Some(100.0), Some(10.0));
+        buy.brokerage = Some(10.0);
+        let mut sell = make_tx(2, "sale", "2025-04-11", Some(40.0), Some(12.0));
+        sell.brokerage = Some(5.0);
+        let txs = vec![buy, sell];
+
+        let costs = sale_costs(&txs);
+        assert!(close(costs[0].native_cost_per_share.unwrap(), 10.1));
+        let sold = calc_sold_entries(&txs);
+        assert_eq!(sold[0].days_held, 100);
+        assert!(close(sold[0].avg_purchase_price, 10.1));
+        assert!(close(sold[0].realised_pl, 40.0 * 12.0 - 5.0 - 404.0));
     }
 }

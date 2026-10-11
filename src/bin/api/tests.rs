@@ -26,6 +26,9 @@ fn make_tx(id: i64, tx_type: &str, date: &str, quantity: f64, price: f64) -> Hol
         original_price: None,
         fx_rate: None,
         cash_account_id: None,
+        withholding_amount: None,
+        franked_amount: None,
+        franking_credit: None,
         custom_fields: Default::default(),
     }
 }
@@ -772,6 +775,8 @@ fn integration_insert_and_fetch_holding_transaction() {
         custom_fields: None,
         cash_account_id: None,
         withholding_amount: None,
+        franked_amount: None,
+        franking_credit: None,
         confirm: None,
     };
 
@@ -807,6 +812,8 @@ fn integration_insert_transaction_rejects_zero_quantity() {
         custom_fields: None,
         cash_account_id: None,
         withholding_amount: None,
+        franked_amount: None,
+        franking_credit: None,
         confirm: None,
     };
 
@@ -2822,6 +2829,8 @@ fn trade_payload(symbol: &str, tx_type: &str, qty: f64, price: f64) -> NewHoldin
         custom_fields: None,
         cash_account_id: None,
         withholding_amount: None,
+        franked_amount: None,
+        franking_credit: None,
         confirm: None,
     }
 }
@@ -5516,4 +5525,466 @@ async fn ledger_rows_carry_the_settlement_account() {
         rows.iter().all(|r| r.get("cash_account_id").is_some()),
         "every ledger row must carry the key so the UI can distinguish absent from unset"
     );
+}
+
+// -------------------------------------------------------------------------
+// Tax report
+// -------------------------------------------------------------------------
+
+/// One holdings row, with the columns the tax report reads.
+#[allow(clippy::too_many_arguments)]
+fn tax_tx(
+    db_path: &PathBuf,
+    id: i64,
+    symbol: &str,
+    kind: &str,
+    date: &str,
+    quantity: f64,
+    price: f64,
+    brokerage: f64,
+    foreign: Option<(&str, f64, f64)>, // (currency, native price, rate)
+) {
+    let conn = open_db(db_path).unwrap();
+    let (currency, original, rate) = match foreign {
+        Some((c, native, rate)) => (c, Some(native), Some(rate)),
+        None => ("AUD", None, None),
+    };
+    let amount = (kind == "dividend").then_some(quantity * price);
+    conn.execute(
+        "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, amount, brokerage, created_at, currency, original_price, fx_rate)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '2024-01-01T00:00:00Z', ?9, ?10, ?11)",
+        params![id, symbol, kind, date, quantity, price, amount, brokerage, currency, original, rate],
+    )
+    .unwrap();
+}
+
+async fn tax_report(db_path: &Path, query: &str) -> serde_json::Value {
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.to_path_buf())).service(get_tax_report),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::get().uri(&format!("/api/tax/report?{}", query)).to_request();
+    actix_web::test::call_and_read_body_json(&app, req).await
+}
+
+fn section<'a>(report: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    report["sections"].as_array().unwrap().iter().find(|s| s["key"] == key).unwrap_or_else(|| panic!("no {} section", key))
+}
+
+/// A summary figure by return label, or by its label text when it has none.
+fn figure(report: &serde_json::Value, key: &str, item: &str) -> f64 {
+    section(report, key)["summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["item"] == item || l["label"] == item)
+        .unwrap_or_else(|| panic!("no {} in {}", item, key))["amount"]
+        .as_f64()
+        .unwrap()
+}
+
+/// A table's rows, each as column label → cell.
+fn table_rows(report: &serde_json::Value, key: &str, title: &str) -> Vec<HashMap<String, serde_json::Value>> {
+    let table = section(report, key)["tables"].as_array().unwrap().iter().find(|t| t["title"] == title).unwrap();
+    let labels: Vec<String> = table["columns"].as_array().unwrap().iter().map(|c| c["label"].as_str().unwrap().to_string()).collect();
+    table["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| labels.iter().cloned().zip(row.as_array().unwrap().iter().cloned()).collect())
+        .collect()
+}
+
+fn has_check(report: &serde_json::Value, text: &str) -> bool {
+    report["checks"].as_array().unwrap().iter().any(|c| c["message"].as_str().unwrap_or("").contains(text))
+}
+
+/// One sale can take shares bought years apart. Only the parcel held for
+/// more than 12 months is discounted — the reason the report works parcel by
+/// parcel rather than per sale.
+#[actix_web::test]
+async fn the_tax_report_discounts_only_the_parcels_held_long_enough() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "AAA.AX", "purchase", "2022-03-01", 100.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 2, "AAA.AX", "purchase", "2024-03-01", 100.0, 20.0, 0.0, None);
+    tax_tx(&db_path, 3, "AAA.AX", "sale", "2024-09-02", 150.0, 30.0, 15.0, None);
+
+    let report = tax_report(&db_path, "fy=2025&sections=cgt").await;
+    let parcels = table_rows(&report, "cgt", "Parcels sold");
+    assert_eq!(parcels.len(), 2);
+    assert_eq!(parcels[0]["Acquired"], "2022-03-01");
+    assert_eq!(parcels[0]["12 months+"], "Yes");
+    assert_eq!(parcels[0]["Gain (AUD)"], 1990.0, "3000 proceeds − 10 brokerage share − 1000 cost");
+    assert_eq!(parcels[1]["Acquired"], "2024-03-01");
+    assert_eq!(parcels[1]["12 months+"], "No", "held six months");
+    assert_eq!(parcels[1]["Gain (AUD)"], 495.0, "1500 − 5 − 1000");
+
+    assert_eq!(figure(&report, "cgt", "18H"), 2485.0);
+    assert_eq!(figure(&report, "cgt", "18A"), 995.0 + 495.0, "only the old parcel's gain is halved");
+    assert_eq!(figure(&report, "summary", "18A"), 1490.0, "the label summary agrees");
+}
+
+/// Foreign trades show the trade's own currency beside AUD, and the cost
+/// base uses the purchase's rate while the proceeds use the sale's.
+#[actix_web::test]
+async fn a_foreign_sale_is_reported_in_both_currencies() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "XYZ", "purchase", "2024-08-01", 10.0, 150.0, 0.0, Some(("USD", 100.0, 1.5)));
+    tax_tx(&db_path, 2, "XYZ", "sale", "2025-02-03", 10.0, 192.0, 0.0, Some(("USD", 120.0, 1.6)));
+
+    let report = tax_report(&db_path, "fy=2025&sections=cgt").await;
+    let parcel = &table_rows(&report, "cgt", "Parcels sold")[0];
+    assert_eq!(parcel["Currency"], "USD");
+    assert_eq!(parcel["Sale price"], 120.0, "in the trade's currency");
+    assert_eq!(parcel["Sale FX rate"], 1.6);
+    assert_eq!(parcel["Purchase FX rate"], 1.5);
+    assert_eq!(parcel["Proceeds (trade ccy)"], 1200.0);
+    assert_eq!(parcel["Proceeds (AUD)"], 1920.0);
+    assert_eq!(parcel["Cost base (trade ccy)"], 1000.0);
+    assert_eq!(parcel["Cost base (AUD)"], 1500.0);
+    assert_eq!(parcel["Gain (trade ccy)"], 200.0);
+    assert_eq!(parcel["Gain (AUD)"], 420.0, "the currency move is part of the AUD gain");
+}
+
+/// A dividend going ex in June but paid in July is income of the later year.
+#[actix_web::test]
+async fn a_dividend_is_taxed_in_the_year_it_was_paid() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "BBB.AX", "purchase", "2024-01-02", 100.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 2, "BBB.AX", "dividend", "2024-06-25", 100.0, 0.5, 0.0, None);
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO dividend_events (symbol, ex_date, payment_date, amount, fetched_at) VALUES ('BBB.AX', '2024-06-25', '2024-07-15', 0.5, '2024-01-01')",
+            [],
+        )
+        .unwrap();
+    }
+    let earlier = tax_report(&db_path, "fy=2024&sections=dividends").await;
+    assert!(table_rows(&earlier, "dividends", "Dividends").is_empty());
+    let later = tax_report(&db_path, "fy=2025&sections=dividends").await;
+    let rows = table_rows(&later, "dividends", "Dividends");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["Paid"], "2024-07-15");
+}
+
+/// A statement's own franking beats the symbol's standing rate, which beats
+/// nothing at all — and nothing at all is reported, not assumed unfranked.
+#[actix_web::test]
+async fn franking_comes_from_the_statement_then_the_standing_rate() {
+    let (_file, db_path) = setup_test_db();
+    for (symbol, id) in [("CCC.AX", 1), ("DDD.AX", 3), ("EEE.AX", 5)] {
+        tax_tx(&db_path, id, symbol, "purchase", "2024-01-02", 100.0, 10.0, 0.0, None);
+        tax_tx(&db_path, id + 1, symbol, "dividend", "2024-09-02", 100.0, 1.0, 0.0, None);
+    }
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("UPDATE holdings_transactions SET franked_amount = 40, franking_credit = 17.14 WHERE id = 2", []).unwrap();
+    }
+    store_symbol_tax_settings(&db_path, "DDD.AX", &SymbolTaxPayload {
+        income_kind: Some(Some("company".into())),
+        franking_pct: Some(Some(100.0)),
+        dividend_withholding_pct: None,
+        tax_share_pct: None,
+    })
+    .unwrap();
+
+    let report = tax_report(&db_path, "fy=2025&sections=dividends,checks").await;
+    // CCC: 40 franked, 60 unfranked. DDD: 100 franked. EEE: unknown.
+    assert_eq!(figure(&report, "dividends", "11T"), 140.0);
+    assert_eq!(figure(&report, "dividends", "11S"), 60.0);
+    assert_eq!(figure(&report, "dividends", "11U"), 17.14 + 42.86);
+    assert_eq!(figure(&report, "dividends", "Dividends with franking not recorded"), 100.0);
+    assert!(has_check(&report, "Franking isn't recorded for $100.00 of dividends from EEE.AX"));
+}
+
+/// An ETF's statement replaces its cash on the return, its capital gains join
+/// the year's netting, and its AMIT adjustment changes the gain on a later sale.
+#[actix_web::test]
+async fn a_trust_statement_feeds_the_return_and_the_cost_base() {
+    let (_file, db_path) = setup_test_db();
+    store_symbol_tax_settings(&db_path, "VVV.AX", &SymbolTaxPayload {
+        income_kind: Some(Some("trust".into())),
+        franking_pct: None,
+        dividend_withholding_pct: None,
+        tax_share_pct: None,
+    })
+    .unwrap();
+    tax_tx(&db_path, 1, "VVV.AX", "purchase", "2023-08-01", 100.0, 100.0, 0.0, None);
+    // June-quarter distribution, ex 1 July: belongs to 2023–24.
+    tax_tx(&db_path, 2, "VVV.AX", "dividend", "2024-07-01", 100.0, 0.8, 0.0, None);
+    tax_tx(&db_path, 3, "VVV.AX", "sale", "2024-09-02", 100.0, 110.0, 0.0, None);
+    store_tax_statement(&db_path, "VVV.AX", 2024, &TaxStatementFigures {
+        non_primary_income: Some(55.0),
+        franked_distributions: Some(20.0),
+        franking_credits: Some(8.0),
+        total_capital_gains: Some(20.0),
+        net_capital_gain: Some(10.0),
+        amit_decrease: Some(50.0),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let year = tax_report(&db_path, "fy=2024").await;
+    assert_eq!(figure(&year, "trusts", "13U"), 55.0);
+    assert_eq!(figure(&year, "summary", "13C"), 20.0);
+    assert_eq!(figure(&year, "summary", "18H"), 20.0, "the trust's grossed-up gain");
+    assert_eq!(figure(&year, "summary", "18A"), 10.0);
+    let statements = table_rows(&year, "trusts", "Annual tax statements");
+    assert_eq!(statements[0]["Cash received (AUD)"], 80.0, "the July-paid distribution counts here");
+    assert_eq!(year["statements"][0]["statement"]["non_primary_income"], 55.0);
+
+    let next = tax_report(&db_path, "fy=2025&sections=cgt").await;
+    let parcel = &table_rows(&next, "cgt", "Parcels sold")[0];
+    assert_eq!(parcel["Cost base (AUD)"], 9950.0, "the $50 AMIT decrease came off the units held at 30 June");
+    assert_eq!(parcel["Gain (AUD)"], 1050.0);
+}
+
+#[actix_web::test]
+async fn capital_losses_carry_into_the_next_year() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "LLL.AX", "purchase", "2023-08-01", 100.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 2, "LLL.AX", "sale", "2024-03-01", 100.0, 7.0, 0.0, None);
+    tax_tx(&db_path, 3, "GGG.AX", "purchase", "2023-08-01", 100.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 4, "GGG.AX", "sale", "2024-09-02", 100.0, 20.0, 0.0, None);
+
+    let first = tax_report(&db_path, "fy=2024&sections=cgt").await;
+    assert_eq!(figure(&first, "cgt", "18V"), 300.0);
+
+    let second = tax_report(&db_path, "fy=2025&sections=cgt").await;
+    assert_eq!(second["losses_carried_in"], 300.0);
+    assert_eq!(second["losses_carried_in_source"], "computed");
+    assert_eq!(figure(&second, "cgt", "18H"), 1000.0);
+    assert_eq!(figure(&second, "cgt", "18A"), 350.0, "(1000 − 300) halved");
+
+    let entered = tax_report(&db_path, "fy=2025&sections=cgt&losses_carried_in=0").await;
+    assert_eq!(entered["losses_carried_in_source"], "entered");
+    assert_eq!(figure(&entered, "cgt", "18A"), 500.0);
+}
+
+#[actix_web::test]
+async fn the_tax_report_downloads_as_csv_named_for_its_year() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "AAA.AX", "purchase", "2024-08-01", 10.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 2, "AAA.AX", "sale", "2024-09-02", 10.0, 12.0, 0.0, None);
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.clone())).service(get_tax_report),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::get().uri("/api/tax/report?fy=2025&format=csv").to_request();
+    let response = actix_web::test::call_service(&app, req).await;
+    assert_eq!(response.status(), 200);
+    let disposition = response.headers().get("Content-Disposition").unwrap().to_str().unwrap().to_string();
+    assert!(disposition.contains("tax-report-FY2024-25.csv"), "{}", disposition);
+    let body = String::from_utf8(actix_web::test::read_body(response).await.to_vec()).unwrap();
+    assert!(body.starts_with('\u{feff}'), "a byte-order mark, so Excel reads UTF-8");
+    assert!(body.contains("Capital gains — Parcels sold"));
+    assert!(body.contains("AAA.AX,2024-09-02,2024-08-01,32,10,AUD,12.00"), "{}", body);
+
+    let bad = actix_web::test::TestRequest::get().uri("/api/tax/report?fy=2025&sections=everything").to_request();
+    assert_eq!(actix_web::test::call_service(&app, bad).await.status(), 400);
+}
+
+/// Once a year's report has gone to the accountant, a later edit to that
+/// year has to say so.
+#[actix_web::test]
+async fn changes_after_an_export_are_listed() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "AAA.AX", "purchase", "2024-08-01", 10.0, 10.0, 0.0, None);
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.clone())).service(record_tax_export),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::post().uri("/api/tax/exports").set_json(serde_json::json!({ "fy": 2025 })).to_request();
+    assert_eq!(actix_web::test::call_service(&app, req).await.status(), 200);
+
+    let before = tax_report(&db_path, "fy=2025").await;
+    assert!(before["last_exported_at"].is_string());
+    assert!(!has_check(&before, "since its report was last exported"));
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    tax_tx(&db_path, 2, "AAA.AX", "sale", "2025-01-10", 10.0, 12.0, 0.0, None);
+    tax_tx(&db_path, 3, "ZZZ.AX", "purchase", "2023-01-10", 10.0, 12.0, 0.0, None); // no bearing on 2024–25
+    let after = tax_report(&db_path, "fy=2025").await;
+    assert!(has_check(&after, "1 change affecting this year"), "{}", after["checks"]);
+    assert!(has_check(&after, "AAA.AX sale added dated 2025-01-10"));
+}
+
+#[test]
+fn symbol_tax_settings_are_validated_and_audited() {
+    let (_file, db_path) = setup_test_db();
+    let bad = SymbolTaxPayload { income_kind: Some(Some("partnership".into())), franking_pct: None, dividend_withholding_pct: None, tax_share_pct: None };
+    assert!(store_symbol_tax_settings(&db_path, "AAA.AX", &bad).is_err());
+    let bad = SymbolTaxPayload { income_kind: None, franking_pct: Some(Some(140.0)), dividend_withholding_pct: None, tax_share_pct: None };
+    assert!(store_symbol_tax_settings(&db_path, "AAA.AX", &bad).is_err());
+
+    let good = SymbolTaxPayload { income_kind: Some(Some("trust".into())), franking_pct: Some(Some(80.0)), dividend_withholding_pct: None, tax_share_pct: None };
+    store_symbol_tax_settings(&db_path, "AAA.AX", &good).unwrap();
+    let rows = audit_rows(&db_path, "symbol_info");
+    let last = rows.last().unwrap().1.as_deref().unwrap();
+    assert!(last.contains("\"income_kind\":\"trust\"") && last.contains("\"franking_pct\":80"), "{}", last);
+
+    // Absent leaves a field alone; null clears it.
+    let clear = SymbolTaxPayload { income_kind: None, franking_pct: Some(None), dividend_withholding_pct: None, tax_share_pct: None };
+    store_symbol_tax_settings(&db_path, "AAA.AX", &clear).unwrap();
+    let conn = open_db(&db_path).unwrap();
+    let (kind, pct): (Option<String>, Option<f64>) = conn
+        .query_row("SELECT income_kind, franking_pct FROM symbol_info WHERE symbol = 'AAA.AX'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(kind.as_deref(), Some("trust"));
+    assert_eq!(pct, None);
+}
+
+/// Editing a dividend's note must not wipe the franking typed from its
+/// statement; sending null clears it on purpose.
+#[test]
+fn a_dividends_franking_is_kept_unless_cleared() {
+    let (_file, db_path) = setup_test_db();
+    let mut div = trade_payload("FRK.AX", "dividend", 100.0, 0.5);
+    div.amount = Some(50.0);
+    div.franked_amount = Some(Some(50.0));
+    div.franking_credit = Some(Some(21.43));
+    let id = insert_holding_transaction(&db_path, "FRK.AX", div).unwrap().id;
+
+    let read = |db: &PathBuf| -> (Option<f64>, Option<f64>) {
+        let conn = open_db(db).unwrap();
+        conn.query_row("SELECT franked_amount, franking_credit FROM holdings_transactions WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+    };
+    let mut edit = trade_payload("FRK.AX", "dividend", 100.0, 0.5);
+    edit.amount = Some(50.0);
+    edit.notes = Some("note only".into());
+    modify_holding_transaction(&db_path, id, "FRK.AX", edit).unwrap();
+    assert_eq!(read(&db_path), (Some(50.0), Some(21.43)));
+
+    let mut clear = trade_payload("FRK.AX", "dividend", 100.0, 0.5);
+    clear.amount = Some(50.0);
+    clear.franked_amount = Some(None);
+    clear.franking_credit = Some(None);
+    modify_holding_transaction(&db_path, id, "FRK.AX", clear).unwrap();
+    assert_eq!(read(&db_path), (None, None));
+}
+
+fn set_share(db_path: &Path, symbol: &str, pct: f64) {
+    store_symbol_tax_settings(db_path, symbol, &SymbolTaxPayload {
+        income_kind: Some(Some("company".into())),
+        franking_pct: None,
+        dividend_withholding_pct: None,
+        tax_share_pct: Some(Some(pct)),
+    })
+    .unwrap();
+}
+
+/// A partner's shares tracked in the app are taxed on their return, not
+/// this one — but the report says what it left out.
+#[actix_web::test]
+async fn a_holding_set_to_no_share_is_left_out_and_named() {
+    let (_file, db_path) = setup_test_db();
+    for (symbol, id) in [("MINE.AX", 1), ("HERS.AX", 4)] {
+        tax_tx(&db_path, id, symbol, "purchase", "2023-08-01", 100.0, 10.0, 0.0, None);
+        tax_tx(&db_path, id + 1, symbol, "dividend", "2024-09-02", 100.0, 1.0, 0.0, None);
+        tax_tx(&db_path, id + 2, symbol, "sale", "2024-10-01", 100.0, 12.0, 0.0, None);
+    }
+    set_share(&db_path, "HERS.AX", 0.0);
+
+    let report = tax_report(&db_path, "fy=2025").await;
+    let parcels = table_rows(&report, "cgt", "Parcels sold");
+    assert_eq!(parcels.len(), 1);
+    assert_eq!(parcels[0]["Symbol"], "MINE.AX");
+    assert_eq!(figure(&report, "cgt", "18H"), 200.0);
+    assert_eq!(table_rows(&report, "dividends", "Dividends").len(), 1);
+    assert!(report["ownership"][0].as_str().unwrap().contains("HERS.AX"), "{}", report["ownership"]);
+    assert!(report["text"].as_str().unwrap().contains("Left out, as not yours (share 0%): HERS.AX."));
+    // Still listed, so it can be put back.
+    let listed = report["symbols"].as_array().unwrap().iter().find(|s| s["symbol"] == "HERS.AX").unwrap();
+    assert_eq!(listed["share_pct"], 0.0);
+}
+
+#[actix_web::test]
+async fn a_joint_holding_is_reported_at_its_share() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "JNT.AX", "purchase", "2023-08-01", 100.0, 10.0, 20.0, None);
+    tax_tx(&db_path, 2, "JNT.AX", "dividend", "2024-09-02", 100.0, 1.0, 0.0, None);
+    tax_tx(&db_path, 3, "JNT.AX", "sale", "2024-10-01", 100.0, 12.0, 10.0, None);
+    set_share(&db_path, "JNT.AX", 50.0);
+
+    let report = tax_report(&db_path, "fy=2025").await;
+    let parcel = &table_rows(&report, "cgt", "Parcels sold")[0];
+    assert_eq!(parcel["Symbol"], "JNT.AX (50% yours)");
+    assert_eq!(parcel["Quantity"], 50.0);
+    assert_eq!(parcel["Proceeds (AUD)"], 600.0);
+    assert_eq!(parcel["Cost base (AUD)"], 510.0, "half the shares and half the purchase brokerage");
+    assert_eq!(parcel["Gain (AUD)"], 85.0, "(1200 − 10 − 1020) halved");
+    assert_eq!(table_rows(&report, "dividends", "Dividends")[0]["Gross (AUD)"], 50.0);
+}
+
+/// Interest on a joint account is taxed half to each holder; the report
+/// shows the bank's figure beside the user's share of it.
+#[actix_web::test]
+async fn a_joint_accounts_interest_and_fees_are_reported_at_its_share() {
+    let (_file, db_path) = setup_test_db();
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("INSERT INTO cash_accounts (id, name, currency, include_in_portfolio, created_at) VALUES (7, 'Joint Saver', 'AUD', 1, '2024-01-01')", []).unwrap();
+        for (date, amount, kind) in [("2024-08-01", 60.0, "interest"), ("2025-02-01", 40.0, "interest"), ("2025-03-01", -10.0, "fee")] {
+            conn.execute(
+                "INSERT INTO cash_transactions (account_id, date, amount, kind, created_at) VALUES (7, ?1, ?2, ?3, '2024-01-01')",
+                params![date, amount, kind],
+            )
+            .unwrap();
+        }
+    }
+    assert!(store_account_tax_share(&db_path, 7, Some(50.0)).unwrap());
+    assert!(store_account_tax_share(&db_path, 99, Some(50.0)).is_ok_and(|found| !found));
+    assert!(store_account_tax_share(&db_path, 7, Some(120.0)).is_err());
+
+    let report = tax_report(&db_path, "fy=2025&sections=interest,deductions").await;
+    assert_eq!(figure(&report, "interest", "10L"), 50.0);
+    let row = &table_rows(&report, "interest", "Interest received")[0];
+    assert_eq!(row["Amount (AUD)"], 60.0, "the bank's figure");
+    assert_eq!(row["Yours (AUD)"], 30.0);
+    assert_eq!(figure(&report, "deductions", "D8"), 5.0);
+    assert_eq!(report["accounts"][0]["share_pct"], 50.0);
+    assert!(report["ownership"][0].as_str().unwrap().contains("Joint Saver 50%"));
+
+    let audited = audit_rows(&db_path, "cash_accounts");
+    assert!(audited.last().unwrap().1.as_deref().unwrap().contains("\"tax_share_pct\":50"));
+}
+
+/// The printed report ends with what the app can't know, laid out with
+/// blank boxes; the CSV leaves the same cells empty to type into.
+#[actix_web::test]
+async fn the_worksheet_lists_what_still_has_to_be_entered() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "NOF.AX", "purchase", "2024-01-02", 100.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 2, "NOF.AX", "dividend", "2024-09-02", 100.0, 1.0, 0.0, None);
+    store_symbol_tax_settings(&db_path, "ETF.AX", &SymbolTaxPayload {
+        income_kind: Some(Some("trust".into())),
+        franking_pct: None,
+        dividend_withholding_pct: None,
+        tax_share_pct: None,
+    })
+    .unwrap();
+    tax_tx(&db_path, 3, "ETF.AX", "purchase", "2024-01-02", 10.0, 50.0, 0.0, None);
+    tax_tx(&db_path, 4, "ETF.AX", "dividend", "2024-10-01", 10.0, 0.5, 0.0, None);
+
+    let report = tax_report(&db_path, "fy=2025").await;
+    let titles: Vec<&str> = report["worksheet"].as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+    assert!(titles.iter().any(|t| t.starts_with("Dividends: franking")), "{:?}", titles);
+    assert!(titles.iter().any(|t| t.starts_with("Annual tax statements")), "{:?}", titles);
+    assert!(titles.contains(&"Figures the app doesn't hold"));
+    let franking = report["worksheet"].as_array().unwrap().iter().find(|t| t["title"].as_str().unwrap().starts_with("Dividends: franking")).unwrap();
+    assert_eq!(franking["columns"][5]["kind"], "entry");
+    assert_eq!(franking["rows"][0][0], "NOF.AX");
+    assert!(franking["rows"][0][5].is_null());
+
+    let text = report["text"].as_str().unwrap();
+    assert!(text.contains("TO COMPLETE BY HAND"));
+    assert!(text.contains("__________"));
+
+    let app = actix_web::test::init_service(App::new().app_data(web::Data::new(db_path.clone())).service(get_tax_report)).await;
+    let req = actix_web::test::TestRequest::get().uri("/api/tax/report?fy=2025&format=csv").to_request();
+    let body = String::from_utf8(actix_web::test::read_body(actix_web::test::call_service(&app, req).await).await.to_vec()).unwrap();
+    assert!(body.contains("To complete — Dividends: franking"), "{}", body);
+    assert!(body.contains("NOF.AX,2024-09-02,,100,100.00,,,"), "{}", body);
 }

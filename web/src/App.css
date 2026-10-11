@@ -1424,3 +1424,409 @@
   padding: 16px 24px 24px;
   border-top: 1px solid #eee;
 }
+
+/* ---------------------------------------------------------------
+   Tax report dialog (Transactions screen). Wide, because the parcel
+   tables carry both currencies; every table scrolls sideways inside
+   its own wrapper rather than widening the dialog.
+   --------------------------------------------------------------- */
+.tax-report-card {
+  width: min(1200px, 100%);
+  height: 100%;
+  /* The app root centres its text; a report reads down the left edge. */
+  text-align: left;
+}
+
+.tax-fieldset legend,
+.tax-field {
+  text-align: left;
+}
+
+.tax-report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.tax-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tax-muted {
+  color: #888;
+  font-size: 13px;
+  font-weight: normal;
+}
+
+.tax-options {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 720px;
+}
+
+.tax-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 14px;
+}
+
+.tax-fieldset {
+  border: 1px solid #e8edf4;
+  border-radius: 8px;
+  padding: 10px 14px 12px;
+  margin: 0;
+}
+
+.tax-fieldset legend {
+  font-size: 13px;
+  color: #666;
+  padding: 0 4px;
+}
+
+.tax-link {
+  background: none;
+  border: none;
+  color: #2196f3;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 0 0 8px;
+}
+
+.tax-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.tax-check input {
+  margin-top: 3px;
+}
+
+.tax-check.disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.tax-section {
+  margin-bottom: 22px;
+}
+
+.tax-section h4 {
+  margin: 0 0 8px;
+}
+
+.tax-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 2px solid #e8edf4;
+  padding-bottom: 4px;
+  margin-bottom: 8px;
+}
+
+.tax-section-header h4 {
+  margin: 0;
+}
+
+.tax-summary {
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.tax-summary td {
+  padding: 3px 10px 3px 0;
+  vertical-align: top;
+}
+
+.tax-summary-item {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: #2196f3;
+  min-width: 34px;
+}
+
+.tax-summary-labelled td {
+  font-weight: 600;
+}
+
+.tax-summary-amount {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  min-width: 110px;
+}
+
+.tax-summary-note {
+  color: #888;
+  font-size: 12px;
+  font-weight: normal !important;
+}
+
+.tax-table {
+  margin: 8px 0;
+}
+
+.tax-table summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 4px 0;
+}
+
+.tax-detail-table {
+  min-width: 0;
+}
+
+.tax-detail-table th,
+.tax-detail-table td {
+  padding: 5px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tax-detail-table .num,
+.tax-detail-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.negative {
+  color: #c62828;
+}
+
+.tax-notes {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: #777;
+}
+
+.tax-attention ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tax-attention li {
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.tax-check-warn {
+  background: #fff4e5;
+  color: #7a4300;
+}
+
+.tax-check-info {
+  background: #eef5fd;
+  color: #234a72;
+}
+
+.tax-panel {
+  border: 1px solid #e8edf4;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.tax-panel > summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.tax-guess {
+  color: #b0741c;
+  font-size: 12px;
+}
+
+.tax-pct {
+  width: 80px;
+}
+
+.tax-detail-table .config-input {
+  padding: 4px 6px;
+  font-size: 13px;
+}
+
+.tax-statement-form {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #f8f9fc;
+}
+
+.tax-statement-heading {
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.tax-statement-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px 14px;
+  margin-bottom: 10px;
+}
+
+.tax-statement-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.tax-statement-notes {
+  grid-column: 1 / -1;
+}
+
+/* Tax report: ownership notes, holdings left out, and write-in boxes. */
+.tax-ownership {
+  margin: 0 0 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #f3effc;
+  color: #4a3a75;
+  font-size: 13px;
+}
+
+.tax-excluded td {
+  color: #999;
+}
+
+.tax-detail-table td.tax-entry {
+  min-width: 90px;
+  background: #fffdf3;
+  border: 1px dashed #d8c98a;
+}
+
+/* ---------------------------------------------------------------
+   Tax report, printed. The print layout is rendered outside #root,
+   so printing simply swaps the app out for it: no fighting the
+   dialog's fixed position or its scrolling body.
+   --------------------------------------------------------------- */
+.tax-print {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A4 landscape;
+    margin: 10mm;
+  }
+
+  body > #root {
+    display: none !important;
+  }
+
+  body {
+    background: #fff !important;
+  }
+
+  .tax-print {
+    display: block;
+    color: #000;
+    font-size: 9pt;
+    line-height: 1.35;
+    text-align: left;
+  }
+
+  .tax-print h1 {
+    font-size: 15pt;
+    margin: 0 0 4pt;
+  }
+
+  .tax-print h2 {
+    font-size: 11.5pt;
+    margin: 14pt 0 5pt;
+    padding-bottom: 2pt;
+    border-bottom: 1pt solid #000;
+    break-after: avoid;
+  }
+
+  .tax-print h3 {
+    font-size: 9.5pt;
+    margin: 8pt 0 3pt;
+    break-after: avoid;
+  }
+
+  .tax-print p {
+    margin: 0 0 4pt;
+  }
+
+  .tax-print ul {
+    margin: 0;
+    padding-left: 14pt;
+  }
+
+  .tax-print table {
+    border-collapse: collapse;
+    margin-bottom: 6pt;
+  }
+
+  .tax-print th,
+  .tax-print td {
+    border: 0.5pt solid #999;
+    padding: 1.5pt 4pt;
+    font-size: 7.5pt;
+    vertical-align: top;
+  }
+
+  .tax-print td {
+    white-space: nowrap;
+  }
+
+  .tax-print th {
+    background: #eee;
+    font-weight: 600;
+  }
+
+  .tax-print thead {
+    display: table-header-group;
+  }
+
+  .tax-print tr {
+    break-inside: avoid;
+  }
+
+  .tax-print .num {
+    text-align: right;
+  }
+
+  .tax-print .tax-print-summary td {
+    border: none;
+    padding: 1pt 10pt 1pt 0;
+    font-size: 9pt;
+  }
+
+  .tax-print .tax-print-item {
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+
+  .tax-print .tax-print-muted {
+    color: #555;
+    font-size: 8pt;
+  }
+
+  /* A box big enough to write a figure in by hand. */
+  .tax-print td.tax-entry {
+    min-width: 24mm;
+    height: 7mm;
+    border: 0.75pt solid #000;
+  }
+
+  .tax-print .tax-print-worksheet {
+    break-before: page;
+  }
+}
