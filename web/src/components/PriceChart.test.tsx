@@ -856,6 +856,34 @@ describe('placing a level', () => {
     expect(symbol).toBe('TST.AX')
     expect(price).toBeGreaterThan(0)
   })
+
+  // One level per press: the button switches itself off, so the next click on
+  // the chart — reaching for the new line to adjust it — adds nothing.
+  it('turns Level off once the level is placed', async () => {
+    const { container } = await renderChart()
+    const levelButton = screen.getByTitle(/Draw a horizontal price level/)
+    fireEvent.click(levelButton)
+    expect(levelButton.classList.contains('active')).toBe(true)
+
+    clickPricePanel(container, 200)
+    await waitFor(() => expect(addChartDrawing).toHaveBeenCalledTimes(1))
+    expect(levelButton.classList.contains('active')).toBe(false)
+    expect(screen.queryByText(/to place a level/)).toBeNull()
+
+    clickPricePanel(container, 260)
+    expect(addChartDrawing).toHaveBeenCalledTimes(1)
+  })
+
+  // Off from the click itself, not from the save's reply, so a double-click
+  // made while the save is still in flight cannot slip a second level in.
+  it('places one level for a double-click, before the save has returned', async () => {
+    addChartDrawing.mockReturnValue(new Promise(() => {}))
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByTitle(/Draw a horizontal price level/))
+    clickPricePanel(container, 200)
+    clickPricePanel(container, 200)
+    expect(addChartDrawing).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('the newest bar', () => {
@@ -955,6 +983,53 @@ describe('trendlines', () => {
     expect(line.startDate < line.endDate).toBe(true)
     expect(line.startPrice).toBeGreaterThan(0)
     expect(line.endPrice).toBeGreaterThan(0)
+  })
+
+  const clickChart = (container: HTMLElement, clientX: number, clientY: number) => {
+    const svg = container.querySelector('svg')!
+    svg.getBoundingClientRect = () => ({
+      top: 0, left: 0, width: 1040, height: 460, right: 1040, bottom: 460, x: 0, y: 0, toJSON: () => {},
+    }) as DOMRect
+    fireEvent.click(svg, { clientX, clientY })
+  }
+  const trendHint = () => screen.queryByText(/Click the first point|Anchored at/)
+
+  // One line per press, as for a level: the first click only anchors it, and
+  // the click that finishes it switches the button off, so the next click on
+  // the chart — reaching for an end to adjust it — starts nothing.
+  it('turns Trend off once the line is finished', async () => {
+    const { container } = await renderChart()
+    const trendButton = screen.getByTitle(/Draw a trendline/)
+    fireEvent.click(trendButton)
+
+    clickChart(container, 200, 200)
+    await waitFor(() => expect(screen.getByText(/Anchored at/)).toBeTruthy())
+    expect(trendButton.classList.contains('active')).toBe(true)
+
+    clickChart(container, 800, 150)
+    await waitFor(() => expect(addTrendline).toHaveBeenCalledTimes(1))
+    expect(trendButton.classList.contains('active')).toBe(false)
+    expect(trendHint()).toBeNull()
+
+    clickChart(container, 500, 180)
+    expect(trendHint()).toBeNull()
+    expect(addTrendline).toHaveBeenCalledTimes(1)
+  })
+
+  // Off from the finishing click itself, not from the save's reply, so a
+  // double-click on the second point neither saves the line twice nor leaves
+  // its second click anchoring a new one.
+  it('finishes one line for a double-click on the second point, before the save has returned', async () => {
+    addTrendline.mockReturnValue(new Promise(() => {}))
+    const { container } = await renderChart()
+    fireEvent.click(screen.getByTitle(/Draw a trendline/))
+    clickChart(container, 200, 200)
+    await waitFor(() => expect(screen.getByText(/Anchored at/)).toBeTruthy())
+
+    clickChart(container, 800, 150)
+    clickChart(container, 800, 150)
+    expect(addTrendline).toHaveBeenCalledTimes(1)
+    expect(trendHint()).toBeNull()
   })
 })
 

@@ -985,6 +985,10 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     setDrawError(null)
 
     if (drawMode === 'level') {
+      // One level per press of the button. The mode ends with the click that
+      // places the level, not when the save returns, so a double-click — or a
+      // grab at the new line that just misses it — cannot add a second one.
+      setDrawMode(null)
       try {
         setDrawings(await apiClient.addChartDrawing(symbol, Number(price.toFixed(4))))
       } catch (err) {
@@ -1009,6 +1013,11 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
     const [a, b] = date < pendingAnchor.date
       ? [{ date, price }, pendingAnchor]
       : [pendingAnchor, { date, price }]
+    // The line is finished, so the mode ends here as it does for a level, and
+    // the anchor with it: a double-click on the second point, or a grab at one
+    // of the new line's ends that just misses, cannot start another line.
+    setDrawMode(null)
+    setPendingAnchor(null)
     try {
       setDrawings(await apiClient.addTrendline(symbol, {
         startDate: a.date,
@@ -1016,7 +1025,6 @@ export default function PriceChart({ symbol, currency: currencyProp = 'AUD', onL
         endDate: b.date,
         endPrice: Number(b.price.toFixed(4)),
       }))
-      setPendingAnchor(null)
     } catch (err) {
       setDrawError(err instanceof Error ? err.message : 'Failed to save the trendline')
     }
