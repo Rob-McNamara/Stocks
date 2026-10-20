@@ -363,9 +363,9 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
         )}
       </div>
 
-      {/* The portfolio as one map. Holdings breaks the same tiles out by
-          section; this is the view across all of them. Clicking a tile opens
-          that position on the Holdings screen. */}
+      {/* The portfolio as one map. Each Holdings screen maps its own half;
+          this is the view across both. Clicking a tile opens that position on
+          the Holdings screen. */}
       {heatMapHoldings.length > 0 && (
         <CollapsibleCard id="heatmap-overall" title="Heat Map">
           <HoldingsHeatMap holdings={heatMapHoldings} onSelectSymbol={onNavigateToHoldings} />

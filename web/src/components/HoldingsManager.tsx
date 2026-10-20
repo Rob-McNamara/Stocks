@@ -14,10 +14,8 @@ import { formatPrice, priceParts } from '../utils/priceDisplay'
  *
  * Classification (ETF vs equity, domestic vs international) is computed
  * server-side, including config overrides; this only names the combinations and
- * says which screen each belongs to. It is the single source of truth for both:
- * the per-section heat maps and the summary groups read the same list, and a
- * holding that landed in one section's map but another's card grid would be a
- * quietly wrong screen.
+ * says which screen each belongs to. The summary groups are built from it. The
+ * heat map is not: it draws the screen's equities and ETFs as one map.
  */
 const SECTIONS_BY_SCOPE = {
   local: ['Equities', 'ETFs'],
@@ -1082,24 +1080,20 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
       {error && !showRecordDialog && <div className="alert alert-error">❌ {error}</div>}
       {success && <div className="alert alert-success">✓ {success}</div>}
 
-      {/* One map per section, so each is scaled to its own holdings: a single
-          map across the lot sizes every tile against the largest position in
-          the portfolio, which leaves a small section unreadable. The map of
-          everything lives on the Dashboard. An empty section is skipped rather
-          than shown as an empty frame. */}
-      {scopeSections.map((section) => {
-        const rows = scopedHoldings.filter((h) => sectionOf(h.is_etf, h.is_international) === section)
-        if (rows.length === 0) return null
-        return (
-          // The collapse id is the section name, not the heading, so rewording
-          // the heading cannot reopen a card the user had folded away.
-          <CollapsibleCard key={section} id={`heatmap-${section}`} title={`${section} Heat Map`}>
-            {/* Clicking a tile drives the chart card below rather than opening
-                anything of its own — the map is a way into a position. */}
-            <HoldingsHeatMap holdings={rows} onSelectSymbol={setSelectedChartSymbol} />
-          </CollapsibleCard>
-        )
-      })}
+      {/* One map for the screen, equities and ETFs together, so every tile is
+          sized against everything else the screen holds rather than against
+          its own kind only. The map of both screens lives on the Dashboard. A
+          screen with nothing held is skipped rather than shown as an empty
+          frame. */}
+      {scopedHoldings.length > 0 && (
+        // The collapse id is the scope, not the heading, so rewording the
+        // heading cannot reopen a card the user had folded away.
+        <CollapsibleCard id={`heatmap-${scope}`} title="Heat Map">
+          {/* Clicking a tile drives the chart card below rather than opening
+              anything of its own — the map is a way into a position. */}
+          <HoldingsHeatMap holdings={scopedHoldings} onSelectSymbol={setSelectedChartSymbol} />
+        </CollapsibleCard>
+      )}
 
       {selectedChartSymbol && (
         <div className="manager-card chart-card">

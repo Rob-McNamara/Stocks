@@ -166,8 +166,6 @@ describe('local vs international screens', () => {
   it('shows only the local sections on the local screen', async () => {
     await renderScope('local')
     await waitFor(() => expect(sectionHeadings()).toEqual(['Equities', 'ETFs', 'Active Holdings']))
-    expect(screen.getByRole('button', { name: 'Equities Heat Map' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'International Equities Heat Map' })).toBeNull()
   })
 
   it('shows only the international sections on the international screen', async () => {
@@ -175,8 +173,6 @@ describe('local vs international screens', () => {
     await waitFor(() =>
       expect(sectionHeadings()).toEqual(['International Equities', 'International ETFs', 'Active Holdings']),
     )
-    expect(screen.getByRole('button', { name: 'International Equities Heat Map' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Equities Heat Map' })).toBeNull()
   })
 
   // The chart picker is the screen's own list of positions; offering the other
@@ -404,7 +400,7 @@ describe("today's P/L", () => {
   })
 })
 
-describe('per-section heat maps', () => {
+describe('heat map', () => {
   const ONE_OF_EACH = [
     makePortfolioHolding({ symbol: 'BHP.AX' }),
     makePortfolioHolding({ symbol: 'EXPD', is_international: true }),
@@ -412,8 +408,8 @@ describe('per-section heat maps', () => {
     makePortfolioHolding({ symbol: 'IVV.AX', is_etf: true, is_international: true }),
   ]
 
-  const cardFor = (title: string) =>
-    screen.getByRole('button', { name: title }).closest('.manager-card')! as HTMLElement
+  const mapCard = () =>
+    screen.getByRole('button', { name: 'Heat Map' }).closest('.manager-card')! as HTMLElement
 
   async function renderWithHoldings(holdings: unknown[], scope: 'local' | 'international' = 'local') {
     mocked.getPortfolioHoldings.mockResolvedValue({ holdings, fx_rates: {} })
@@ -421,66 +417,61 @@ describe('per-section heat maps', () => {
     await waitFor(() => expect((triggerButton() as HTMLButtonElement).disabled).toBe(false))
   }
 
-  it('gives each of the screen\'s sections its own map, and drops the overall one', async () => {
-    await renderWithHoldings(ONE_OF_EACH)
-    await screen.findByRole('button', { name: 'Equities Heat Map' })
-
-    // The section's own tile is in its map, and its neighbour's is not: the
-    // whole point of the split is that each map is scaled to one section.
-    const equities = cardFor('Equities Heat Map')
-    expect(within(equities).getByText('BHP.AX')).toBeTruthy()
-    expect(within(equities).queryByText('VAS.AX')).toBeNull()
-    expect(within(cardFor('ETFs Heat Map')).getByText('VAS.AX')).toBeTruthy()
-
-    // The map of everything now lives on the Dashboard.
-    expect(screen.queryByText('Heat Map')).toBeNull()
+  // One map per screen, not one per kind: equities and ETFs are sized against
+  // each other, and the other screen's holdings stay on that screen's map.
+  it.each([
+    ['local', ['BHP.AX', 'VAS.AX'], ['EXPD', 'IVV.AX']],
+    ['international', ['EXPD', 'IVV.AX'], ['BHP.AX', 'VAS.AX']],
+  ] as const)('draws the %s screen\'s equities and ETFs in one map', async (scope, shown, elsewhere) => {
+    await renderWithHoldings(ONE_OF_EACH, scope)
+    await screen.findByRole('button', { name: 'Heat Map' })
+    expect(screen.getAllByRole('button', { name: /Heat Map/ })).toHaveLength(1)
+    for (const symbol of shown) expect(within(mapCard()).getByText(symbol)).toBeTruthy()
+    for (const symbol of elsewhere) expect(within(mapCard()).queryByText(symbol)).toBeNull()
   })
 
-  it('folds one section without touching the others', async () => {
-    await renderWithHoldings(ONE_OF_EACH)
-    const toggle = (title: string) => screen.getByRole('button', { name: title })
-    await waitFor(() => expect(toggle('Equities Heat Map')).toBeTruthy())
+  // Both screens' maps and the Dashboard's share one stored key, so a fold is
+  // stored under this screen's own id and leaves the others as they were.
+  it.each([
+    ['local', 'heatmap-local'],
+    ['international', 'heatmap-international'],
+  ] as const)('folds the %s map under its own id, keeping the others', async (scope, id) => {
+    mocked.getConfig.mockResolvedValue({ [COLLAPSED_CARDS_KEY]: JSON.stringify(['heatmap-overall']) })
+    await renderWithHoldings(ONE_OF_EACH, scope)
+    const toggle = await screen.findByRole('button', { name: 'Heat Map' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
 
-    fireEvent.click(toggle('Equities Heat Map'))
-    expect(toggle('Equities Heat Map').getAttribute('aria-expanded')).toBe('false')
-    expect(within(cardFor('Equities Heat Map')).queryByText('BHP.AX')).toBeNull()
-
-    // The three siblings share one stored key; folding one must not shut them.
-    expect(toggle('ETFs Heat Map').getAttribute('aria-expanded')).toBe('true')
-    expect(within(cardFor('ETFs Heat Map')).getByText('VAS.AX')).toBeTruthy()
-  })
-
-  it('adds to the stored set rather than replacing it', async () => {
-    mocked.getConfig.mockResolvedValue({ [COLLAPSED_CARDS_KEY]: JSON.stringify(['heatmap-ETFs']) })
-    await renderWithHoldings(ONE_OF_EACH)
-    const equities = await screen.findByRole('button', { name: 'Equities Heat Map' })
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'ETFs Heat Map' }).getAttribute('aria-expanded')).toBe('false'),
-    )
-
-    fireEvent.click(equities)
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
     await waitFor(() =>
       expect(mocked.updateConfig).toHaveBeenCalledWith(
         COLLAPSED_CARDS_KEY,
-        JSON.stringify(['heatmap-ETFs', 'heatmap-Equities'].sort()),
+        JSON.stringify([id, 'heatmap-overall'].sort()),
       ),
     )
   })
 
-  // A key written by an older version must not leave every map shut with
+  // A key written by an older version must not leave the map shut with
   // nothing on screen to explain it.
-  it('opens every map when the stored value is unreadable', async () => {
+  it('opens the map when the stored value is unreadable', async () => {
     mocked.getConfig.mockResolvedValue({ [COLLAPSED_CARDS_KEY]: 'not json' })
     await renderWithHoldings(ONE_OF_EACH)
-    await screen.findByRole('button', { name: 'Equities Heat Map' })
-    expect(within(cardFor('Equities Heat Map')).getByText('BHP.AX')).toBeTruthy()
-    expect(cardFor('Equities Heat Map').querySelector('button')!.getAttribute('aria-expanded')).toBe('true')
+    await screen.findByRole('button', { name: 'Heat Map' })
+    expect(within(mapCard()).getByText('BHP.AX')).toBeTruthy()
+    expect(mapCard().querySelector('button')!.getAttribute('aria-expanded')).toBe('true')
   })
 
-  it('skips a section with no holdings rather than framing an empty map', async () => {
-    await renderWithHoldings([makePortfolioHolding({ symbol: 'BHP.AX' })])
-    await screen.findByRole('button', { name: 'Equities Heat Map' })
-    expect(screen.queryByText('ETFs Heat Map')).toBeNull()
+  // Waits for the load to finish, so the map's absence is not simply the
+  // holdings not having arrived yet.
+  it('skips a screen that holds nothing rather than framing an empty map', async () => {
+    mocked.getPortfolioHoldings.mockResolvedValue({
+      holdings: [makePortfolioHolding({ symbol: 'EXPD', is_international: true })],
+      fx_rates: {},
+    })
+    const onLoading = vi.fn()
+    render(<HoldingsManager scope="local" onLoading={onLoading} />)
+    await waitFor(() => expect(onLoading).toHaveBeenLastCalledWith(false))
+    expect(screen.queryByText(/Heat Map/)).toBeNull()
   })
 
   it('shows no map at all before any holding has loaded', async () => {
