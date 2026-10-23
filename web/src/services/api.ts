@@ -471,6 +471,46 @@ export interface SyncState {
   server_time: string
 }
 
+/** Periods the sector rotation map measures, shortest first. */
+export type RotationPeriod = '1d' | '1w' | '1m' | '3m'
+
+/** One figure per period, in percent; null where there was no price to measure from. */
+export type RotationReturns = Record<RotationPeriod, number | null>
+
+export interface SectorRotationEntry {
+  symbol: string
+  /** A name from the app's sector list. */
+  sector: string
+  long_name: string | null
+  /** Newest stored close. Before the set's `as_of`, the returns are all null. */
+  last_date: string | null
+  returns: RotationReturns
+  /** `returns` minus the benchmark's, in percentage points. */
+  relative: RotationReturns
+}
+
+/** One set of sectors as GET /api/sector-rotation measures it. */
+export interface SectorRotationSet {
+  name: string
+  /** The day every figure in the set runs to: the benchmark's newest close. */
+  as_of: string | null
+  benchmark: {
+    symbol: string
+    name: string
+    long_name: string | null
+    last_date: string | null
+    returns: RotationReturns
+  }
+  sectors: SectorRotationEntry[]
+}
+
+/** One set as stored in the `sector_rotation` config value. */
+export interface SectorRotationSetConfig {
+  name: string
+  benchmark: { symbol: string; name: string }
+  sectors: { symbol: string; sector: string }[]
+}
+
 export interface AppMeta {
   sectors: string[]
   currencies: string[]
@@ -802,6 +842,16 @@ export const apiClient = {
     if (!response.ok) {
       const message = await apiErrorMessage(response)
       throw new Error(message || 'Failed to fetch portfolio holdings')
+    }
+    return response.json()
+  },
+
+  /** Every configured sector set, measured against its benchmark. */
+  async getSectorRotation(): Promise<{ sets: SectorRotationSet[] }> {
+    const response = await apiFetch(`${API_BASE_URL}/sector-rotation`)
+    if (!response.ok) {
+      const message = await apiErrorMessage(response)
+      throw new Error(message || 'Failed to fetch sector rotation')
     }
     return response.json()
   },

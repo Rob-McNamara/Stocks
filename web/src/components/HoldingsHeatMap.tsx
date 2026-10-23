@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import type { PortfolioHolding } from '../services/api'
 import { squarify, squarifyGrouped } from '../utils/treemap'
+import { labelColor, rgb, tileColor } from '../utils/heatColors'
 
 const WIDTH = 1100
 const HEIGHT = 460
@@ -40,50 +41,6 @@ type Metric = (typeof METRICS)[number][0]
  * band renders the whole map blank.
  */
 const SCALE_CAP: Record<Metric, number> = { pl: 50, today: 5 }
-
-/**
- * Diverging scale endpoints.
- *
- * Green/red is kept because it is what this app already uses for profit and
- * loss everywhere else, and a heat map that inverted that convention would be
- * misread at a glance. Colour is never the only channel though: every tile with
- * room prints its own percentage, and the tooltip carries the exact figures —
- * so the map stays readable with red-green colour vision deficiency, which is
- * precisely the axis a green-to-red ramp destroys.
- */
-const GAIN_END = { r: 27, g: 94, b: 32 } // #1b5e20
-const LOSS_END = { r: 155, g: 26, b: 26 } // #9b1a1a
-const NEUTRAL = { r: 236, g: 239, b: 241 } // #eceff1
-
-function mix(from: typeof NEUTRAL, to: typeof NEUTRAL, t: number) {
-  return {
-    r: Math.round(from.r + (to.r - from.r) * t),
-    g: Math.round(from.g + (to.g - from.g) * t),
-    b: Math.round(from.b + (to.b - from.b) * t),
-  }
-}
-
-function tileColor(pct: number | null, cap: number) {
-  if (pct === null) return { r: 207, g: 216, b: 220 } // #cfd8dc — no price to judge
-  const t = Math.min(Math.abs(pct) / cap, 1)
-  return mix(NEUTRAL, pct >= 0 ? GAIN_END : LOSS_END, t)
-}
-
-const rgb = (c: typeof NEUTRAL) => `rgb(${c.r}, ${c.g}, ${c.b})`
-
-/**
- * Label colour chosen from the tile's own luminance rather than a fixed value,
- * so text stays legible across the whole ramp — the ends are dark enough to
- * need white, the middle light enough to need near-black.
- */
-function labelColor(c: typeof NEUTRAL): string {
-  const channel = (v: number) => {
-    const s = v / 255
-    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
-  }
-  const luminance = 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
-  return luminance > 0.45 ? '#1c2430' : '#ffffff'
-}
 
 const formatAud = (value: number) =>
   `$${value.toLocaleString('en-AU', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`

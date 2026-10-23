@@ -22,6 +22,7 @@ mod cash;
 mod charts;
 mod tax;
 mod valuation;
+mod sectors;
 use market::{
     fetch_current_price, fetch_histories, http_client, fetch_price_history, fx_pair_symbol, fx_rate_on,
     fetch_price_history_from_yahoo, persist_price_history, resolve_fx_rates, yahoo_local_date,
@@ -45,6 +46,7 @@ use cash::*;
 use charts::*;
 use tax::*;
 use valuation::*;
+use sectors::*;
 use stocks::db::{insert_event_log, open_db};
 
 #[derive(Serialize)]
@@ -237,7 +239,7 @@ impl utoipa::Modify for SecurityAddon {
         get_config, update_config, get_events,
         get_tax_years, get_tax_report, update_symbol_tax_settings,
         save_tax_statement, delete_tax_statement, record_tax_export,
-        update_account_tax_share,
+        update_account_tax_share, get_sector_rotation,
     ),
     modifiers(&SecurityAddon)
 )]
@@ -396,6 +398,7 @@ async fn main() -> std::io::Result<()> {
             .service(delete_tax_statement)
             .service(record_tax_export)
             .service(update_account_tax_share)
+            .service(get_sector_rotation)
             .service(get_meta)
             .service(get_sync_state)
             .service(openapi_spec)

@@ -187,3 +187,88 @@ describe('delisted symbols', () => {
     expect(within(card()).queryByText('CCLD.AX')).toBeNull()
   })
 })
+
+describe('sector rotation sets', () => {
+  const sets = [
+    { name: 'US', benchmark: { symbol: 'SPY', name: 'S&P 500' }, sectors: [{ symbol: 'XLK', sector: 'Technology' }] },
+    { name: 'ASX', benchmark: { symbol: '^AXJO', name: 'S&P/ASX 200' }, sectors: [] },
+  ]
+
+  beforeEach(() => {
+    getConfig.mockResolvedValue({
+      sector_rotation: JSON.stringify(sets),
+      sectors: JSON.stringify(['Technology', 'Financials', 'Others']),
+    })
+  })
+
+  const savedSets = () => {
+    const call = updateConfig.mock.calls.findLast(([key]) => key === 'sector_rotation')
+    return call ? JSON.parse(call[1]) : undefined
+  }
+
+  it('lists each set with its benchmark and sectors', async () => {
+    await renderPanel()
+    expect(screen.getByText('US')).toBeTruthy()
+    expect(screen.getByText('SPY')).toBeTruthy()
+    expect(screen.getByText('XLK')).toBeTruthy()
+    expect(screen.getByText('^AXJO')).toBeTruthy()
+  })
+
+  it('picks the sector from the existing list', async () => {
+    await renderPanel()
+    fireEvent.change(screen.getByLabelText('New sector code for US'), { target: { value: 'xlf' } })
+    const picker = screen.getByLabelText('New sector for US') as HTMLSelectElement
+    expect(Array.from(picker.options).map((o) => o.textContent)).toEqual(['Select sector...', 'Technology', 'Financials', 'Others', 'New sector…'])
+    fireEvent.change(picker, { target: { value: 'Financials' } })
+    fireEvent.click(within(screen.getByText('US').closest('.rotation-config-set') as HTMLElement).getByRole('button', { name: 'Add Sector' }))
+
+    await waitFor(() => expect(savedSets()?.[0].sectors).toEqual([
+      { symbol: 'XLK', sector: 'Technology' },
+      { symbol: 'XLF', sector: 'Financials' },
+    ]))
+  })
+
+  // "Add if new": the name goes out with the set, and the server adds it to the list.
+  it('takes a new sector name, matching an existing one whatever its case', async () => {
+    await renderPanel()
+    const add = (code: string, typed: string) => {
+      fireEvent.change(screen.getByLabelText('New sector code for ASX'), { target: { value: code } })
+      fireEvent.change(screen.getByLabelText('New sector for ASX'), { target: { value: '__new__' } })
+      fireEvent.change(screen.getByLabelText('New sector name for ASX'), { target: { value: typed } })
+      fireEvent.click(within(screen.getByText('ASX').closest('.rotation-config-set') as HTMLElement).getByRole('button', { name: 'Add Sector' }))
+    }
+    add('^AXIJ', 'technology')
+    await waitFor(() => expect(savedSets()?.[1].sectors).toEqual([{ symbol: '^AXIJ', sector: 'Technology' }]))
+    add('^AXPJ', 'A-REIT')
+    await waitFor(() => expect(savedSets()?.[1].sectors).toEqual([
+      { symbol: '^AXIJ', sector: 'Technology' },
+      { symbol: '^AXPJ', sector: 'A-REIT' },
+    ]))
+  })
+
+  it('refuses a code that is already in the set, or is its benchmark', async () => {
+    await renderPanel()
+    const usSet = screen.getByText('US').closest('.rotation-config-set') as HTMLElement
+    fireEvent.change(screen.getByLabelText('New sector code for US'), { target: { value: 'xlk' } })
+    fireEvent.change(screen.getByLabelText('New sector for US'), { target: { value: 'Technology' } })
+    fireEvent.click(within(usSet).getByRole('button', { name: 'Add Sector' }))
+    expect(within(usSet).getByText('XLK is already in this set')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('New sector code for US'), { target: { value: 'spy' } })
+    fireEvent.click(within(usSet).getByRole('button', { name: 'Add Sector' }))
+    expect(within(usSet).getByText('SPY is this set’s benchmark')).toBeTruthy()
+    expect(savedSets()).toBeUndefined()
+  })
+
+  it('adds a set, and moves a set up to make it the Dashboard’s first', async () => {
+    await renderPanel()
+    fireEvent.change(screen.getByPlaceholderText('e.g. Europe'), { target: { value: 'Europe' } })
+    fireEvent.change(screen.getByPlaceholderText('e.g. SPY'), { target: { value: 'vgk' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add Set' }))
+    await waitFor(() => expect(savedSets()?.map((s: { name: string }) => s.name)).toEqual(['US', 'ASX', 'Europe']))
+    expect(savedSets()?.[2].benchmark).toEqual({ symbol: 'VGK', name: '' })
+
+    fireEvent.click(within(screen.getByText('ASX').closest('.rotation-config-set') as HTMLElement).getByRole('button', { name: 'Move up' }))
+    await waitFor(() => expect(savedSets()?.map((s: { name: string }) => s.name)).toEqual(['ASX', 'US', 'Europe']))
+  })
+})

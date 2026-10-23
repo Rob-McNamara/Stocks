@@ -13,7 +13,7 @@ vi.mock('../services/api', async (importOriginal) => {
   return {
     ...actual,
     // getConfig/updateConfig back the collapsible cards' stored state.
-    apiClient: { getPortfolioOverview: vi.fn(), getPortfolioHistory: vi.fn(), getPortfolioHoldings: vi.fn(), getConfig: vi.fn(), updateConfig: vi.fn() },
+    apiClient: { getPortfolioOverview: vi.fn(), getPortfolioHistory: vi.fn(), getPortfolioHoldings: vi.fn(), getSectorRotation: vi.fn(), getConfig: vi.fn(), updateConfig: vi.fn() },
   }
 })
 
@@ -21,6 +21,7 @@ import { apiClient } from '../services/api'
 const getPortfolioOverview = apiClient.getPortfolioOverview as ReturnType<typeof vi.fn>
 const getPortfolioHistory = apiClient.getPortfolioHistory as ReturnType<typeof vi.fn>
 const getPortfolioHoldings = apiClient.getPortfolioHoldings as ReturnType<typeof vi.fn>
+const getSectorRotation = apiClient.getSectorRotation as ReturnType<typeof vi.fn>
 const getConfig = apiClient.getConfig as ReturnType<typeof vi.fn>
 const updateConfig = apiClient.updateConfig as ReturnType<typeof vi.fn>
 
@@ -135,6 +136,7 @@ beforeEach(() => {
   getPortfolioOverview.mockResolvedValue(overviewFixture())
   getPortfolioHistory.mockReset().mockResolvedValue(historyFixture())
   getPortfolioHoldings.mockReset().mockResolvedValue({ holdings: [], fx_rates: {} })
+  getSectorRotation.mockReset().mockResolvedValue({ sets: [] })
   getConfig.mockReset().mockResolvedValue({})
   updateConfig.mockReset().mockResolvedValue(undefined)
   // The config read is cached module-wide, so one test's stored state would
@@ -197,6 +199,44 @@ describe('Dashboard heat map', () => {
     getPortfolioHoldings.mockRejectedValue(new Error('nope'))
     await renderDashboard()
     expect(screen.queryByText('Heat Map')).toBeNull()
+    expect(screen.getByText('Worst Holdings — 150SMA')).toBeTruthy()
+  })
+})
+
+describe('Dashboard sector rotation', () => {
+  const returns = (v: number) => ({ '1d': v, '1w': v, '1m': v, '3m': v })
+  const sets = [
+    {
+      name: 'US',
+      as_of: '2026-10-23',
+      benchmark: { symbol: 'SPY', name: 'S&P 500', long_name: null, last_date: '2026-10-23', returns: returns(1) },
+      sectors: [
+        { symbol: 'XLK', sector: 'Technology', long_name: null, last_date: '2026-10-23', returns: returns(3), relative: returns(2) },
+      ],
+    },
+  ]
+
+  it('shows the sets as tiles below the heat map', async () => {
+    getSectorRotation.mockResolvedValue({ sets })
+    await renderDashboard()
+    const card = (await screen.findByText('Sector Rotation')).closest('.manager-card')! as HTMLElement
+    await waitFor(() => expect(within(card).getByText('XLK')).toBeTruthy())
+    expect(within(card).getByText('SPY')).toBeTruthy()
+    expect(within(card).getByText('Fri 23 Oct 2026')).toBeTruthy()
+  })
+
+  it('leaves the card out when every set has been removed', async () => {
+    await renderDashboard()
+    await waitFor(() => expect(getSectorRotation).toHaveBeenCalled())
+    await waitFor(() => expect(screen.queryByText('Sector Rotation')).toBeNull())
+  })
+
+  // A failure is the card's alone: the rest of the dashboard still renders.
+  it('says why inside its own card when the fetch fails', async () => {
+    getSectorRotation.mockRejectedValue(new Error('Yahoo is down'))
+    await renderDashboard()
+    const card = (await screen.findByText('Sector Rotation')).closest('.manager-card')! as HTMLElement
+    await waitFor(() => expect(within(card).getByText('Yahoo is down')).toBeTruthy())
     expect(screen.getByText('Worst Holdings — 150SMA')).toBeTruthy()
   })
 })

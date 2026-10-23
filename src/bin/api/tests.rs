@@ -5047,10 +5047,12 @@ async fn post_refresh(db_path: &std::path::Path, uri: &str) -> serde_json::Value
 
 /// One sequential scenario: REFRESH_IN_FLIGHT is process-global, so the
 /// debounce cases must not run as parallel tests. The DB is empty (no
-/// watchlist, no holdings), so no request touches the network.
+/// watchlist, no holdings, and the seeded sector sets cleared), so no request
+/// touches the network.
 #[actix_web::test]
 async fn refresh_debounce_scenario() {
     let (_file, db_path) = setup_test_db();
+    upsert_config(&db_path, SECTOR_ROTATION, "[]").unwrap();
 
     // Fresh DB: runs, and an empty portfolio still stamps the debounce
     let body = post_refresh(&db_path, "/api/refresh").await;
@@ -5987,4 +5989,229 @@ async fn the_worksheet_lists_what_still_has_to_be_entered() {
     let body = String::from_utf8(actix_web::test::read_body(actix_web::test::call_service(&app, req).await).await.to_vec()).unwrap();
     assert!(body.contains("To complete — Dividends: franking"), "{}", body);
     assert!(body.contains("NOF.AX,2024-09-02,,100,100.00,,,"), "{}", body);
+}
+
+// -------------------------------------------------------------------------
+// Sector rotation
+// -------------------------------------------------------------------------
+
+fn rotation_set(name: &str, benchmark: &str, sectors: &[(&str, &str)]) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "benchmark": { "symbol": benchmark, "name": format!("{benchmark} index") },
+        "sectors": sectors.iter().map(|(symbol, sector)| serde_json::json!({ "symbol": symbol, "sector": sector })).collect::<Vec<_>>(),
+    })
+}
+
+fn stored_sectors(db_path: &PathBuf) -> Vec<String> {
+    let raw: String = open_db(db_path)
+        .unwrap()
+        .query_row("SELECT value FROM app_config WHERE key = 'sectors'", [], |r| r.get(0))
+        .unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+async fn put_config(db_path: &Path, key: &str, value: &str) -> actix_web::http::StatusCode {
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.to_path_buf())).service(update_config),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::put()
+        .uri("/api/config")
+        .set_json(serde_json::json!({ "key": key, "value": value }))
+        .to_request();
+    actix_web::test::call_service(&app, req).await.status()
+}
+
+/// Everything the Configuration screen can build must pass — including a set
+/// that has just been created and has no sectors yet.
+#[test]
+fn sector_rotation_validation_accepts_the_defaults_and_partial_sets() {
+    let defaults = serde_json::to_string(&default_rotation_sets()).unwrap();
+    assert_eq!(validate_config_value(SECTOR_ROTATION, &defaults), Ok(()));
+    assert_eq!(validate_sector_rotation("[]"), Ok(()), "no sets is a legitimate configuration");
+    let bare = serde_json::json!([{ "name": "New", "benchmark": { "symbol": "SPY", "name": "" }, "sectors": [] }]);
+    assert_eq!(validate_sector_rotation(&bare.to_string()), Ok(()));
+}
+
+/// Each rejection names the set and the entry at fault.
+#[test]
+fn sector_rotation_validation_rejects_and_explains() {
+    let one = |set: serde_json::Value| serde_json::json!([set]).to_string();
+    let cases: Vec<(String, &str)> = vec![
+        ("{not json".to_string(), "not valid JSON"),
+        (r#"{"name":"US"}"#.to_string(), "must be a JSON array"),
+        ("[3]".to_string(), "set 1: must be an object"),
+        (one(serde_json::json!({ "benchmark": { "symbol": "SPY" } })), "set 1: name is required"),
+        (one(serde_json::json!({ "name": "US" })), "benchmark is required"),
+        (one(serde_json::json!({ "name": "US", "benchmark": { "name": "S&P 500" } })), "benchmark symbol is required"),
+        (one(serde_json::json!({ "name": "US", "benchmark": { "symbol": "SPY", "name": 5 } })), "benchmark name must be text"),
+        (one(serde_json::json!({ "name": "US", "benchmark": { "symbol": "SPY" }, "sectors": "XLK" })), "sectors must be a list"),
+        (one(rotation_set("US", "SPY", &[("", "Technology")])), "set 1, sector 1: symbol is required"),
+        (one(rotation_set("US", "SPY", &[("XLK", " ")])), "set 1, sector 1: sector is required"),
+        (one(rotation_set("US", "SPY", &[("XLK", "Technology"), ("xlk ", "Technology")])), "set 1, sector 2: XLK is listed twice"),
+        (one(rotation_set("US", "SPY", &[("spy", "Market")])), "SPY is the set's benchmark"),
+        (
+            serde_json::json!([rotation_set("US", "SPY", &[]), rotation_set("us", "IVV", &[])]).to_string(),
+            "set 2: duplicate name 'us'",
+        ),
+        (
+            serde_json::Value::Array((0..11).map(|i| rotation_set(&format!("S{i}"), "SPY", &[])).collect()).to_string(),
+            "11 sets is more than the 10 allowed",
+        ),
+    ];
+    for (json, expected) in cases {
+        let err = validate_config_value(SECTOR_ROTATION, &json).expect_err(&format!("should have been rejected: {json}"));
+        assert!(err.contains(expected), "expected {expected:?} in {err:?}");
+    }
+}
+
+/// A new database starts with the US and ASX sets, and every sector they
+/// name is one the holdings screens can pick.
+#[test]
+fn a_fresh_database_seeds_the_us_and_asx_sets() {
+    let (_file, db_path) = setup_test_db();
+    let raw: String = open_db(&db_path)
+        .unwrap()
+        .query_row("SELECT value FROM app_config WHERE key = ?1", params![SECTOR_ROTATION], |r| r.get(0))
+        .unwrap();
+    let sets: Vec<RotationSetConfig> = serde_json::from_str(&raw).unwrap();
+    let names: Vec<&str> = sets.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["US", "ASX"]);
+    assert_eq!(sets[0].benchmark.symbol, "SPY");
+    assert_eq!(sets[1].benchmark.symbol, "^AXJO");
+    assert!(sets.iter().all(|s| s.sectors.len() == 11), "eleven sectors in each");
+
+    let listed = stored_sectors(&db_path);
+    for sector in sets.iter().flat_map(|s| &s.sectors) {
+        assert!(listed.contains(&sector.sector), "{} is not in the sector list", sector.sector);
+    }
+    assert_eq!(listed.last().map(String::as_str), Some("Others"), "the defaults add nothing, so Others stays last");
+    assert!(listed.contains(&"Technology".to_string()) && !listed.contains(&"Information Technology".to_string()));
+}
+
+/// The seed only lands once: a set the user deleted does not come back on the
+/// next start, and neither does a sector they took off the list.
+#[test]
+fn reseeding_leaves_edited_sets_alone() {
+    let (_file, db_path) = setup_test_db();
+    upsert_config(&db_path, SECTOR_ROTATION, "[]").unwrap();
+    init_db(&db_path).unwrap();
+    let raw: String = open_db(&db_path)
+        .unwrap()
+        .query_row("SELECT value FROM app_config WHERE key = ?1", params![SECTOR_ROTATION], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw, "[]");
+}
+
+/// "Use the existing sector list, add if new": saving a set that names a
+/// sector the list lacks adds it — ahead of Others, and only once.
+#[actix_web::test]
+async fn saving_a_set_adds_a_new_sector_to_the_list() {
+    let (_file, db_path) = setup_test_db();
+    let sets = serde_json::json!([rotation_set("Themes", "SPY", &[("IBIT", "Crypto"), ("XLK", "Technology")])]).to_string();
+    assert!(put_config(&db_path, SECTOR_ROTATION, &sets).await.is_success());
+
+    let listed = stored_sectors(&db_path);
+    assert_eq!(&listed[listed.len() - 2..], ["Crypto", "Others"], "added ahead of Others: {listed:?}");
+    assert_eq!(listed.iter().filter(|s| *s == "Technology").count(), 1, "an existing name is not added again");
+
+    // Saving again names nothing new, so the list is not rewritten.
+    let sector_list_audits = || audit_rows(&db_path, "app_config").into_iter().filter(|(_, v)| v.as_deref().is_some_and(|v| v.contains(r#""key":"sectors""#))).count();
+    let before = sector_list_audits();
+    assert!(put_config(&db_path, SECTOR_ROTATION, &sets).await.is_success());
+    assert_eq!(sector_list_audits(), before, "no audit row for a list that did not change");
+}
+
+/// A refused set must leave both the sets and the sector list as they were.
+#[actix_web::test]
+async fn a_refused_set_changes_nothing() {
+    let (_file, db_path) = setup_test_db();
+    let before = stored_sectors(&db_path);
+    let bad = serde_json::json!([rotation_set("US", "SPY", &[("SPY", "Brand new")])]).to_string();
+    assert_eq!(put_config(&db_path, SECTOR_ROTATION, &bad).await, 400);
+    assert_eq!(stored_sectors(&db_path), before);
+    let raw: String = open_db(&db_path)
+        .unwrap()
+        .query_row("SELECT value FROM app_config WHERE key = ?1", params![SECTOR_ROTATION], |r| r.get(0))
+        .unwrap();
+    assert!(raw.contains("XLK"), "the seeded sets are still in place");
+}
+
+/// The refresh quotes each symbol once, however many sets name it.
+#[test]
+fn the_refresh_quotes_every_set_symbol_once() {
+    let (_file, db_path) = setup_test_db();
+    let sets = serde_json::json!([
+        rotation_set("A", "spy", &[("XLK", "Technology"), ("XLF", "Financials")]),
+        rotation_set("B", "IVV", &[("xlk", "Technology"), ("SPY", "Market")]),
+    ]);
+    upsert_config(&db_path, SECTOR_ROTATION, &sets.to_string()).unwrap();
+    assert_eq!(sector_rotation_symbols(&db_path).unwrap(), ["SPY", "XLK", "XLF", "IVV"]);
+}
+
+/// The S&P/ASX indices trade on the ASX timetable even without the .AX suffix.
+#[test]
+fn asx_indices_follow_the_asx_monday_cutoff() {
+    // 08:00 UTC Monday 5 Jan 2026: the ASX has closed, US markets have not opened.
+    let now = Utc.with_ymd_and_hms(2026, 1, 5, 8, 0, 0).unwrap();
+    assert_eq!(last_expected_trading_day(now, "^AXJO"), "2026-01-05");
+    assert_eq!(last_expected_trading_day(now, "^axij"), "2026-01-05");
+    assert_eq!(last_expected_trading_day(now, "SPY"), "2026-01-02");
+}
+
+/// The endpoint measures each sector over the benchmark's days, and leaves a
+/// sector blank — with its last date — when it has no price for that day.
+#[actix_web::test]
+async fn sector_rotation_measures_each_sector_against_its_benchmark() {
+    let (_file, db_path) = setup_test_db();
+    let sets = serde_json::json!([rotation_set("Test", "ROTB.TEST", &[("ROTA.TEST", "Technology"), ("ROTS.TEST", "Energy")])]);
+    upsert_config(&db_path, SECTOR_ROTATION, &sets.to_string()).unwrap();
+    {
+        let conn = open_db(&db_path).unwrap();
+        let bars: [(&str, &[(&str, f64)]); 3] = [
+            ("ROTB.TEST", &[("2026-07-23", 100.0), ("2026-09-23", 100.0), ("2026-10-16", 100.0), ("2026-10-22", 100.0), ("2026-10-23", 101.0)]),
+            ("ROTA.TEST", &[("2026-07-23", 50.0), ("2026-09-23", 50.0), ("2026-10-16", 50.0), ("2026-10-22", 50.0), ("2026-10-23", 52.0)]),
+            // No close on the 23rd: behind the benchmark.
+            ("ROTS.TEST", &[("2026-10-21", 20.0), ("2026-10-22", 21.0)]),
+        ];
+        for (symbol, rows) in bars {
+            for (date, close) in rows {
+                conn.execute(
+                    "INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, '2026-10-24T00:00:00Z')",
+                    params![symbol, date, close],
+                )
+                .unwrap();
+            }
+        }
+    }
+    // Stored bars only: no Yahoo top-up inside the test.
+    for symbol in ["ROTB.TEST", "ROTA.TEST", "ROTS.TEST"] {
+        mark_history_checked(symbol);
+    }
+
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.clone())).service(get_sector_rotation),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::get().uri("/api/sector-rotation").to_request();
+    let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+
+    let set = &body["sets"][0];
+    assert_eq!(set["name"], "Test");
+    assert_eq!(set["as_of"], "2026-10-23", "the benchmark's newest close sets the day");
+    let approx = |v: &serde_json::Value, expected: f64| {
+        let found = v.as_f64().unwrap_or_else(|| panic!("expected {expected}, found {v}"));
+        assert!((found - expected).abs() < 1e-9, "expected {expected}, found {found}");
+    };
+    for period in ["1d", "1w", "1m", "3m"] {
+        approx(&set["benchmark"]["returns"][period], 1.0);
+        approx(&set["sectors"][0]["returns"][period], 4.0);
+        approx(&set["sectors"][0]["relative"][period], 3.0);
+        assert!(set["sectors"][1]["returns"][period].is_null(), "a sector behind the benchmark is blank");
+        assert!(set["sectors"][1]["relative"][period].is_null());
+    }
+    assert_eq!(set["sectors"][1]["last_date"], "2026-10-22", "and says how far behind it is");
+    assert_eq!(set["sectors"][0]["sector"], "Technology");
+    assert_eq!(set["benchmark"]["name"], "ROTB.TEST index");
 }

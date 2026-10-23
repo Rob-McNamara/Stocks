@@ -13,7 +13,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
-use crate::{open_db, DEFAULT_SECTORS_JSON};
+use crate::{open_db, seed_sector_rotation, DEFAULT_SECTORS_JSON};
 
 pub fn init_db(path: &PathBuf) -> Result<(), String> {
     let mut db = open_db(path).map_err(|err| err.to_string())?;
@@ -189,6 +189,10 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
         params![DEFAULT_SECTORS_JSON],
     )
     .map_err(|err| err.to_string())?;
+
+    // Seed the Dashboard's sector rotation sets (US and ASX). Seeded after the
+    // sector list, which any sector the sets name is added to.
+    seed_sector_rotation(&conn)?;
 
     // holdings_custom_fields: per-transaction values for user-defined custom fields
     conn.execute_batch(

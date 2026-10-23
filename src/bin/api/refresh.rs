@@ -130,6 +130,34 @@ pub(crate) async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<R
         }
     };
 
+    // The Dashboard's sector rotation sets. Nothing else quotes their
+    // benchmarks and sectors, since none of them need be held or watched, and
+    // without this their day's move would only arrive with the next history
+    // top-up.
+    let mut sector_ok = 0;
+    let sector_symbols = sector_rotation_symbols(&db_path).unwrap_or_else(|err| {
+        let _ = insert_event_log(&db_path, "error", "refresh_all", "api", None, &format!("Could not list the sector rotation symbols: {}", err));
+        errors.push(err);
+        Vec::new()
+    });
+    let sector_count = if sector_symbols.is_empty() {
+        0
+    } else {
+        match fetch_and_cache_current_prices(&db_path, &sector_symbols, SECTOR_PRICES_UPDATED_AT).await {
+            Ok(prices) => {
+                sector_ok = prices.iter().filter(|p| p.error.is_none()).count();
+                // A mistyped code fails on every run, and the banner is where
+                // that shows.
+                errors.extend(prices.iter().filter_map(|p| p.error.clone()));
+                prices.len()
+            }
+            Err(err) => {
+                errors.push(err);
+                0
+            }
+        }
+    };
+
     let dividends = refresh_dividends_for_symbols(&db_path, holding_symbols).await;
     errors.extend(dividends.errors.clone());
 
@@ -154,13 +182,14 @@ pub(crate) async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<R
             let _ = insert_event_log(&db_path, "error", "refresh_all", "api", None, &err);
         }
 
-    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, {} sold prices, dividends for {} symbols ({} error(s))", watchlist_ok, holdings_ok, exited_ok, dividends.updated, errors.len()));
+    let _ = insert_event_log(&db_path, "info", "refresh_all", "api", None, &format!("Refreshed {} watchlist prices, {} holdings prices, {} sold prices, {} sector prices, dividends for {} symbols ({} error(s))", watchlist_ok, holdings_ok, exited_ok, sector_ok, dividends.updated, errors.len()));
 
     HttpResponse::Ok().json(serde_json::json!({
         "skipped": false,
         "watchlist_prices": watchlist_count,
         "holdings_prices": holdings_count,
         "sold_prices": exited_count,
+        "sector_prices": sector_count,
         "dividends_updated": dividends.updated,
         "dividends_recorded": recorded.recorded,
         "errors": errors,

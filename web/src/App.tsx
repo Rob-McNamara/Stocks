@@ -184,7 +184,7 @@ function App() {
 
       <main className="app-content">
         <div style={{ display: activeTab === 'dashboard' ? 'block' : 'none' }}>
-          <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} onNavigateToWatchlist={handleNavigateToWatchlist} onNavigateToHoldings={handleNavigateToHoldings} />
+          <Dashboard onLoading={setLoading} holdingsVersion={holdingsVersion} configVersion={configVersion} onNavigateToWatchlist={handleNavigateToWatchlist} onNavigateToHoldings={handleNavigateToHoldings} />
         </div>
         <div style={{ display: activeTab === 'watchlist' ? 'block' : 'none' }}>
           <WatchlistManager onLoading={setLoading} initialSymbol={watchlistFocusSymbol} onInitialSymbolConsumed={() => setWatchlistFocusSymbol(null)} onMoveToHoldings={handleMoveToHoldings} removeSymbolRequest={watchlistRemoveSymbol} onRemoveSymbolConsumed={() => setWatchlistRemoveSymbol(null)} />

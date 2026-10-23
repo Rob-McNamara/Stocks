@@ -69,6 +69,7 @@ pub(crate) fn validate_config_value(key: &str, value: &str) -> Result<(), String
     match key {
         "dashboard_custom_lists" => validate_dashboard_custom_lists(value),
         "holdings_custom_fields" | "watchlist_custom_fields" => validate_custom_fields(value),
+        SECTOR_ROTATION => validate_sector_rotation(value),
         PORTFOLIO_HISTORY_START => validate_optional_date(value),
         DIVIDEND_RECORD_FROM => validate_optional_date(value),
         // A delisting date is compared against bar dates as text, so a value in
@@ -260,7 +261,19 @@ pub(crate) async fn update_config(
         return err_bad_request(message);
     }
 
-    match upsert_config(&db_path, key, value) {
+    // The sector rotation sets name sectors from the app's list, and a name the
+    // list lacks is added to it in the same transaction.
+    let saved = if key == SECTOR_ROTATION {
+        save_sector_rotation(&db_path, value).map(|added| {
+            if !added.is_empty() {
+                let _ = insert_event_log(&db_path, "info", "config_update", "api", Some("sectors"),
+                    &format!("Added {} to the sector list", added.join(", ")));
+            }
+        })
+    } else {
+        upsert_config(&db_path, key, value)
+    };
+    match saved {
         Ok(()) => {
             let _ = insert_event_log(&db_path, "info", "config_update", "api", Some(key), &format!("Updated config {}", key));
             if let Some(symbol) = key.strip_prefix(DEAD_SYMBOL_PREFIX).filter(|_| !value.is_empty()) {
@@ -412,7 +425,7 @@ pub(crate) fn fetch_event_log(db_path: &PathBuf, q: &EventQuery) -> Result<(Vec<
     Ok((items, total))
 }
 
-pub(crate) const DEFAULT_SECTORS_JSON: &str = r#"["Energy","Materials","Industrials","Consumer Discretionary","Consumer Staples","Health Care","Financials","Information Technology","Communication Services","Utilities","Real Estate","Others"]"#;
+pub(crate) const DEFAULT_SECTORS_JSON: &str = r#"["Energy","Materials","Industrials","Consumer Discretionary","Consumer Staples","Health Care","Financials","Technology","Communication Services","Utilities","Real Estate","Others"]"#;
 
 /// Earliest date the portfolio value chart will report, empty for no floor.
 ///

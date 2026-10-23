@@ -318,6 +318,114 @@
   background: linear-gradient(to right, #9b1a1a 0%, #eceff1 50%, #1b5e20 100%);
 }
 
+/* ---------------------------------------------------------------
+   Sector rotation — one equal tile per sector, the benchmark first.
+   Six across fills two rows for an eleven-sector set and its benchmark;
+   narrower cards step down to four, three and two, which divide twelve
+   evenly too. Measured against the card rather than the window, because
+   the Layout width setting decides how wide the card actually is.
+   --------------------------------------------------------------- */
+.rotation-map {
+  container-type: inline-size;
+}
+
+.rotation-asof {
+  margin: -4px 0 12px;
+  font-size: 12px;
+  color: #8a92a6;
+}
+
+.rotation-asof strong {
+  color: #5b6478;
+}
+
+.rotation-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+}
+
+@container (max-width: 960px) {
+  .rotation-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@container (max-width: 600px) {
+  .rotation-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@container (max-width: 420px) {
+  .rotation-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.rotation-tile {
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-height: 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rotation-symbol {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+/* Wrapped rather than cut off: "Consumer Discretionary" and "+3.2 pp vs
+   S&P/ASX 200" are the information, and a row of tiles grows together. */
+.rotation-name,
+.rotation-sub {
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.rotation-value {
+  font-size: 20px;
+  font-weight: 700;
+  margin-top: auto;
+}
+
+/* The Configuration screen's editor: one bordered block per set. */
+.rotation-config-set {
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.rotation-config-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.rotation-config-benchmark {
+  font-weight: 600;
+  color: #111111;
+}
+
+/* Eleven sectors a set: rows sized for a list, not for a data table. */
+.holdings-table.rotation-config-table th,
+.holdings-table.rotation-config-table td {
+  padding: 6px 12px;
+}
+
+.rotation-config-table select.config-input {
+  padding: 5px 8px;
+  font-size: 13px;
+  min-width: 220px;
+}
+
 .legend-swatch {
   width: 16px;
   height: 12px;

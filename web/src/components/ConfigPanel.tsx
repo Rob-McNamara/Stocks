@@ -1,6 +1,8 @@
 import { useState, useEffect, useEffectEvent } from 'react'
-import { apiClient } from '../services/api'
+import { apiClient, type SectorRotationSetConfig } from '../services/api'
 import { OVERLAYS } from '../utils/chartOverlays'
+import { SECTORS } from '../utils/sectors'
+import SectorRotationConfig from './SectorRotationConfig'
 import {
   CHART_DEFAULTS_KEY, CHART_HEIGHT_RANGE, FALLBACK_CHART_DEFAULTS, TIMEFRAMES,
   parseChartDefaults, type ChartDefaults, type ChartTimeframe,
@@ -102,6 +104,10 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
   const saveDashboardLists = (next: typeof dashboardLists) =>
     saveConfigList('dashboard_custom_lists', next, dashboardLists, setDashboardLists, 'the dashboard lists')
 
+  const [rotationSets, setRotationSets] = useState<SectorRotationSetConfig[]>([])
+  const saveRotationSets = (next: SectorRotationSetConfig[]) =>
+    saveConfigList('sector_rotation', next, rotationSets, setRotationSets, 'the sector rotation sets')
+
   const saveWatchlistFields = (next: typeof customFieldDefs) =>
     saveConfigList('watchlist_custom_fields', next, customFieldDefs, setCustomFieldDefs, 'the watchlist fields')
 
@@ -172,6 +178,9 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
         try {
           setDashboardLists(JSON.parse(data['dashboard_custom_lists'] ?? '[]'))
         } catch { setDashboardLists([]) }
+        try {
+          setRotationSets(JSON.parse(data['sector_rotation'] ?? '[]'))
+        } catch { setRotationSets([]) }
         setChartDefaults(parseChartDefaults(data[CHART_DEFAULTS_KEY], OVERLAYS.map((o) => o.id)))
         setLayoutWidth(parseLayoutWidth(data[LAYOUT_WIDTH_KEY]))
       })
@@ -195,6 +204,17 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
     .filter(([k, v]) => k.startsWith('dead_symbol_') && v !== '')
     .map(([k, v]) => ({ symbol: k.replace('dead_symbol_', ''), lastTraded: v }))
     .sort((a, b) => a.symbol.localeCompare(b.symbol))
+
+  // The sector list the Holdings and Watchlist pickers use, for the sector
+  // rotation sets to choose from.
+  const sectorList: string[] = (() => {
+    try {
+      const parsed: unknown = JSON.parse(config['sectors'] ?? '')
+      return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === 'string') : [...SECTORS]
+    } catch {
+      return [...SECTORS]
+    }
+  })()
 
   const manualTypes = Object.entries(config)
     .filter(([k, v]) => k.startsWith('instrument_type_') && v !== '')
@@ -1074,6 +1094,8 @@ export default function ConfigPanel({ onLoading, onConfigChanged }: ConfigPanelP
               )}
             </div>
           </div>
+
+          <SectorRotationConfig sets={rotationSets} sectorList={sectorList} onSave={saveRotationSets} />
 
           <div className="manager-card" style={{ marginTop: 24 }}>
             <h2>Layout</h2>

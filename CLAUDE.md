@@ -66,9 +66,10 @@ Shared by every binary, in `src/` (the `stocks` library):
 - `prices.rs` — `upsert_daily_bar`, the one writer for `prices` (refuses zero closes, keeps backfilled OHLC).
 - `dividends.rs` — fetching, de-duplicating and storing dividend events.
 - `portfolio.rs`, `indicators.rs`, `hindsight.rs` — the calculation engines. `portfolio::walk_parcels` is the one FIFO walk that matches sales to purchases parcel by parcel; reuse it rather than keeping another lot queue.
+- `rotation.rs` — sector rotation: each period's price move (1D, 1W, 1M, 3M) to a given day, and the difference from a benchmark in percentage points.
 - `tax.rs` — Australian income-tax rules for the tax report: income years, the 12-month CGT discount, loss ordering, franking gross-up.
 
-The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
+The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `sectors` (the Dashboard's sector rotation sets, stored in `app_config` as `sector_rotation`), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
 
 A write that touches more than one row goes through `with_tx`, so it commits all-or-nothing.
 

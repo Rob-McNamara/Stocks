@@ -609,13 +609,15 @@ pub(crate) async fn fetch_and_cache_current_prices(
 
 /// Most recent date (YYYY-MM-DD, UTC) for which a daily close bar is
 /// expected to exist for `symbol`. Weekends map back to Friday. The Monday
-/// cutoff is market-aware: ASX (.AX) closes ~05:00–06:00 UTC (16:00
-/// Sydney), so Monday's close is expected from 07:00 UTC — hours before US
-/// markets even open; US symbols keep a ~10:00 UTC cutoff, with Friday the
-/// last expected bar before it. Without the split, Monday-afternoon Sydney
-/// sessions would be treated as up to date on Friday's data.
+/// cutoff is market-aware: ASX (.AX listings, and the ^AX… S&P/ASX indices)
+/// closes ~05:00–06:00 UTC (16:00 Sydney), so Monday's close is expected from
+/// 07:00 UTC — hours before US markets even open; US symbols keep a ~10:00 UTC
+/// cutoff, with Friday the last expected bar before it. Without the split,
+/// Monday-afternoon Sydney sessions would be treated as up to date on Friday's
+/// data.
 pub(crate) fn last_expected_trading_day(now: chrono::DateTime<Utc>, symbol: &str) -> String {
-    let monday_cutoff_hour = if symbol.to_uppercase().ends_with(".AX") { 7 } else { 10 };
+    let upper = symbol.to_uppercase();
+    let monday_cutoff_hour = if upper.ends_with(".AX") || upper.starts_with("^AX") { 7 } else { 10 };
     let days_back = match now.weekday() {
         chrono::Weekday::Sat => 1,
         chrono::Weekday::Sun => 2,

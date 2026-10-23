@@ -1,7 +1,8 @@
 import { useEffect, useEffectEvent, useMemo, useState } from 'react'
-import { apiClient, type CashAccount, type PortfolioOverview, type CustomListEntry, type CustomListResult, type PortfolioHistory, type PortfolioHolding } from '../services/api'
+import { apiClient, type CashAccount, type PortfolioOverview, type CustomListEntry, type CustomListResult, type PortfolioHistory, type PortfolioHolding, type SectorRotationSet } from '../services/api'
 import PortfolioHistoryChart from './PortfolioHistoryChart'
 import HoldingsHeatMap from './HoldingsHeatMap'
+import SectorRotationMap from './SectorRotationMap'
 import CollapsibleCard from './CollapsibleCard'
 
 // Thin client: every number on this screen — totals, breakdowns, sectors,
@@ -102,7 +103,7 @@ function metricCell(key: string, entry: CustomListEntry) {
   )
 }
 
-export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatchlist, onNavigateToHoldings }: { onLoading: (loading: boolean) => void; holdingsVersion?: number; onNavigateToWatchlist?: (symbol: string) => void; onNavigateToHoldings?: (symbol: string) => void }) {
+export default function Dashboard({ onLoading, holdingsVersion, configVersion, onNavigateToWatchlist, onNavigateToHoldings }: { onLoading: (loading: boolean) => void; holdingsVersion?: number; configVersion?: number; onNavigateToWatchlist?: (symbol: string) => void; onNavigateToHoldings?: (symbol: string) => void }) {
   const [overview, setOverview] = useState<PortfolioOverview | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -123,6 +124,9 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
    * their own endpoint — and a failure there empties the map alone.
    */
   const [heatMapHoldings, setHeatMapHoldings] = useState<PortfolioHolding[]>([])
+  /** The sector rotation sets; null until the first response lands. */
+  const [sectorSets, setSectorSets] = useState<SectorRotationSet[] | null>(null)
+  const [sectorError, setSectorError] = useState<string | null>(null)
 
   /**
    * A range starting at or before the configured floor returns exactly what
@@ -187,6 +191,20 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       .then((r) => setHeatMapHoldings(r.holdings))
       .catch(() => setHeatMapHoldings([]))
   }, [holdingsVersion])
+
+  // Loaded separately: it has nothing to do with the portfolio, and the first
+  // load of a new set fetches a year of history per symbol. Reloaded after the
+  // startup refresh (holdingsVersion) brings today's quotes, and after the sets
+  // are edited (configVersion).
+  useEffect(() => {
+    apiClient
+      .getSectorRotation()
+      .then((r) => {
+        setSectorError(null)
+        setSectorSets(r.sets)
+      })
+      .catch((err) => setSectorError(err instanceof Error ? err.message : 'Failed to load sector rotation'))
+  }, [holdingsVersion, configVersion])
 
   // Loaded separately from the overview: it sweeps every day of history, so a
   // slow response should not hold up the rest of the dashboard.
@@ -369,6 +387,20 @@ export default function Dashboard({ onLoading, holdingsVersion, onNavigateToWatc
       {heatMapHoldings.length > 0 && (
         <CollapsibleCard id="heatmap-overall" title="Heat Map">
           <HoldingsHeatMap holdings={heatMapHoldings} onSelectSymbol={onNavigateToHoldings} />
+        </CollapsibleCard>
+      )}
+
+      {/* Sectors against their benchmark, from the sets on the Configuration
+          screen. Hidden only when every set has been deleted. */}
+      {(sectorSets === null || sectorSets.length > 0 || sectorError) && (
+        <CollapsibleCard id="heatmap-sectors" title="Sector Rotation">
+          {sectorError ? (
+            <div className="alert alert-error">{sectorError}</div>
+          ) : sectorSets === null ? (
+            <p className="loading-text">Loading sector rotation…</p>
+          ) : (
+            <SectorRotationMap sets={sectorSets} />
+          )}
         </CollapsibleCard>
       )}
 

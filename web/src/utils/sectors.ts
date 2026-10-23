@@ -13,7 +13,7 @@ export const SECTORS = [
   'Consumer Staples',
   'Health Care',
   'Financials',
-  'Information Technology',
+  'Technology',
   'Communication Services',
   'Utilities',
   'Real Estate',
