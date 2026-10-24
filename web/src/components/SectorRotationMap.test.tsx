@@ -1,9 +1,18 @@
 // @vitest-environment jsdom
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
 import SectorRotationMap from './SectorRotationMap'
 import { formatSessionDate } from '../utils/sessionDate'
-import type { RotationReturns, SectorRotationSet } from '../services/api'
+import type { RotationReturns, SectorHoldings, SectorRotationSet } from '../services/api'
+
+// Opening a tile fetches its fund's holdings; the tests decide what comes back.
+vi.mock('../services/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/api')>()
+  return { ...actual, apiClient: { getSectorHoldings: vi.fn() } }
+})
+
+import { apiClient } from '../services/api'
+const getSectorHoldings = apiClient.getSectorHoldings as ReturnType<typeof vi.fn>
 
 const returns = (d: number | null, w: number | null, m: number | null, q: number | null): RotationReturns => ({
   '1d': d, '1w': w, '1m': m, '3m': q,
@@ -63,7 +72,28 @@ const tile = (symbol: string) =>
 
 const pressed = (name: string) => screen.getByRole('button', { name }).getAttribute('aria-pressed')
 
-beforeEach(() => cleanup())
+/** XLE opened up: two holdings and a cash line Yahoo gives no ticker for. */
+function energyHoldings(): SectorHoldings {
+  const none = returns(null, null, null, null)
+  return {
+    set: 'US',
+    symbol: 'XLE',
+    name: 'Energy',
+    as_of: '2026-10-23',
+    benchmark: { symbol: 'SPY', name: 'S&P 500' },
+    top_weight: 39.4,
+    holdings: [
+      { symbol: 'XOM', name: 'Exxon Mobil Corp', weight: 22.9, last_date: '2026-10-23', returns: returns(1.2, 2.0, 9.0, 15.0), relative: returns(1.7, 2.4, 10.0, 12.0) },
+      { symbol: 'CVX', name: 'Chevron Corp', weight: 16.1, last_date: '2026-10-23', returns: returns(-0.4, 1.0, 6.0, 10.0), relative: returns(0.1, 1.4, 7.0, 7.0) },
+      { symbol: null, name: 'Cash', weight: 0.4, last_date: null, returns: none, relative: none },
+    ],
+  }
+}
+
+beforeEach(() => {
+  cleanup()
+  getSectorHoldings.mockReset().mockResolvedValue(energyHoldings())
+})
 
 describe('SectorRotationMap', () => {
   it('opens on the first set, one month against the benchmark', () => {
@@ -135,6 +165,83 @@ describe('SectorRotationMap', () => {
   it('says so when there are no sets', () => {
     render(<SectorRotationMap sets={[]} />)
     expect(screen.getByText('No sector sets configured.')).toBeTruthy()
+  })
+})
+
+describe('a tile opened up', () => {
+  /** The holdings panel's rows, cell by cell. */
+  const rows = () =>
+    Array.from(document.querySelectorAll('.rotation-holdings tbody tr')).map((tr) =>
+      Array.from(tr.querySelectorAll('td')).map((td) => td.textContent),
+    )
+
+  it('lists the fund’s top holdings with their weights and moves, and closes again', async () => {
+    render(<SectorRotationMap sets={[us()]} />)
+    fireEvent.click(tile('XLE'))
+    expect(getSectorHoldings).toHaveBeenCalledWith('US', 'XLE')
+    expect(tile('XLE').getAttribute('aria-expanded')).toBe('true')
+
+    const panel = await screen.findByRole('region', { name: 'Top holdings of XLE' })
+    expect(within(panel).getByText('Top 3 holdings · 39.4% of the fund')).toBeTruthy()
+    expect(within(panel).getByText('1M return')).toBeTruthy()
+    expect(within(panel).getByText('vs S&P 500')).toBeTruthy()
+    expect(rows()).toEqual([
+      ['XOM', 'Exxon Mobil Corp', '22.9%', '+9.0%', '+10.0 pp'],
+      ['CVX', 'Chevron Corp', '16.1%', '+6.0%', '+7.0 pp'],
+      ['—', 'Cash', '0.4%', '—', '—'],
+    ])
+
+    fireEvent.click(tile('XLE'))
+    expect(screen.queryByRole('region', { name: 'Top holdings of XLE' })).toBeNull()
+    expect(tile('XLE').getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('follows the period, and shades the figure the tiles are measuring', async () => {
+    render(<SectorRotationMap sets={[us()]} />)
+    fireEvent.click(tile('XLE'))
+    await screen.findByRole('region', { name: 'Top holdings of XLE' })
+    const shaded = () => Array.from(document.querySelectorAll('.rotation-holdings-figure')).map((td) => td.textContent)
+
+    fireEvent.click(screen.getByRole('button', { name: '1D' }))
+    expect(screen.getByText('1D return')).toBeTruthy()
+    expect(rows()[0]).toEqual(['XOM', 'Exxon Mobil Corp', '22.9%', '+1.2%', '+1.7 pp'])
+    expect(shaded()[0]).toBe('+1.7 pp')
+
+    fireEvent.click(screen.getByRole('button', { name: 'vs Return' }))
+    expect(shaded()[0]).toBe('+1.2%')
+  })
+
+  it('says why a holding is blank when it has no price for the day', async () => {
+    const opened = energyHoldings()
+    opened.holdings[1] = { ...opened.holdings[1], last_date: '2026-10-22', returns: returns(null, null, null, null), relative: returns(null, null, null, null) }
+    getSectorHoldings.mockResolvedValueOnce(opened)
+    render(<SectorRotationMap sets={[us()]} />)
+    fireEvent.click(tile('XLE'))
+    await screen.findByRole('region', { name: 'Top holdings of XLE' })
+    const row = Array.from(document.querySelectorAll('.rotation-holdings tbody tr'))[1]
+    expect(row.getAttribute('title')).toBe('No price for Fri 23 Oct 2026 — the newest is Thu 22 Oct 2026')
+    expect(within(row as HTMLElement).getByText('Last price Thu 22 Oct 2026')).toBeTruthy()
+    expect(Array.from(document.querySelectorAll('.rotation-holdings tbody tr'))[0].getAttribute('title')).toBeNull()
+  })
+
+  it('says why when there are no holdings to show', async () => {
+    getSectorHoldings.mockRejectedValueOnce(new Error('^AXIJ is an index rather than a fund, so Yahoo lists no holdings for it'))
+    render(<SectorRotationMap sets={[us()]} />)
+    fireEvent.click(tile('XLK'))
+    expect(await screen.findByText('^AXIJ is an index rather than a fund, so Yahoo lists no holdings for it')).toBeTruthy()
+  })
+
+  it('closes from its own button, and when another set is chosen', async () => {
+    render(<SectorRotationMap sets={[us(), asx()]} />)
+    fireEvent.click(tile('XLE'))
+    const panel = await screen.findByRole('region', { name: 'Top holdings of XLE' })
+    fireEvent.click(within(panel).getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('region')).toBeNull()
+
+    fireEvent.click(tile('XLE'))
+    await screen.findByRole('region', { name: 'Top holdings of XLE' })
+    fireEvent.click(screen.getByRole('button', { name: 'ASX' }))
+    expect(screen.queryByRole('region')).toBeNull()
   })
 })
 

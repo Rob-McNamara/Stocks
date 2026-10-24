@@ -25,13 +25,13 @@ mod valuation;
 mod sectors;
 use market::{
     fetch_current_price, fetch_histories, http_client, fetch_price_history, fx_pair_symbol, fx_rate_on,
-    fetch_price_history_from_yahoo, persist_price_history, resolve_fx_rates, yahoo_local_date,
-    YahooMeta,
+    fetch_price_history_from_yahoo, fetch_top_holdings, persist_price_history, resolve_fx_rates,
+    yahoo_local_date, FundHolding, YahooMeta,
 };
 #[cfg(test)]
 use market::{
-    history_recently_checked, mark_history_checked, session_range, HISTORY_CHECKED,
-    HISTORY_CHECK_TTL_SECS,
+    chart_history, cookie_header, history_recently_checked, mark_history_checked, parse_top_holdings,
+    session_range, HISTORY_CHECKED, HISTORY_CHECK_TTL_SECS,
 };
 use schema::init_db;
 use config::*;
@@ -239,7 +239,7 @@ impl utoipa::Modify for SecurityAddon {
         get_config, update_config, get_events,
         get_tax_years, get_tax_report, update_symbol_tax_settings,
         save_tax_statement, delete_tax_statement, record_tax_export,
-        update_account_tax_share, get_sector_rotation,
+        update_account_tax_share, get_sector_rotation, get_sector_holdings,
     ),
     modifiers(&SecurityAddon)
 )]
@@ -399,6 +399,7 @@ async fn main() -> std::io::Result<()> {
             .service(record_tax_export)
             .service(update_account_tax_share)
             .service(get_sector_rotation)
+            .service(get_sector_holdings)
             .service(get_meta)
             .service(get_sync_state)
             .service(openapi_spec)

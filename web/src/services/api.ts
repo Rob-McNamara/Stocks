@@ -504,6 +504,32 @@ export interface SectorRotationSet {
   sectors: SectorRotationEntry[]
 }
 
+/** One of a fund's top holdings, with its moves over each period. */
+export interface SectorHolding {
+  /** Null for a position Yahoo gives no ticker for, such as cash. */
+  symbol: string | null
+  name: string
+  /** Percent of the fund. */
+  weight: number
+  last_date: string | null
+  returns: RotationReturns
+  /** `returns` minus the set's benchmark's, in percentage points. */
+  relative: RotationReturns
+}
+
+/** GET /api/sector-rotation/holdings: a sector tile's fund, opened up. */
+export interface SectorHoldings {
+  set: string
+  symbol: string
+  /** The sector's name, or the benchmark's. */
+  name: string
+  as_of: string | null
+  benchmark: { symbol: string; name: string }
+  /** How much of the fund the listed holdings make up, in percent. */
+  top_weight: number
+  holdings: SectorHolding[]
+}
+
 /** One set as stored in the `sector_rotation` config value. */
 export interface SectorRotationSetConfig {
   name: string
@@ -852,6 +878,17 @@ export const apiClient = {
     if (!response.ok) {
       const message = await apiErrorMessage(response)
       throw new Error(message || 'Failed to fetch sector rotation')
+    }
+    return response.json()
+  },
+
+  /** A sector tile's fund: its top holdings, and how each one moved. */
+  async getSectorHoldings(set: string, symbol: string): Promise<SectorHoldings> {
+    const qs = `?set=${encodeURIComponent(set)}&symbol=${encodeURIComponent(symbol)}`
+    const response = await apiFetch(`${API_BASE_URL}/sector-rotation/holdings${qs}`)
+    if (!response.ok) {
+      const message = await apiErrorMessage(response)
+      throw new Error(message || 'Failed to fetch the holdings')
     }
     return response.json()
   },

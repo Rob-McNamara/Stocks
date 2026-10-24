@@ -10,7 +10,7 @@
 use chrono::{NaiveDate, Utc};
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
-use stocks::yahoo::ChartResponse;
+use stocks::yahoo::{ChartResponse, ChartResult};
 use std::{collections::HashMap, path::PathBuf};
 
 use crate::{
@@ -271,25 +271,45 @@ pub(crate) async fn fetch_price_history_from_yahoo(client: &Client, symbol: &str
     let response = response.error_for_status().map_err(|err| err.to_string())?;
     let payload: ChartResponse = response.json().await.map_err(|err| err.to_string())?;
     let result = payload.chart.into_first(symbol)?;
+    chart_history(&result, symbol)
+}
 
+/// The daily bars in one chart result, oldest first.
+///
+/// Yahoo leaves the newest session's close empty for a while after the close
+/// — hours, on some symbols — while the result's meta already carries it as
+/// the regular-market price, stamped on that session's date. Skipped like any
+/// other empty close, the session goes missing, and anything measured to it
+/// reads a day behind. The meta's price completes the bar instead: the figure
+/// the quote refresh stores for the day.
+pub(crate) fn chart_history(result: &ChartResult, symbol: &str) -> Result<Vec<PriceHistoryPoint>, String> {
     let timestamps = result.timestamp.as_ref().ok_or_else(|| format!("No timestamp data in Yahoo response for {}", symbol))?;
     let quote = result
         .quote()
         .ok_or_else(|| format!("No quote data in Yahoo response for {}", symbol))?;
 
     let gmtoffset = result.gmtoffset();
+    let meta = result.meta.as_ref();
+    // The session the meta's price belongs to.
+    let market_day = meta.and_then(|m| m.regular_market_time).and_then(|ts| yahoo_local_date(ts, gmtoffset));
+    let market_price = meta.and_then(|m| m.regular_market_price).filter(|price| is_usable_quote(Some(*price)));
+
     let mut records = Vec::with_capacity(timestamps.len());
     for (index, ts) in timestamps.iter().enumerate() {
-        let date = yahoo_local_date(*ts, gmtoffset)
-            .ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?
-            .format("%Y-%m-%d")
-            .to_string();
+        let day = yahoo_local_date(*ts, gmtoffset).ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?;
+        let date = day.format("%Y-%m-%d").to_string();
 
-        let close = quote.close_at(index);
-        let volume = quote.volume_at(index);
+        let mut close = quote.close_at(index);
+        let mut volume = quote.volume_at(index);
         let open = quote.open_at(index);
-        let high = quote.high_at(index);
-        let low = quote.low_at(index);
+        let mut high = quote.high_at(index);
+        let mut low = quote.low_at(index);
+        if close.is_none() && market_day == Some(day) {
+            close = market_price;
+            high = high.or(meta.and_then(|m| m.regular_market_day_high));
+            low = low.or(meta.and_then(|m| m.regular_market_day_low));
+            volume = volume.or(meta.and_then(|m| m.regular_market_volume));
+        }
 
         if close.is_some() {
             // Widened here as well as on persist, so a first load that serves
@@ -442,4 +462,149 @@ pub(crate) async fn resolve_fx_rates(db_path: &PathBuf, currencies: &[String]) -
         rates.insert(currency.clone(), live.or(cached.and_then(|c| c.0)).or_else(stored));
     }
     rates
+}
+
+/// User agent for Yahoo's cookie-and-crumb endpoints. They answer this
+/// client's own `stocks-api/1.0` with a 429, and let a bare browser name
+/// through.
+const YAHOO_SESSION_UA: &str = "Mozilla/5.0";
+
+/// The cookie and crumb Yahoo's quoteSummary endpoint demands — the chart
+/// endpoint needs neither. They cost two extra requests to obtain, so they are
+/// kept until Yahoo stops honouring them.
+#[derive(Clone)]
+struct YahooSession {
+    cookie: String,
+    crumb: String,
+}
+
+static YAHOO_SESSION: std::sync::OnceLock<std::sync::Mutex<Option<YahooSession>>> = std::sync::OnceLock::new();
+
+fn yahoo_session_slot() -> std::sync::MutexGuard<'static, Option<YahooSession>> {
+    YAHOO_SESSION
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The `name=value` pairs a response's Set-Cookie headers carry, as one
+/// Cookie header. The attributes after them (Expires, Domain…) are for a
+/// browser's cookie jar and are dropped.
+pub(crate) fn cookie_header<'a>(set_cookies: impl Iterator<Item = &'a str>) -> String {
+    set_cookies
+        .filter_map(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|pair| pair.contains('='))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+async fn new_yahoo_session(client: &Client) -> Result<YahooSession, String> {
+    // fc.yahoo.com answers 404 by design: the cookie it sets is the point.
+    let response = client
+        .get("https://fc.yahoo.com")
+        .header("User-Agent", YAHOO_SESSION_UA)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let cookie = cookie_header(
+        response.headers().get_all(reqwest::header::SET_COOKIE).iter().filter_map(|value| value.to_str().ok()),
+    );
+    if cookie.is_empty() {
+        return Err("Yahoo set no session cookie".to_string());
+    }
+    let crumb = client
+        .get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+        .header("User-Agent", YAHOO_SESSION_UA)
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?
+        .error_for_status()
+        .map_err(|err| format!("Yahoo refused a crumb: {err}"))?
+        .text()
+        .await
+        .map_err(|err| err.to_string())?;
+    let crumb = crumb.trim().to_string();
+    // An error page or a rate-limit notice comes back as text too.
+    if crumb.is_empty() || crumb.len() > 64 || crumb.contains(char::is_whitespace) || crumb.contains('<') {
+        return Err("Yahoo returned no usable crumb".to_string());
+    }
+    Ok(YahooSession { cookie, crumb })
+}
+
+async fn yahoo_session(client: &Client) -> Result<YahooSession, String> {
+    let cached = yahoo_session_slot().clone();
+    if let Some(session) = cached {
+        return Ok(session);
+    }
+    let session = new_yahoo_session(client).await?;
+    *yahoo_session_slot() = Some(session.clone());
+    Ok(session)
+}
+
+/// One of a fund's top holdings. `symbol` is missing for a position Yahoo
+/// gives no ticker for, such as cash; `weight` is percent of the fund.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FundHolding {
+    pub(crate) symbol: Option<String>,
+    pub(crate) name: String,
+    pub(crate) weight: f64,
+}
+
+/// Read quoteSummary's topHoldings module. Yahoo answers a symbol it holds no
+/// fund data for with an error description, which is passed on as the reason.
+pub(crate) fn parse_top_holdings(symbol: &str, body: &str) -> Result<Vec<FundHolding>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| format!("Yahoo's holdings response for {symbol} was not readable"))?;
+    let summary = &parsed["quoteSummary"];
+    if let Some(description) = summary["error"]["description"].as_str() {
+        return Err(description.to_string());
+    }
+    let listed = summary["result"][0]["topHoldings"]["holdings"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let holdings: Vec<FundHolding> = listed
+        .iter()
+        .filter_map(|holding| {
+            let weight = holding["holdingPercent"]["raw"].as_f64()? * 100.0;
+            let text = |key: &str| holding[key].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let symbol = text("symbol");
+            let name = text("holdingName").or_else(|| symbol.clone())?;
+            Some(FundHolding { symbol, name, weight })
+        })
+        .collect();
+    if holdings.is_empty() {
+        Err(format!("Yahoo lists no holdings for {symbol}"))
+    } else {
+        Ok(holdings)
+    }
+}
+
+/// A fund's top holdings — ten, for an ETF — from Yahoo's quoteSummary.
+pub(crate) async fn fetch_top_holdings(client: &Client, symbol: &str) -> Result<Vec<FundHolding>, String> {
+    let url = format!("https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}");
+    let mut renewed = false;
+    loop {
+        let session = yahoo_session(client).await?;
+        let response = client
+            .get(&url)
+            .query(&[("modules", "topHoldings"), ("crumb", session.crumb.as_str())])
+            .header("User-Agent", YAHOO_SESSION_UA)
+            .header("Cookie", &session.cookie)
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = response.status();
+        // A crumb Yahoo has stopped honouring comes back 401: start one new
+        // session and ask again.
+        if status == reqwest::StatusCode::UNAUTHORIZED && !renewed {
+            *yahoo_session_slot() = None;
+            renewed = true;
+            continue;
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err("Yahoo is limiting requests; try again in a minute".to_string());
+        }
+        let body = response.text().await.map_err(|err| err.to_string())?;
+        return parse_top_holdings(symbol, &body);
+    }
 }

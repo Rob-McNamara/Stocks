@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { RotationPeriod, SectorRotationEntry, SectorRotationSet } from '../services/api'
 import { labelColor, rgb, tileColor } from '../utils/heatColors'
 import { formatSessionDate } from '../utils/sessionDate'
+import SectorHoldings from './SectorHoldings'
 
 /** Periods offered, as `[value, label]`. */
 const PERIODS = [
@@ -41,12 +42,14 @@ const formatPoints = (v: number | null) => (v == null ? '—' : `${v >= 0 ? '+' 
  * The configured sector sets as tiles: the benchmark first, in black, then
  * every sector strongest first for the chosen period. Each tile prints both
  * figures — its move against the benchmark and its own return — and is
- * coloured by whichever one is selected.
+ * coloured by whichever one is selected. Clicking a tile opens its fund's top
+ * holdings below the tiles; clicking it again closes them.
  */
 export default function SectorRotationMap({ sets }: { sets: SectorRotationSet[] }) {
   const [setName, setSetName] = useState<string | null>(null)
   const [period, setPeriod] = useState<RotationPeriod>('1m')
   const [mode, setMode] = useState<Mode>('relative')
+  const [openSymbol, setOpenSymbol] = useState<string | null>(null)
 
   // Held by name and looked up each render, so a set renamed or removed on
   // the Configuration screen falls back to the first rather than to nothing.
@@ -58,6 +61,13 @@ export default function SectorRotationMap({ sets }: { sets: SectorRotationSet[] 
   const benchmarkLabel = active.benchmark.name || active.benchmark.symbol
   const periodLabel = PERIODS.find(([value]) => value === period)?.[1] ?? period
   const asOfText = active.as_of ? formatSessionDate(active.as_of) : null
+  // Only a tile the active set still has stays open, so switching sets or
+  // editing one never leaves a panel without its tile.
+  const open =
+    openSymbol && (openSymbol === active.benchmark.symbol || active.sectors.some((s) => s.symbol === openSymbol))
+      ? openSymbol
+      : null
+  const toggle = (symbol: string) => setOpenSymbol(open === symbol ? null : symbol)
   const shown = (entry: SectorRotationEntry) => (mode === 'relative' ? entry.relative[period] : entry.returns[period])
 
   // Strongest first; a sector with nothing to show sinks to the end.
@@ -110,19 +120,23 @@ export default function SectorRotationMap({ sets }: { sets: SectorRotationSet[] 
       </p>
 
       <div className="rotation-grid">
-        <div
-          className="rotation-tile"
+        <button
+          type="button"
+          className={`rotation-tile${open === active.benchmark.symbol ? ' selected' : ''}`}
           style={{ background: BENCHMARK_FILL, color: '#ffffff' }}
+          aria-expanded={open === active.benchmark.symbol}
+          onClick={() => toggle(active.benchmark.symbol)}
           title={[
             `${active.benchmark.symbol}${active.benchmark.long_name ? ` — ${active.benchmark.long_name}` : ''}`,
             `Benchmark return (${periodLabel}): ${formatPct(active.benchmark.returns[period])}`,
+            'Click for its top holdings',
           ].join('\n')}
         >
-          <div className="rotation-symbol">{active.benchmark.symbol}</div>
-          <div className="rotation-name">{benchmarkLabel}</div>
-          <div className="rotation-value">{formatPct(active.benchmark.returns[period])}</div>
-          <div className="rotation-sub">Benchmark</div>
-        </div>
+          <span className="rotation-symbol">{active.benchmark.symbol}</span>
+          <span className="rotation-name">{benchmarkLabel}</span>
+          <span className="rotation-value">{formatPct(active.benchmark.returns[period])}</span>
+          <span className="rotation-sub">Benchmark</span>
+        </button>
 
         {sectors.map((entry) => {
           const value = shown(entry)
@@ -141,26 +155,43 @@ export default function SectorRotationMap({ sets }: { sets: SectorRotationSet[] 
                 ? `${formatPct(entry.returns[period])} return`
                 : `${formatPoints(entry.relative[period])} vs ${benchmarkLabel}`
           return (
-            <div
+            <button
+              type="button"
               key={entry.symbol}
-              className="rotation-tile"
+              className={`rotation-tile${open === entry.symbol ? ' selected' : ''}`}
               style={{ background: rgb(fill), color: labelColor(fill) }}
+              aria-expanded={open === entry.symbol}
+              onClick={() => toggle(entry.symbol)}
               title={[
                 `${entry.symbol}${entry.long_name ? ` — ${entry.long_name}` : ''}`,
                 `Sector: ${entry.sector}`,
                 `Return (${periodLabel}): ${formatPct(entry.returns[period])}`,
                 `vs ${benchmarkLabel}: ${formatPoints(entry.relative[period])}`,
                 ...(behind ? [behind] : []),
+                'Click for its top holdings',
               ].join('\n')}
             >
-              <div className="rotation-symbol">{entry.symbol}</div>
-              <div className="rotation-name">{entry.sector}</div>
-              <div className="rotation-value">{mode === 'relative' ? formatPoints(value) : formatPct(value)}</div>
-              <div className="rotation-sub">{sub}</div>
-            </div>
+              <span className="rotation-symbol">{entry.symbol}</span>
+              <span className="rotation-name">{entry.sector}</span>
+              <span className="rotation-value">{mode === 'relative' ? formatPoints(value) : formatPct(value)}</span>
+              <span className="rotation-sub">{sub}</span>
+            </button>
           )
         })}
       </div>
+
+      {open && (
+        <SectorHoldings
+          key={`${active.name}|${open}`}
+          setName={active.name}
+          symbol={open}
+          period={period}
+          periodLabel={periodLabel}
+          mode={mode}
+          cap={cap}
+          onClose={() => setOpenSymbol(null)}
+        />
+      )}
     </div>
   )
 }

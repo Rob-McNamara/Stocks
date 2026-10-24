@@ -363,14 +363,81 @@
   }
 }
 
+/* Each tile is a button: clicking one opens its fund's top holdings. */
 .rotation-tile {
+  border: 0;
   border-radius: 8px;
   padding: 10px 12px;
   min-height: 96px;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+}
+
+.rotation-tile:hover {
+  box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.55);
+}
+
+.rotation-tile:focus-visible {
+  outline: 2px solid #667eea;
+  outline-offset: 2px;
+}
+
+.rotation-tile.selected {
+  box-shadow: 0 0 0 3px #667eea;
+}
+
+.rotation-holdings {
+  margin-top: 14px;
+  border: 1px solid #e3e7ef;
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.rotation-holdings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.rotation-holdings-name {
+  margin-left: 8px;
+}
+
+.rotation-holdings-note {
+  margin-left: 12px;
+  font-size: 12px;
+  color: #8a92a6;
+}
+
+.rotation-holdings-error {
+  margin: 4px 0;
+  font-size: 13px;
+  color: #c62828;
+}
+
+.holdings-table.rotation-holdings-table th,
+.holdings-table.rotation-holdings-table td {
+  padding: 6px 12px;
+}
+
+.rotation-holdings-figure {
+  font-weight: 600;
+}
+
+/* Why a holding's figures are blank: the newest close it has. */
+.rotation-holdings-stale {
+  display: block;
+  font-size: 12px;
+  color: #8a92a6;
 }
 
 .rotation-symbol {

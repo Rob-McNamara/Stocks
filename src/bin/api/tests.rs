@@ -6185,8 +6185,9 @@ async fn sector_rotation_measures_each_sector_against_its_benchmark() {
             }
         }
     }
-    // Stored bars only: no Yahoo top-up inside the test.
+    // Stored bars only: no Yahoo re-read or top-up inside the test.
     for symbol in ["ROTB.TEST", "ROTA.TEST", "ROTS.TEST"] {
+        mark_history_reread(symbol);
         mark_history_checked(symbol);
     }
 
@@ -6214,4 +6215,184 @@ async fn sector_rotation_measures_each_sector_against_its_benchmark() {
     assert_eq!(set["sectors"][1]["last_date"], "2026-10-22", "and says how far behind it is");
     assert_eq!(set["sectors"][0]["sector"], "Technology");
     assert_eq!(set["benchmark"]["name"], "ROTB.TEST index");
+}
+
+// -------------------------------------------------------------------------
+// Sector rotation: a fund's top holdings
+// -------------------------------------------------------------------------
+
+/// Yahoo's topHoldings shape, trimmed: weights arrive as fractions, and a
+/// position with no ticker (cash) still has a name.
+#[test]
+fn top_holdings_are_read_as_percentages() {
+    let body = r#"{"quoteSummary":{"result":[{"topHoldings":{"holdings":[
+        {"symbol":"NVDA","holdingName":"NVIDIA Corp","holdingPercent":{"raw":0.1547,"fmt":"15.47%"}},
+        {"symbol":"AAPL","holdingName":"Apple Inc","holdingPercent":{"raw":0.136,"fmt":"13.60%"}},
+        {"holdingName":"Cash","holdingPercent":{"raw":0.004,"fmt":"0.40%"}},
+        {"symbol":"BAD","holdingName":"No weight"}
+    ]}}],"error":null}}"#;
+    let holdings = parse_top_holdings("XLK", body).unwrap();
+    assert_eq!(holdings.len(), 3, "a row with no weight is dropped");
+    assert_eq!(holdings[0].symbol.as_deref(), Some("NVDA"));
+    assert!((holdings[0].weight - 15.47).abs() < 1e-9);
+    assert_eq!(holdings[2].symbol, None);
+    assert_eq!(holdings[2].name, "Cash");
+}
+
+/// Yahoo's own reason is passed on, and an empty list is an error rather than
+/// an empty panel with no explanation.
+#[test]
+fn top_holdings_report_why_there_are_none() {
+    let refused = r#"{"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"No fundamentals data found for symbol: BHP.AX"}}}"#;
+    assert_eq!(parse_top_holdings("BHP.AX", refused).unwrap_err(), "No fundamentals data found for symbol: BHP.AX");
+    let empty = r#"{"quoteSummary":{"result":[{"topHoldings":{"holdings":[]}}],"error":null}}"#;
+    assert_eq!(parse_top_holdings("XYZ", empty).unwrap_err(), "Yahoo lists no holdings for XYZ");
+    assert!(parse_top_holdings("XYZ", "<html>busy</html>").unwrap_err().contains("not readable"));
+}
+
+#[test]
+fn the_session_cookie_keeps_only_name_and_value() {
+    let headers = [
+        "A3=d=AQAB&S=xyz; Expires=Sun, 24 Oct 2027 05:50:06 GMT; Max-Age=31557600; Domain=.yahoo.com; Path=/; Secure",
+        "B=abc; Path=/",
+        "malformed",
+    ];
+    assert_eq!(cookie_header(headers.into_iter()), "A3=d=AQAB&S=xyz; B=abc");
+}
+
+async fn get_holdings(db_path: &Path, query: &str) -> (actix_web::http::StatusCode, serde_json::Value) {
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.to_path_buf())).service(get_sector_holdings),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::get().uri(&format!("/api/sector-rotation/holdings?{query}")).to_request();
+    let response = actix_web::test::call_service(&app, req).await;
+    let status = response.status();
+    (status, actix_web::test::read_body_json(response).await)
+}
+
+/// A tile opened up: its fund's holdings with their weights, each measured
+/// over the benchmark's days, and the share of the fund they make up.
+#[actix_web::test]
+async fn a_funds_holdings_are_measured_against_the_sets_benchmark() {
+    let (_file, db_path) = setup_test_db();
+    let sets = serde_json::json!([rotation_set("Test", "HBNC.TEST", &[("HFND.TEST", "Technology"), ("^HIDX", "Energy")])]);
+    upsert_config(&db_path, SECTOR_ROTATION, &sets.to_string()).unwrap();
+    remember_top_holdings(
+        "HFND.TEST",
+        vec![
+            FundHolding { symbol: Some("HONE.TEST".into()), name: "One Inc".into(), weight: 30.0 },
+            FundHolding { symbol: Some("HTWO.TEST".into()), name: "Two Inc".into(), weight: 20.0 },
+            FundHolding { symbol: None, name: "Cash".into(), weight: 0.5 },
+        ],
+    );
+    {
+        let conn = open_db(&db_path).unwrap();
+        let bars: [(&str, &[(&str, f64)]); 3] = [
+            ("HBNC.TEST", &[("2026-07-23", 100.0), ("2026-09-23", 100.0), ("2026-10-16", 100.0), ("2026-10-22", 100.0), ("2026-10-23", 102.0)]),
+            ("HONE.TEST", &[("2026-07-23", 10.0), ("2026-09-23", 10.0), ("2026-10-16", 10.0), ("2026-10-22", 10.0), ("2026-10-23", 11.0)]),
+            // Behind the benchmark: no close on the 23rd.
+            ("HTWO.TEST", &[("2026-10-21", 5.0), ("2026-10-22", 5.5)]),
+        ];
+        for (symbol, rows) in bars {
+            for (date, close) in rows {
+                conn.execute(
+                    "INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, '2026-10-24T00:00:00Z')",
+                    params![symbol, date, close],
+                )
+                .unwrap();
+            }
+        }
+    }
+    for symbol in ["HBNC.TEST", "HONE.TEST", "HTWO.TEST"] {
+        mark_history_reread(symbol);
+        mark_history_checked(symbol);
+    }
+
+    let (status, body) = get_holdings(&db_path, "set=Test&symbol=hfnd.test").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["symbol"], "HFND.TEST");
+    assert_eq!(body["name"], "Technology");
+    assert_eq!(body["as_of"], "2026-10-23");
+    assert_eq!(body["benchmark"]["symbol"], "HBNC.TEST");
+    assert!((body["top_weight"].as_f64().unwrap() - 50.5).abs() < 1e-9);
+
+    let one = &body["holdings"][0];
+    assert_eq!(one["symbol"], "HONE.TEST");
+    for period in ["1d", "1w", "1m", "3m"] {
+        assert!((one["returns"][period].as_f64().unwrap() - 10.0).abs() < 1e-9, "{period}: {one}");
+        assert!((one["relative"][period].as_f64().unwrap() - 8.0).abs() < 1e-9, "{period}: {one}");
+    }
+    let two = &body["holdings"][1];
+    assert!(two["returns"]["1d"].is_null(), "a holding behind the benchmark is blank");
+    assert_eq!(two["last_date"], "2026-10-22");
+    let cash = &body["holdings"][2];
+    assert!(cash["symbol"].is_null() && cash["returns"]["1m"].is_null());
+    assert_eq!(cash["name"], "Cash");
+}
+
+/// Refusals that need no trip to Yahoo: an unknown set, a symbol outside it,
+/// and an index, which is not a fund.
+#[actix_web::test]
+async fn holdings_are_only_offered_for_a_sets_own_funds() {
+    let (_file, db_path) = setup_test_db();
+    let sets = serde_json::json!([rotation_set("Test", "HBNC.TEST", &[("^HIDX", "Energy")])]);
+    upsert_config(&db_path, SECTOR_ROTATION, &sets.to_string()).unwrap();
+
+    let (status, body) = get_holdings(&db_path, "set=Nope&symbol=HBNC.TEST").await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"]["message"], "There is no sector set called Nope");
+
+    let (status, body) = get_holdings(&db_path, "set=Test&symbol=XLK").await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"]["message"], "XLK is not in the Test set");
+
+    let (status, body) = get_holdings(&db_path, "set=Test&symbol=%5EHIDX").await;
+    assert_eq!(status, 404);
+    assert!(body["error"]["message"].as_str().unwrap().contains("is an index rather than a fund"));
+}
+
+/// Yahoo leaves the newest session's close empty for hours after the close,
+/// while its meta already has the price, stamped on that session. Seen on XOM
+/// on Sat 24 Oct 2026: the Friday bar's close was null, the meta's 183.21.
+#[test]
+fn an_empty_newest_close_is_completed_from_the_meta() {
+    let chart = |meta: Option<serde_json::Value>| -> stocks::yahoo::ChartResult {
+        let mut result = serde_json::json!({
+            // Wed 21, Thu 22 and Fri 23 Oct 2026, stamped at the 13:30 UTC open.
+            "timestamp": [1792589400_i64, 1792675800_i64, 1792762200_i64],
+            "indicators": { "quote": [{
+                "open":   [177.0, 178.0, 180.0],
+                "high":   [179.0, 179.5, null],
+                "low":    [176.5, 177.0, null],
+                "close":  [null, 178.23, null],
+                "volume": [900, 1000, null]
+            }]}
+        });
+        if let Some(meta) = meta {
+            result["meta"] = meta;
+        }
+        serde_json::from_value(result).unwrap()
+    };
+    let meta = serde_json::json!({
+        "regularMarketPrice": 183.21,
+        // Fri 23 Oct 20:02:59 UTC: after that day's close, in New York time.
+        "regularMarketTime": 1792785779_i64,
+        "gmtoffset": -14400,
+        "regularMarketDayHigh": 184.0,
+        "regularMarketDayLow": 179.5,
+        "regularMarketVolume": 15_000_000
+    });
+
+    let bars = chart_history(&chart(Some(meta)), "XOM").unwrap();
+    let dates: Vec<&str> = bars.iter().map(|b| b.date.as_str()).collect();
+    assert_eq!(dates, ["2026-10-22", "2026-10-23"], "Wednesday's empty close is not the meta's session, so it stays out");
+    let friday = &bars[1];
+    assert_eq!(friday.close, Some(183.21));
+    assert_eq!((friday.open, friday.high, friday.low), (Some(180.0), Some(184.0), Some(179.5)));
+    assert_eq!(friday.volume, Some(15_000_000));
+
+    // With no meta to complete it, the empty bar is still left out.
+    let bars = chart_history(&chart(None), "XOM").unwrap();
+    assert_eq!(bars.iter().map(|b| b.date.as_str()).collect::<Vec<_>>(), ["2026-10-22"]);
 }

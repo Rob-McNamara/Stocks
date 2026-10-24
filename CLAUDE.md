@@ -62,14 +62,14 @@ Shared by every binary, in `src/` (the `stocks` library):
 
 - `db.rs` — `open_db` (WAL + busy timeout) and `insert_event_log`. Use these; don't open SQLite directly.
 - `http.rs` — the only way to build an HTTP client (it sets the timeouts).
-- `yahoo.rs` — Yahoo chart response types and `local_date` (bars and events are dated in exchange time).
-- `prices.rs` — `upsert_daily_bar`, the one writer for `prices` (refuses zero closes, keeps backfilled OHLC).
+- `yahoo.rs` — Yahoo chart response types and `local_date` (bars and events are dated in exchange time). Yahoo's daily history can leave the newest session's close null for hours after the close, while the meta's `regularMarketPrice` already has it; the API's reader, `market::chart_history`, completes that bar from the meta. A reader that skips null closes without doing the same loses the newest session.
+- `prices.rs` — `upsert_daily_bar`, the one writer for `prices` (refuses zero closes, keeps backfilled OHLC). Stored bars can have holes: the price refresh writes one bar per quote, so a session that closed while the app was not open never gets one, and the history top-up only appends days after the newest stored bar. Code that measures a move from stored bars must not take the previous stored bar for the previous session — `sectors::reread_histories` writes Yahoo's recent history over the stored bars first.
 - `dividends.rs` — fetching, de-duplicating and storing dividend events.
 - `portfolio.rs`, `indicators.rs`, `hindsight.rs` — the calculation engines. `portfolio::walk_parcels` is the one FIFO walk that matches sales to purchases parcel by parcel; reuse it rather than keeping another lot queue.
 - `rotation.rs` — sector rotation: each period's price move (1D, 1W, 1M, 3M) to a given day, and the difference from a benchmark in percentage points.
 - `tax.rs` — Australian income-tax rules for the tax report: income years, the 12-month CGT discount, loss ordering, franking gross-up.
 
-The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `sectors` (the Dashboard's sector rotation sets, stored in `app_config` as `sector_rotation`), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
+The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `quotes`, `fx`, `valuation` (portfolio screens), `sectors` (the Dashboard's sector rotation sets, stored in `app_config` as `sector_rotation`, and each fund's top holdings, which come from Yahoo's quoteSummary behind a cookie-and-crumb session in `market`), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
 
 A write that touches more than one row goes through `with_tx`, so it commits all-or-nothing.
 

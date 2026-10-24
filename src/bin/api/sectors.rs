@@ -299,7 +299,6 @@ fn measure_set(
     let newest = |symbol: &str| closes_of(symbol).last().map(|(date, _)| *date);
     let as_of = newest(&set.benchmark.symbol).or_else(|| set.sectors.iter().filter_map(|s| newest(&s.symbol)).max());
     let measure = |symbol: &str| as_of.map(|day| period_returns(closes_of(symbol), day)).unwrap_or_default();
-    let date_text = |date: NaiveDate| date.format("%Y-%m-%d").to_string();
 
     let benchmark_returns = measure(&set.benchmark.symbol);
     let sectors = set
@@ -329,6 +328,105 @@ fn measure_set(
         },
         sectors,
     }
+}
+
+/// How often each symbol's recent bars are re-read from Yahoo in full.
+const HISTORY_REREAD_TTL: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
+
+/// Bars written per re-read: the newest, enough for three months and the
+/// lookback before it.
+const REREAD_BARS: usize = 120;
+
+static HISTORY_REREAD: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
+fn history_reread_marks() -> std::sync::MutexGuard<'static, HashMap<String, std::time::Instant>> {
+    HISTORY_REREAD
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Treat `symbol` as just re-read, so a test's stored bars are the ones used.
+#[cfg(test)]
+pub(crate) fn mark_history_reread(symbol: &str) {
+    history_reread_marks().insert(symbol.to_string(), std::time::Instant::now());
+}
+
+/// Re-read each symbol's recent daily bars from Yahoo and write them over the
+/// stored ones, at most every few hours per symbol.
+///
+/// Stored bars come from the price refresh, one quote at a time: a US session
+/// that closed while the app was not open never gets a bar at all, and a quote
+/// taken mid-session leaves a half-made close. The history top-up only appends
+/// days after the newest stored one, so it mends neither — and a missing
+/// Thursday turns Friday's 1D into a two-day move. Yahoo's history has every
+/// session, closed, so writing it over the stored bars fills both holes.
+async fn reread_histories(db_path: &Path, symbols: &[String]) {
+    let due: Vec<String> = {
+        let mut marks = history_reread_marks();
+        let now = std::time::Instant::now();
+        let due: Vec<String> = symbols
+            .iter()
+            .filter(|s| marks.get(s.as_str()).is_none_or(|at| now.duration_since(*at) >= HISTORY_REREAD_TTL))
+            .cloned()
+            .collect();
+        // Marked before the fetch, so a request arriving meanwhile does not
+        // fetch them a second time.
+        for symbol in &due {
+            marks.insert(symbol.clone(), now);
+        }
+        due
+    };
+
+    for chunk in due.chunks(5) {
+        let mut set = tokio::task::JoinSet::new();
+        for symbol in chunk {
+            let symbol = symbol.clone();
+            set.spawn(async move {
+                let result = fetch_price_history_from_yahoo(http_client(), &symbol, HISTORY_BARS).await;
+                (symbol, result)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let (symbol, result) = match joined {
+                Ok(done) => done,
+                Err(err) => {
+                    let _ = insert_event_log(db_path, "warn", "price_history_fetch", "api", None, &format!("A history re-read did not finish: {err}"));
+                    continue;
+                }
+            };
+            // One transaction per symbol: a hundred-odd bars, one commit.
+            let written = result.and_then(|records| {
+                let newest = &records[records.len().saturating_sub(REREAD_BARS)..];
+                let mut conn = open_db(db_path).map_err(|err| err.to_string())?;
+                let tx = conn.transaction().map_err(|err| err.to_string())?;
+                persist_price_history(&tx, &symbol, newest);
+                tx.commit().map_err(|err| err.to_string())
+            });
+            if let Err(err) = written {
+                let _ = insert_event_log(db_path, "warn", "price_history_fetch", "api", Some(&symbol), &format!("Recent history not re-read, the stored bars stand: {err}"));
+            }
+        }
+    }
+}
+
+fn date_text(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+/// Each symbol's closes, oldest first, from the bars `fetch_histories` returns.
+fn closes_by_symbol(histories: HashMap<String, Vec<PriceHistoryPoint>>) -> HashMap<String, Vec<(NaiveDate, f64)>> {
+    histories
+        .into_iter()
+        .map(|(symbol, bars)| {
+            let series = bars
+                .into_iter()
+                .filter_map(|bar| Some((NaiveDate::parse_from_str(&bar.date, "%Y-%m-%d").ok()?, bar.close?)))
+                .collect();
+            (symbol, series)
+        })
+        .collect()
 }
 
 /// Yahoo's full names, for the tiles' tooltips. Stored by every quote fetch.
@@ -362,20 +460,11 @@ pub(crate) async fn get_sector_rotation(db_path: web::Data<PathBuf>) -> impl Res
     let sets = rotation_sets(&db_path, &config);
     let symbols = unique_symbols(&sets);
 
-    // Stored bars, topped up from Yahoo at most once per symbol every ten
-    // minutes — the same path the watchlist and the overview read through. A
-    // symbol whose history cannot be had is logged there and shows as blank.
-    let histories = fetch_histories(&db_path, &symbols, HISTORY_BARS).await;
-    let closes: HashMap<String, Vec<(NaiveDate, f64)>> = histories
-        .into_iter()
-        .map(|(symbol, bars)| {
-            let series = bars
-                .into_iter()
-                .filter_map(|bar| Some((NaiveDate::parse_from_str(&bar.date, "%Y-%m-%d").ok()?, bar.close?)))
-                .collect();
-            (symbol, series)
-        })
-        .collect();
+    // Recent bars re-read whole every few hours, so no session is missing;
+    // then the stored bars, read the way the watchlist and the overview read
+    // them. A symbol whose history cannot be had is logged and shows as blank.
+    reread_histories(&db_path, &symbols).await;
+    let closes = closes_by_symbol(fetch_histories(&db_path, &symbols, HISTORY_BARS).await);
 
     let names = match open_db(db_path.as_ref()).and_then(|conn| long_names(&conn, &symbols)) {
         Ok(names) => names,
@@ -387,4 +476,152 @@ pub(crate) async fn get_sector_rotation(db_path: web::Data<PathBuf>) -> impl Res
 
     let sets: Vec<RotationSet> = sets.into_iter().map(|set| measure_set(set, &closes, &names)).collect();
     HttpResponse::Ok().json(serde_json::json!({ "sets": sets }))
+}
+
+/// How long a fund's top holdings are kept before Yahoo is asked again. They
+/// move with the fund's rebalancing, not by the day.
+const HOLDINGS_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
+/// Top holdings by fund symbol, with when they were fetched. Held in memory
+/// rather than a table: they are re-fetchable in one request, and nothing in
+/// them was typed by the user.
+type HoldingsCache = HashMap<String, (std::time::Instant, Vec<FundHolding>)>;
+
+static TOP_HOLDINGS: std::sync::OnceLock<std::sync::Mutex<HoldingsCache>> = std::sync::OnceLock::new();
+
+fn top_holdings_cache() -> std::sync::MutexGuard<'static, HoldingsCache> {
+    TOP_HOLDINGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn cached_top_holdings(symbol: &str) -> Option<Vec<FundHolding>> {
+    top_holdings_cache()
+        .get(symbol)
+        .filter(|(fetched, _)| fetched.elapsed() < HOLDINGS_TTL)
+        .map(|(_, holdings)| holdings.clone())
+}
+
+pub(crate) fn remember_top_holdings(symbol: &str, holdings: Vec<FundHolding>) {
+    top_holdings_cache().insert(symbol.to_string(), (std::time::Instant::now(), holdings));
+}
+
+#[derive(Deserialize)]
+pub(crate) struct HoldingsQuery {
+    set: String,
+    symbol: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct HoldingMove {
+    /// Absent for a position Yahoo gives no ticker for, such as cash.
+    symbol: Option<String>,
+    name: String,
+    /// Percent of the fund.
+    weight: f64,
+    last_date: Option<String>,
+    returns: PeriodReturns,
+    /// `returns` minus the set's benchmark's, in percentage points.
+    relative: PeriodReturns,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/sector-rotation/holdings",
+    tag = "prices",
+    params(("set" = String, Query, description = "The sector set's name"), ("symbol" = String, Query, description = "A sector or benchmark symbol in that set")),
+    responses(
+        (status = 200, description = "The fund's top holdings with each one's 1D, 1W, 1M and 3M moves, alone and against the set's benchmark"),
+        (status = 404, description = "No such set, a symbol outside it, or an index, which has no holdings"),
+        (status = 502, description = "Yahoo did not provide the holdings"),
+    )
+)]
+#[get("/api/sector-rotation/holdings")]
+pub(crate) async fn get_sector_holdings(db_path: web::Data<PathBuf>, query: web::Query<HoldingsQuery>) -> impl Responder {
+    let config: HashMap<String, String> = match load_config(&db_path) {
+        Ok(items) => items.into_iter().map(|c| (c.key, c.value)).collect(),
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "error", "sector_holdings", "api", None, &err);
+            return err_internal(err);
+        }
+    };
+    let symbol = normalize_symbol(&query.symbol);
+    let Some(set) = rotation_sets(&db_path, &config).into_iter().find(|s| s.name == query.set) else {
+        return err_not_found(format!("There is no sector set called {}", query.set));
+    };
+    // Only the set's own symbols, which also gives the benchmark the moves are
+    // measured against.
+    let name = if symbol == set.benchmark.symbol {
+        Some(set.benchmark.name.clone())
+    } else {
+        set.sectors.iter().find(|s| s.symbol == symbol).map(|s| s.sector.clone())
+    };
+    let Some(name) = name else {
+        return err_not_found(format!("{symbol} is not in the {} set", set.name));
+    };
+    // Yahoo's index symbols start with ^, and an index is a list of weights
+    // S&P publishes, not a fund Yahoo reports holdings for.
+    if symbol.starts_with('^') {
+        return err_not_found(format!("{symbol} is an index rather than a fund, so Yahoo lists no holdings for it"));
+    }
+
+    let holdings = match cached_top_holdings(&symbol) {
+        Some(holdings) => holdings,
+        None => match fetch_top_holdings(http_client(), &symbol).await {
+            Ok(holdings) => {
+                remember_top_holdings(&symbol, holdings.clone());
+                holdings
+            }
+            Err(reason) => {
+                let _ = insert_event_log(&db_path, "warn", "sector_holdings", "api", Some(&symbol), &format!("Top holdings not fetched: {reason}"));
+                return api_error(
+                    actix_web::http::StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    format!("Yahoo did not provide the holdings of {symbol}: {reason}"),
+                );
+            }
+        },
+    };
+
+    // The benchmark's newest close sets the day, as it does for the tiles, so a
+    // holding's figures run over the same days as the tile that was clicked.
+    let mut symbols: Vec<String> = holdings.iter().filter_map(|h| h.symbol.as_deref().map(normalize_symbol)).collect();
+    symbols.push(set.benchmark.symbol.clone());
+    symbols.sort();
+    symbols.dedup();
+    reread_histories(&db_path, &symbols).await;
+    let closes = closes_by_symbol(fetch_histories(&db_path, &symbols, HISTORY_BARS).await);
+    let closes_of = |symbol: &str| closes.get(symbol).map(Vec::as_slice).unwrap_or_default();
+    let newest = |symbol: &str| closes_of(symbol).last().map(|(date, _)| *date);
+    let as_of = newest(&set.benchmark.symbol).or_else(|| symbols.iter().filter_map(|s| newest(s)).max());
+    let measure = |symbol: &str| as_of.map(|day| period_returns(closes_of(symbol), day)).unwrap_or_default();
+    let benchmark_returns = measure(&set.benchmark.symbol);
+
+    let top_weight: f64 = holdings.iter().map(|h| h.weight).sum();
+    let moves: Vec<HoldingMove> = holdings
+        .into_iter()
+        .map(|holding| {
+            let key = holding.symbol.as_deref().map(normalize_symbol);
+            let returns = key.as_deref().map(measure).unwrap_or_default();
+            HoldingMove {
+                last_date: key.as_deref().and_then(newest).map(date_text),
+                relative: returns.minus(&benchmark_returns),
+                returns,
+                weight: holding.weight,
+                name: holding.name,
+                symbol: key,
+            }
+        })
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "set": set.name,
+        "symbol": symbol,
+        "name": name,
+        "as_of": as_of.map(date_text),
+        "benchmark": { "symbol": set.benchmark.symbol, "name": set.benchmark.name },
+        "top_weight": top_weight,
+        "holdings": moves,
+    }))
 }
