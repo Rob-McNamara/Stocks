@@ -362,7 +362,10 @@ pub(crate) fn mark_history_reread(symbol: &str) {
 /// days after the newest stored one, so it mends neither — and a missing
 /// Thursday turns Friday's 1D into a two-day move. Yahoo's history has every
 /// session, closed, so writing it over the stored bars fills both holes.
-async fn reread_histories(db_path: &Path, symbols: &[String]) {
+///
+/// The startup refresh runs it for the holdings too, whose heat map measures
+/// its periods from these bars.
+pub(crate) async fn reread_histories(db_path: &Path, symbols: &[String]) {
     let due: Vec<String> = {
         let mut marks = history_reread_marks();
         let now = std::time::Instant::now();

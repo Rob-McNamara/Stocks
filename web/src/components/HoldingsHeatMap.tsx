@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import type { PortfolioHolding } from '../services/api'
+import type { MovePeriod, PortfolioHolding } from '../services/api'
 import { squarify, squarifyGrouped } from '../utils/treemap'
 import { labelColor, rgb, tileColor } from '../utils/heatColors'
 
@@ -19,14 +19,25 @@ const UNASSIGNED = 'Unassigned'
 /**
  * Metrics a tile can be coloured by. Total return and today's move answer
  * different questions — "how is this position doing" versus "what moved today"
- * — and both are already on every holding, so both are offered.
+ * — and both are already on every holding, so both are offered. The periods
+ * answer a third, "what has it done lately", which a return measured from a
+ * purchase years back cannot.
  */
 const METRICS = [
   ['pl', 'P/L'],
   ['today', 'Today'],
+  ['1w', '1 week'],
+  ['1m', '1 month'],
+  ['3m', '3 months'],
+  ['1y', '1 year'],
+  ['2y', '2 years'],
 ] as const
 
 type Metric = (typeof METRICS)[number][0]
+
+const isPeriod = (metric: Metric): metric is MovePeriod => metric !== 'pl' && metric !== 'today'
+
+const labelOf = (metric: Metric) => METRICS.find(([value]) => value === metric)![1]
 
 /**
  * Percentage at which the colour scale saturates, per metric.
@@ -36,11 +47,15 @@ type Metric = (typeof METRICS)[number][0]
  * the ceiling is not a hidden assumption, and the map is comparable between
  * visits.
  *
- * The two metrics need very different bands. Lifetime returns run to hundreds
- * of percent; a day's move rarely leaves ±5%, and reading it against a ±50%
- * band renders the whole map blank.
+ * The metrics need very different bands. Lifetime returns run to hundreds of
+ * percent; a day's move rarely leaves ±5%, and reading it against a ±50% band
+ * renders the whole map blank. A price's spread of outcomes widens roughly with
+ * the square root of time, so each period's band is the day's grown that way
+ * and rounded. Against these holdings' own history that leaves about one move
+ * in ten past the edge, from a week to a year; over two years a few runaway
+ * winners sit far beyond any band that would still colour the rest.
  */
-const SCALE_CAP: Record<Metric, number> = { pl: 50, today: 5 }
+const SCALE_CAP: Record<Metric, number> = { pl: 50, today: 5, '1w': 10, '1m': 20, '3m': 40, '1y': 75, '2y': 100 }
 
 const formatAud = (value: number) =>
   `$${value.toLocaleString('en-AU', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
@@ -81,9 +96,17 @@ export default function HoldingsHeatMap({
 
   const cap = SCALE_CAP[metric]
   // `pl_pct` already follows the baseline wherever one is set, so there is no
-  // second measure to choose between.
+  // second measure to choose between. A period with no figure is no data, and
+  // has to stay null rather than undefined: the colour scale draws null grey
+  // and would make nothing of undefined.
   const metricOf = (holding: PortfolioHolding): number | null =>
-    metric === 'today' ? holding.change_percent : holding.pl_pct
+    metric === 'pl'
+      ? holding.pl_pct
+      : metric === 'today'
+        ? holding.change_percent
+        : (holding.moves?.[metric] ?? null)
+  const description =
+    metric === 'pl' ? 'profit and loss' : metric === 'today' ? "today's move" : `the price move over ${labelOf(metric)}`
 
   const layout = useMemo(() => {
     const bySymbol = new Map(holdings.map((h) => [h.symbol, h]))
@@ -174,7 +197,7 @@ export default function HoldingsHeatMap({
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
           className="chart-svg"
           role="img"
-          aria-label={`Holdings sized by value and coloured by ${metric === 'pl' ? 'profit and loss' : "today's move"}`}
+          aria-label={`Holdings sized by value and coloured by ${description}`}
         >
           <rect x="0" y="0" width={WIDTH} height={HEIGHT} fill="#ffffff" rx="12" />
 
@@ -234,6 +257,8 @@ export default function HoldingsHeatMap({
                   {'\n'}Value: {formatAud(holding.current_value)} ({weight.toFixed(1)}% of holdings)
                   {'\n'}P/L{holding.basis_date ? ` since ${holding.basis_date}` : ''}: {formatPct(holding.pl_pct)} ({formatAud(holding.pl)})
                   {'\n'}Today: {formatPct(holding.change_percent)}
+                  {isPeriod(metric) &&
+                    `\n${labelOf(metric)}: ${formatPct(pct)}${pct == null ? ' (not enough price history)' : ''}`}
                 </title>
                 {showSymbol && (
                   <text

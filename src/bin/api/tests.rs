@@ -2248,6 +2248,83 @@ async fn the_days_pl_is_shares_times_the_change_in_aud() {
     assert!(close_to(&find(&body["holdings"], "LOC.AX")["day_pl"], 25.0));
 }
 
+/// The heat map's periods. Each runs from the last close on or before its
+/// start date — a hole in the bars does not shift it to a count of bars back —
+/// to the quote the screen shows rather than the newest stored close. A
+/// foreign holding is measured in its own currency, like the quote's day
+/// change; a period the history does not reach is null, not 0.
+#[actix_web::test]
+async fn holdings_report_each_periods_move_to_the_quote() {
+    let (_file, db_path) = setup_test_db();
+    let conn = open_db(&db_path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, currency, created_at)
+           VALUES (1, 'LOC.AX', 'purchase', '2024-01-05', 100.0, 5.0, 0.0, 'AUD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, currency, created_at)
+           VALUES (2, 'USX', 'purchase', '2025-06-02', 10.0, 90.0, 0.0, 'USD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, currency, created_at)
+           VALUES (3, 'MAN.AX', 'purchase', '2024-01-05', 100.0, 1.0, 0.0, 'AUD', 'x');
+         INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('LOC.AX', 'AUD', 'x');
+         INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('USX', 'USD', 'x');
+         INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('MAN.AX', 'AUD', 'x');
+         INSERT INTO app_config (key, value) VALUES ('manual_price_MAN.AX', '2.0');",
+    )
+    .unwrap();
+    // The quotes are dated Friday 23 Oct 2026.
+    for (sym, date, close) in [
+        ("LOC.AX", "2024-10-23", 4.0), // two years back
+        ("LOC.AX", "2025-10-23", 5.0), // one year back
+        ("LOC.AX", "2026-07-23", 8.0), // three months back
+        ("LOC.AX", "2026-09-23", 9.0), // one month back
+        ("LOC.AX", "2026-10-15", 9.5), // the 16th, a week back, is a hole
+        ("LOC.AX", "2026-10-22", 9.8), // a bar back: what "N bars" would use
+        ("LOC.AX", "2026-10-23", 9.9), // the day's bar, taken mid-session
+        ("USX", "2025-05-30", 80.0), // listed after the two-year start
+        ("USX", "2025-10-23", 100.0),
+        ("USDAUD=X", "2025-10-23", 1.6),
+        ("MAN.AX", "2025-10-23", 1.0),
+    ] {
+        conn.execute(
+            "INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, 'x')",
+            params![sym, date, close],
+        )
+        .unwrap();
+    }
+    // MAN.AX's quote row is dated but has no price, so the manual price
+    // stands in on that date.
+    for (sym, price) in [("LOC.AX", Some(10.0)), ("USX", Some(120.0)), ("USDAUD=X", Some(1.5)), ("MAN.AX", None)] {
+        conn.execute(
+            "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date) VALUES (?1, ?2, ?3, '2026-10-23')",
+            params![sym, price, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let body = get_json(&db_path, "/api/portfolio/holdings").await;
+    let loc = &find(&body["holdings"], "LOC.AX")["moves"];
+    assert!(close_to(&loc["1w"], (10.0 / 9.5 - 1.0) * 100.0), "from the close before the hole, got {}", loc["1w"]);
+    assert!(close_to(&loc["1m"], (10.0 / 9.0 - 1.0) * 100.0), "got {}", loc["1m"]);
+    assert!(close_to(&loc["3m"], 25.0), "got {}", loc["3m"]);
+    assert!(close_to(&loc["1y"], 100.0), "got {}", loc["1y"]);
+    assert!(close_to(&loc["2y"], 150.0), "got {}", loc["2y"]);
+
+    // US$100 → US$120 is +20%. In AUD it would read +12.5%, with the
+    // dollar's fall from 1.6 to 1.5 folded in.
+    let usx = &find(&body["holdings"], "USX")["moves"];
+    assert!(close_to(&usx["1y"], 20.0), "in the stock's own currency, got {}", usx["1y"]);
+    assert!(usx["2y"].is_null(), "its history starts after the two-year start, got {}", usx["2y"]);
+    assert!(usx["1w"].is_null(), "no close within a week of the week's start, got {}", usx["1w"]);
+
+    // A typed price has no market move behind it: measured, MAN.AX would
+    // read +100% over the year.
+    let man = find(&body["holdings"], "MAN.AX");
+    assert_eq!(man["price_source"], "manual", "the fixture must price MAN.AX by hand");
+    for period in ["1w", "1m", "3m", "1y", "2y"] {
+        assert!(man["moves"][period].is_null(), "manual price, {period}: {}", man["moves"][period]);
+    }
+}
+
 /// A lot that is half sold carries half its fee; the rest left with the
 /// shares that were sold.
 #[actix_web::test]

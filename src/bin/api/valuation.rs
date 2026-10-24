@@ -3,6 +3,7 @@
 //! history, and the stored-bar indicators they read.
 
 use super::*;
+use stocks::rotation::{trailing_moves, TrailingMoves};
 
 /// A symbol's or currency's closes, oldest first, with a cursor for the sweep.
 pub(crate) struct SeriesCursor {
@@ -967,6 +968,46 @@ pub(crate) async fn get_hindsight(db_path: web::Data<PathBuf>) -> impl Responder
     HttpResponse::Ok().json(rows)
 }
 
+/// A holding's price move over each of the heat map's periods, ending on the
+/// price the screen shows for it.
+///
+/// Native throughout — stored closes to the native quote — which is the basis
+/// of the quote's own day change, so a foreign holding's tile shows what its
+/// market did rather than its market and the exchange rate together. A manual
+/// price has no market behind it, and a price with no date has no day to count
+/// back from, so neither gets moves.
+pub(crate) fn holding_moves(conn: &Connection, symbol: &str, price: Option<&EffectivePrice>) -> Result<TrailingMoves, String> {
+    let Some((native, date)) = price
+        .filter(|p| p.source != "manual")
+        .and_then(|p| p.native.zip(p.price_date.as_deref()))
+    else {
+        return Ok(TrailingMoves::default());
+    };
+    let as_of = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|err| format!("price date '{date}' is not a date: {err}"))?;
+    // Two years back, less the week a target may fall short of the close
+    // that stands for it. Bounded by date rather than a count of bars, so a
+    // gap in the bars cannot cut the read short of the two-year target.
+    let floor = as_of
+        .checked_sub_months(chrono::Months::new(24))
+        .and_then(|d| d.checked_sub_days(chrono::Days::new(7)))
+        .ok_or_else(|| format!("no two-year window before {as_of}"))?;
+    let mut stmt = conn
+        .prepare("SELECT date, close FROM prices WHERE symbol = ?1 AND date >= ?2 AND close > 0 ORDER BY date")
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map(params![symbol, floor.format("%Y-%m-%d").to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    let closes: Vec<(NaiveDate, f64)> = rows
+        .into_iter()
+        .filter_map(|(day, close)| Some((NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok()?, close)))
+        .collect();
+    Ok(trailing_moves(&closes, as_of, native))
+}
+
 #[utoipa::path(get, path = "/api/v1/portfolio/holdings", tag = "portfolio", responses((status = 200, description = "Get portfolio holdings")))]
 #[get("/api/portfolio/holdings")]
 pub(crate) async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
@@ -1031,6 +1072,10 @@ pub(crate) async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl 
             ),
         };
         let pl = current_value - invested + dividends;
+        let moves = holding_moves(&conn, symbol, ep).unwrap_or_else(|err| {
+            log_event_on_conn(&conn, "warn", "portfolio_fetch", Some(symbol), &format!("Period moves not measured, the heat map shows them as no data: {err}"));
+            TrailingMoves::default()
+        });
         holdings.push(serde_json::json!({
             "symbol": symbol,
             "long_name": ctx.info.get(symbol).and_then(|i| i.1.clone()),
@@ -1062,6 +1107,9 @@ pub(crate) async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl 
                 .and_then(|c| ctx.to_aud(symbol, c))
                 .map(|c| summary.remaining_shares * c),
             "volume": ep.and_then(|p| p.volume),
+            // Price moves over 1w, 1m, 3m, 1y and 2y, in percent, on the same
+            // basis as `change_percent`. Null where the history is too short.
+            "moves": moves,
             "current_value": current_value,
             "dividends": dividends,
             "pl": pl,

@@ -1,5 +1,6 @@
 //! Sector rotation: how far each sector moved over a few fixed periods, and how
-//! that compares with a benchmark over the same days.
+//! that compares with a benchmark over the same days. The holdings heat map's
+//! periods are measured the same way, out to two years.
 //!
 //! Price return only, as in Hindsight. A dividend paid inside a window shows as
 //! the drop on its ex-date, so the higher-yield sectors read a fraction of a
@@ -94,6 +95,44 @@ pub fn period_returns(closes: &[(NaiveDate, f64)], as_of: NaiveDate) -> PeriodRe
         week: pct(back(as_of.checked_sub_days(Days::new(7))), end),
         month: pct(back(as_of.checked_sub_months(Months::new(1))), end),
         quarter: pct(back(as_of.checked_sub_months(Months::new(3))), end),
+    }
+}
+
+/// A holding's move over each period the holdings heat map offers, in percent.
+/// `None` where there was no close to measure from: history that does not reach
+/// back far enough is no data, not a move of nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct TrailingMoves {
+    #[serde(rename = "1w")]
+    pub week: Option<f64>,
+    #[serde(rename = "1m")]
+    pub month: Option<f64>,
+    #[serde(rename = "3m")]
+    pub quarter: Option<f64>,
+    #[serde(rename = "1y")]
+    pub year: Option<f64>,
+    #[serde(rename = "2y")]
+    pub two_years: Option<f64>,
+}
+
+/// Each period's move to `price`, a quote dated `as_of`, from the last close on
+/// or before the same date a week, a month, three months, a year and two years
+/// earlier.
+///
+/// Unlike `period_returns`, the move ends on a price rather than a stored close:
+/// a holding's tile has to agree with the quote the rest of the screen shows,
+/// and the stored bar for the quote's day can be missing or taken mid-session.
+pub fn trailing_moves(closes: &[(NaiveDate, f64)], as_of: NaiveDate, price: f64) -> TrailingMoves {
+    if !crate::prices::is_usable_price(Some(price)) {
+        return TrailingMoves::default();
+    }
+    let back = |target: Option<NaiveDate>| pct(target.and_then(|t| close_at(closes, t)), price);
+    TrailingMoves {
+        week: back(as_of.checked_sub_days(Days::new(7))),
+        month: back(as_of.checked_sub_months(Months::new(1))),
+        quarter: back(as_of.checked_sub_months(Months::new(3))),
+        year: back(as_of.checked_sub_months(Months::new(12))),
+        two_years: back(as_of.checked_sub_months(Months::new(24))),
     }
 }
 
@@ -197,5 +236,79 @@ mod tests {
     fn periods_serialise_under_their_short_names() {
         let json = serde_json::to_value(PeriodReturns { day: Some(1.0), ..Default::default() }).unwrap();
         assert_eq!(json, serde_json::json!({ "1d": 1.0, "1w": null, "1m": null, "3m": null }));
+    }
+
+    /// The moves end on the quote, not on the newest stored close: that bar is
+    /// often missing, or was taken mid-session and has since been passed.
+    #[test]
+    fn trailing_moves_run_from_each_start_to_the_quote() {
+        // Friday 23 Oct 2026. Every target is a weekday with a close of its own.
+        let bars = closes(&[
+            ("2024-10-23", 40.0), // two years back
+            ("2025-10-23", 50.0), // one year back
+            ("2026-07-23", 80.0), // three months back
+            ("2026-09-23", 90.0), // one month back
+            ("2026-10-16", 95.0), // one week back
+            ("2026-10-23", 99.0), // a mid-session bar the quote has moved on from
+        ]);
+        let m = trailing_moves(&bars, day("2026-10-23"), 100.0);
+        assert_pct(m.week, (100.0 / 95.0 - 1.0) * 100.0);
+        assert_pct(m.month, (100.0 / 90.0 - 1.0) * 100.0);
+        assert_pct(m.quarter, 25.0);
+        assert_pct(m.year, 100.0);
+        assert_pct(m.two_years, 150.0);
+    }
+
+    /// Stored bars have holes. Each period still starts from the last close on
+    /// or before its own target date, never from a count of bars back, and
+    /// never from a close after the target.
+    #[test]
+    fn trailing_moves_start_from_the_close_on_or_before_each_target() {
+        // Monday 26 Oct 2026: a year back is Sunday 26 Oct 2025, two years back
+        // Saturday 26 Oct 2024, and the week's target, Monday 19 Oct, is a hole.
+        let bars = closes(&[
+            ("2024-10-25", 50.0),  // Friday before the 2Y target — the answer
+            ("2024-10-28", 999.0), // Monday after — must not be used
+            ("2025-10-24", 80.0),  // Friday before the 1Y target
+            ("2025-10-27", 999.0),
+            ("2026-10-16", 90.0), // the last close before the missing Monday
+            ("2026-10-20", 999.0),
+        ]);
+        let m = trailing_moves(&bars, day("2026-10-26"), 100.0);
+        assert_pct(m.two_years, 100.0);
+        assert_pct(m.year, 25.0);
+        assert_pct(m.week, (100.0 / 90.0 - 1.0) * 100.0);
+    }
+
+    /// A holding listed eighteen months ago has no two-year move, and a gap
+    /// longer than the lookback is not measured across. Both are no data,
+    /// which the heat map draws differently from a flat 0%.
+    #[test]
+    fn trailing_moves_leave_periods_without_history_empty() {
+        let bars = closes(&[
+            ("2025-05-22", 50.0), // first close: after the 2Y target
+            ("2025-10-23", 60.0),
+            ("2026-08-01", 70.0), // more than a week before the 1M target (23 Sep)
+            ("2026-10-16", 90.0),
+        ]);
+        let m = trailing_moves(&bars, day("2026-10-23"), 100.0);
+        assert_eq!(m.two_years, None, "history starts after 23 Oct 2024");
+        assert_eq!(m.month, None, "nothing within a week of 23 Sep");
+        assert_pct(m.year, (100.0 / 60.0 - 1.0) * 100.0);
+        assert_pct(m.week, (100.0 / 90.0 - 1.0) * 100.0);
+    }
+
+    #[test]
+    fn trailing_moves_need_a_price_to_end_on() {
+        let bars = closes(&[("2026-10-16", 90.0)]);
+        for price in [0.0, -1.0, f64::NAN] {
+            assert_eq!(trailing_moves(&bars, day("2026-10-23"), price), TrailingMoves::default());
+        }
+    }
+
+    #[test]
+    fn trailing_moves_serialise_under_their_short_names() {
+        let json = serde_json::to_value(TrailingMoves { year: Some(1.0), ..Default::default() }).unwrap();
+        assert_eq!(json, serde_json::json!({ "1w": null, "1m": null, "3m": null, "1y": 1.0, "2y": null }));
     }
 }

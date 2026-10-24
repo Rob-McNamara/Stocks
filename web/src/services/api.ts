@@ -221,6 +221,9 @@ export interface EnrichedWatchlistItem {
   indicators: WatchlistIndicators | null
 }
 
+/** The periods a holding's price move is reported over, for the heat map. */
+export type MovePeriod = '1w' | '1m' | '3m' | '1y' | '2y'
+
 export interface PortfolioHolding {
   symbol: string
   long_name: string | null
@@ -244,6 +247,13 @@ export interface PortfolioHolding {
   change: number | null
   change_percent: number | null
   volume: number | null
+  /**
+   * Price move over each heat map period, in percent: from the last close on
+   * or before the period's start to the quote, in the stock's own currency —
+   * the basis of `change_percent`. Null where the history is too short.
+   * Optional because an API older than the periods omits it outright.
+   */
+  moves?: Partial<Record<MovePeriod, number | null>>
   current_value: number
   dividends: number
   pl: number

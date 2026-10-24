@@ -104,6 +104,23 @@ pub(crate) async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<R
         }
     };
 
+    // The holdings' recent bars, re-read whole every few hours. The quotes
+    // above write one bar per refresh, so a session the app was closed for
+    // has none, and a heat map period that starts on that day would start a
+    // session early. A delisted symbol is left out: Yahoo has no history for
+    // it, and asking would log a failure on every run.
+    let live_holdings: Vec<String> = match open_db(db_path.as_ref()) {
+        Ok(conn) => {
+            let dead = dead_symbols(&conn);
+            holding_symbols.iter().filter(|s| !dead.contains_key(*s)).cloned().collect()
+        }
+        Err(err) => {
+            let _ = insert_event_log(&db_path, "warn", "refresh_all", "api", None, &format!("Could not read delisted markers; re-reading every holding's history: {}", err));
+            holding_symbols.clone()
+        }
+    };
+    reread_histories(&db_path, &live_holdings).await;
+
     // Sold positions, so the Hindsight windows keep filling. Their own stamp:
     // a stale quote on something sold last year is far less urgent than one on
     // a holding, and separating them makes that visible rather than assumed.

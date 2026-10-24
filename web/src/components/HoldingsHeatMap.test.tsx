@@ -206,6 +206,116 @@ describe('HoldingsHeatMap', () => {
     expect(fillOf('ONE.AX')).toBe('rgb(27, 94, 32)')
   })
 
+  /**
+   * With P/L measured from purchase, a long-held position reads in the
+   * thousands of percent and says nothing about lately. The periods colour
+   * every tile by the holding's price move over that span instead.
+   */
+  describe('periods', () => {
+    const fillOf = (symbol: string) => tileFor(symbol).querySelector('rect')!.getAttribute('fill')!
+    const tooltipOf = (symbol: string) => tileFor(symbol).querySelector('title')!.textContent!
+
+    it('offers the periods beside P/L and Today, as the same pills', () => {
+      render(<HoldingsHeatMap holdings={[holding({ symbol: 'ONE.AX' })]} />)
+      const buttons = within(screen.getByRole('group', { name: 'Colour tiles by' })).getAllByRole('button')
+      expect(buttons.map((b) => b.textContent)).toEqual([
+        'P/L', 'Today', '1 week', '1 month', '3 months', '1 year', '2 years',
+      ])
+      for (const button of buttons) expect(button.className).toContain('sma-button')
+    })
+
+    it('prints each tile\'s move over the chosen period', () => {
+      const moves = { '1w': 2.5, '1m': -4, '3m': 12, '1y': 30, '2y': -45 }
+      render(<HoldingsHeatMap holdings={[holding({ symbol: 'CSL.AX', pl_pct: 3157, change_percent: 0.3, moves })]} />)
+      const tile = () => tileFor('CSL.AX') as unknown as HTMLElement
+
+      fireEvent.click(screen.getByRole('button', { name: '1 month' }))
+      expect(within(tile()).getByText('-4.0%')).toBeTruthy()
+      expect(within(tile()).queryByText('+3157%')).toBeNull()
+      expect(screen.getByRole('button', { name: '1 month' }).getAttribute('aria-pressed')).toBe('true')
+
+      fireEvent.click(screen.getByRole('button', { name: '2 years' }))
+      expect(within(tile()).getByText('-45.0%')).toBeTruthy()
+      expect(screen.getByRole('img').getAttribute('aria-label')).toBe(
+        'Holdings sized by value and coloured by the price move over 2 years',
+      )
+    })
+
+    /**
+     * A week's move rarely passes ±10% and two years' runs to the hundreds, so
+     * one band would leave the short periods blank or the long ones saturated.
+     * Each period gets its own, and the legend states it.
+     */
+    it('gives each period its own band, and the legend follows it', () => {
+      const moves = { '1w': 10, '1m': 10, '3m': 10, '1y': 10, '2y': 10 }
+      render(<HoldingsHeatMap holdings={[holding({ symbol: 'ONE.AX', moves })]} />)
+
+      const fills: string[] = []
+      for (const [label, cap] of [['1 week', 10], ['1 month', 20], ['3 months', 40], ['1 year', 75], ['2 years', 100]] as const) {
+        fireEvent.click(screen.getByRole('button', { name: label }))
+        expect(screen.getByText(`−${cap}%`)).toBeTruthy()
+        expect(screen.getByText(`+${cap}%`)).toBeTruthy()
+        fills.push(fillOf('ONE.AX'))
+      }
+      // The same +10% is a full-strength week, a tenth of the way to a full
+      // two years, and a different shade for every band between.
+      expect(fills[0]).toBe('rgb(27, 94, 32)')
+      expect(fills[4]).toBe('rgb(215, 225, 220)')
+      expect(new Set(fills).size).toBe(5)
+    })
+
+    /**
+     * Grey for no data and near-white for no move are different answers. A
+     * holding listed eighteen months ago has no two-year move, and painting it
+     * as a flat 0% would say it went nowhere.
+     */
+    it('shows a period the history does not reach as no data, not as 0%', () => {
+      render(
+        <HoldingsHeatMap
+          holdings={[
+            holding({ symbol: 'NEW', current_value: 5000, moves: { '1w': 1.2, '1y': 8, '2y': null } }),
+            holding({ symbol: 'FLAT', current_value: 5000, moves: { '2y': 0 } }),
+          ]}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '2 years' }))
+
+      expect(fillOf('NEW')).toBe('rgb(207, 216, 220)')
+      expect(within(tileFor('NEW') as unknown as HTMLElement).getByText('—')).toBeTruthy()
+      expect(tooltipOf('NEW')).toContain('2 years: — (not enough price history)')
+
+      expect(fillOf('FLAT')).toBe('rgb(236, 239, 241)')
+      expect(within(tileFor('FLAT') as unknown as HTMLElement).getByText('+0.0%')).toBeTruthy()
+
+      // A period missing from the figures, rather than null, is no data too.
+      fireEvent.click(screen.getByRole('button', { name: '3 months' }))
+      expect(fillOf('NEW')).toBe('rgb(207, 216, 220)')
+    })
+
+    // An API older than the periods sends no `moves` at all. That has to read
+    // as no data rather than paint every tile with an undefined colour.
+    it('treats an API that sends no moves as no data', () => {
+      render(<HoldingsHeatMap holdings={[holding({ symbol: 'OLD.AX' })]} />)
+      fireEvent.click(screen.getByRole('button', { name: '1 week' }))
+      expect(fillOf('OLD.AX')).toBe('rgb(207, 216, 220)')
+      expect(tooltipOf('OLD.AX')).toContain('1 week: —')
+    })
+
+    it('adds the chosen period to the tooltip, keeping P/L and Today', () => {
+      render(<HoldingsHeatMap holdings={[holding({ symbol: 'ONE.AX', moves: { '3m': 12.34, '1y': -5 } })]} />)
+      expect(tooltipOf('ONE.AX')).not.toContain('3 months')
+
+      fireEvent.click(screen.getByRole('button', { name: '3 months' }))
+      expect(tooltipOf('ONE.AX')).toContain('3 months: +12.3%')
+      expect(tooltipOf('ONE.AX')).not.toContain('1 year')
+      expect(tooltipOf('ONE.AX')).toContain('P/L: +20.0%')
+      expect(tooltipOf('ONE.AX')).toContain('Today: +1.0%')
+
+      fireEvent.click(screen.getByRole('button', { name: 'P/L' }))
+      expect(tooltipOf('ONE.AX')).not.toContain('3 months')
+    })
+  })
+
   describe('sector grouping', () => {
     const mixed = [
       holding({ symbol: 'BHP.AX', sector: 'Materials', current_value: 6000 }),
