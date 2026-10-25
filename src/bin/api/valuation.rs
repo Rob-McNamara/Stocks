@@ -1008,6 +1008,35 @@ pub(crate) fn holding_moves(conn: &Connection, symbol: &str, price: Option<&Effe
     Ok(trailing_moves(&closes, as_of, native))
 }
 
+/// A foreign holding's P/L, less its dividends, split into what the stock's
+/// price did and what the exchange rate did, both in AUD.
+///
+/// The price part is the P/L in the stock's own currency — value less cost,
+/// brokerage included — at today's rate. The currency part is the rest: what
+/// the rate's move since each purchase did to the cost. The two and the
+/// dividends add up to `pl` exactly.
+///
+/// Only where every purchase was recorded in the stock's own currency. A
+/// purchase recorded in AUD has no rate of its own, and its native cost is the
+/// AUD price standing in, so there is nothing true to split.
+pub(crate) fn pl_by_source(
+    ctx: &PortfolioContext,
+    symbol: &str,
+    txs: &[PortfolioTx],
+    summary: &portfolio::SymbolSummary,
+    price: Option<&EffectivePrice>,
+) -> Option<(f64, f64)> {
+    let bought_abroad = ctx.intl.get(symbol).copied().unwrap_or(false)
+        && txs.iter().filter(|t| t.tx_type == TxType::Purchase).all(|t| t.native_price.is_some());
+    if !bought_abroad {
+        return None;
+    }
+    let native_value = summary.remaining_shares * price?.native?;
+    let from_price = ctx.to_aud(symbol, native_value - summary.native_remaining_cost)?;
+    let from_currency = ctx.to_aud(symbol, summary.native_remaining_cost)? - summary.remaining_cost;
+    Some((from_price, from_currency))
+}
+
 #[utoipa::path(get, path = "/api/v1/portfolio/holdings", tag = "portfolio", responses((status = 200, description = "Get portfolio holdings")))]
 #[get("/api/portfolio/holdings")]
 pub(crate) async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl Responder {
@@ -1072,6 +1101,13 @@ pub(crate) async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl 
             ),
         };
         let pl = current_value - invested + dividends;
+        // A baseline is valued at today's rate, so measured from one there is
+        // no currency part to report.
+        let (pl_price, pl_currency) = rebased
+            .is_none()
+            .then(|| pl_by_source(&ctx, symbol, txs, &summary, ep))
+            .flatten()
+            .unzip();
         let moves = holding_moves(&conn, symbol, ep).unwrap_or_else(|err| {
             log_event_on_conn(&conn, "warn", "portfolio_fetch", Some(symbol), &format!("Period moves not measured, the heat map shows them as no data: {err}"));
             TrailingMoves::default()
@@ -1114,6 +1150,11 @@ pub(crate) async fn get_portfolio_holdings(db_path: web::Data<PathBuf>) -> impl 
             "dividends": dividends,
             "pl": pl,
             "pl_pct": if invested > 0.0 { Some(pl / invested * 100.0) } else { None },
+            // A foreign holding's P/L by source, in AUD: price and currency,
+            // which with `dividends` add up to `pl`. Null for one bought in
+            // AUD and for one measured from a baseline.
+            "pl_price": pl_price,
+            "pl_currency": pl_currency,
             // Present when the figures above are measured from a baseline
             // rather than from the purchase, so the client can say which.
             "basis_date": rebased.as_ref().map(|(date, _)| date.clone()),

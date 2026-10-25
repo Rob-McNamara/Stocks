@@ -258,6 +258,15 @@ export interface PortfolioHolding {
   dividends: number
   pl: number
   pl_pct: number | null
+  /**
+   * A foreign holding's P/L by source, in AUD: what the stock's own price did
+   * (its P/L in its own currency, at today's rate) and what the exchange rate
+   * did since each purchase. With `dividends` they add up to `pl`. Null for a
+   * holding bought in AUD and for one measured from a baseline; optional
+   * because an older API omits them.
+   */
+  pl_price?: number | null
+  pl_currency?: number | null
   sma50: number | null
   native_sma50: number | null
   sma150: number | null

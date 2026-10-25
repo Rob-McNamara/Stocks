@@ -283,6 +283,33 @@ describe('which currency a price leads with', () => {
     expect(within(intlCard).getByText(/P\/L: \+A\$/)).toBeTruthy()
   })
 
+  /**
+   * The card's P/L is in AUD while the price above it is in USD, so a holding
+   * can show a loss beside a price above its cost. The parts under the P/L
+   * say how much the price made and how much the dollar's move took.
+   */
+  it('splits a foreign card\'s P/L into what the price and the currency did', async () => {
+    // A$2,000 in, A$2,916 now: +A$1,016 from the price, −A$100 from the dollar.
+    mocked.getPortfolioHoldings.mockResolvedValue({
+      holdings: [{ ...EXPD, current_value: 2916, pl: 916, pl_pct: 45.8, pl_price: 1016, pl_currency: -100 }, BHP],
+      fx_rates: { USD: 1.527 },
+    })
+    mocked.getHoldings.mockResolvedValue([makeTransaction(usdPurchase)])
+    mocked.getPortfolioLots.mockResolvedValue({
+      lots: [{ transaction_id: 1, remaining: 10, current_value: 2915, unrealised_pl: 5 }],
+    })
+    render(<HoldingsManager scope="international" onLoading={() => {}} />)
+    await waitFor(() => expect((triggerButton() as HTMLButtonElement).disabled).toBe(false))
+
+    // Scoped to the card: the heat map's tooltips name the parts as well.
+    const card = (await screen.findByText(/Current value: A\$2916\.00/)).closest('div')!.parentElement!
+    expect(within(card).getByText(/P\/L: \+A\$916\.00/)).toBeTruthy()
+    expect(within(card).getByText('from price:').parentElement!.textContent).toMatch(/^from price: \+A\$1016\.00\s*\(\+50\.8%\)$/)
+    expect(within(card).getByText('from currency:').parentElement!.textContent).toMatch(/^from currency: -A\$100\.00\s*\(-5\.0%\)$/)
+    // No dividends yet, so no third part.
+    expect(within(card).queryByText('from dividends:')).toBeNull()
+  })
+
   it('leaves the local card in plain AUD, with no suffix', async () => {
     await renderScope('local', { id: 1, symbol: 'BHP.AX', price: 40.0 })
     expect(await screen.findByText(/150SMA: \$38\.00/)).toBeTruthy()

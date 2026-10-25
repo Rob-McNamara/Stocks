@@ -174,6 +174,31 @@ describe('HoldingsHeatMap', () => {
     expect(tooltip).toContain('-1.2%')
   })
 
+  /**
+   * SGOV's case: the US price rose, but the dollar fell further since the
+   * purchases, so the AUD P/L is a loss. Without the parts the figure reads as
+   * wrong; with them it says which way each one went.
+   */
+  it('splits a foreign holding\'s P/L into price and currency in the tooltip', () => {
+    render(
+      <HoldingsHeatMap
+        holdings={[
+          holding({ symbol: 'SGOV', is_international: true, currency: 'USD', invested: 7207, pl: -55.84, pl_pct: -0.77, pl_price: 7.12, pl_currency: -62.96 }),
+          holding({ symbol: 'RSP', is_international: true, currency: 'USD', invested: 1000, pl: 85, pl_pct: 8.5, pl_price: 100, pl_currency: -40, dividends: 25 }),
+          holding({ symbol: 'CBA.AX' }),
+        ]}
+      />,
+    )
+    const tooltipOf = (symbol: string) => tileFor(symbol).querySelector('title')!.textContent!
+    expect(tooltipOf('SGOV')).toContain(
+      'P/L: -0.8% ($-56)\n\u00a0\u00a0from price: +0.1% ($7)\n\u00a0\u00a0from currency: -0.9% ($-63)\nToday',
+    )
+    // Dividends are part of the P/L too, so they join the parts once paid.
+    expect(tooltipOf('RSP')).toContain('\u00a0\u00a0from dividends: +2.5% ($25)')
+    // Bought in AUD: there is nothing to split.
+    expect(tooltipOf('CBA.AX')).not.toContain('from price')
+  })
+
   // The two metrics answer different questions and a position is routinely up
   // overall while down today, so the toggle has to change what is rendered.
   it('switches the printed figure between total and today', () => {

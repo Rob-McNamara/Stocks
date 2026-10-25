@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import type { MovePeriod, PortfolioHolding } from '../services/api'
 import { squarify, squarifyGrouped } from '../utils/treemap'
 import { labelColor, rgb, tileColor } from '../utils/heatColors'
+import { plSources } from '../utils/holdings'
 
 const WIDTH = 1100
 const HEIGHT = 460
@@ -256,6 +257,13 @@ export default function HoldingsHeatMap({
                   {'\n'}Sector: {holding.sector?.trim() || UNASSIGNED}
                   {'\n'}Value: {formatAud(holding.current_value)} ({weight.toFixed(1)}% of holdings)
                   {'\n'}P/L{holding.basis_date ? ` since ${holding.basis_date}` : ''}: {formatPct(holding.pl_pct)} ({formatAud(holding.pl)})
+                  {/* A foreign holding's P/L can fall while its price rises,
+                      when the currency has fallen further; the parts say how
+                      much of each. Indented with no-break spaces, which a
+                      tooltip cannot collapse as it may ordinary ones. */}
+                  {plSources(holding.pl_price, holding.pl_currency, holding.dividends, holding.invested)
+                    ?.map((s) => `\n\u00a0\u00a0from ${s.source}: ${formatPct(s.pct)} (${formatAud(s.amount)})`)
+                    .join('')}
                   {'\n'}Today: {formatPct(holding.change_percent)}
                   {isPeriod(metric) &&
                     `\n${labelOf(metric)}: ${formatPct(pct)}${pct == null ? ' (not enough price history)' : ''}`}

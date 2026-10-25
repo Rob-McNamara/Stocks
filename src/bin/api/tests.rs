@@ -2332,6 +2332,64 @@ async fn holdings_report_each_periods_move_to_the_quote() {
     }
 }
 
+/// A foreign holding's P/L by source. The US price can rise while the AUD
+/// P/L falls, when the dollar has dropped since the purchase; the split says
+/// how much of each, and with the dividends the parts add up to the P/L.
+#[actix_web::test]
+async fn a_foreign_holdings_pl_is_split_into_price_and_currency() {
+    let (_file, db_path) = setup_test_db();
+    let conn = open_db(&db_path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, original_price, fx_rate, brokerage, currency, created_at)
+           VALUES (1, 'FXS', 'purchase', '2026-03-02', 20.0, 150.0, 100.0, 1.5, 3.0, 'USD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, original_price, fx_rate, brokerage, currency, created_at)
+           VALUES (2, 'FXS', 'purchase', '2026-05-04', 30.0, 154.0, 110.0, 1.4, 0.0, 'USD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, amount, currency, created_at)
+           VALUES (3, 'FXS', 'dividend', '2026-06-01', 15.0, 'AUD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, original_price, fx_rate, brokerage, currency, created_at)
+           VALUES (4, 'MIX', 'purchase', '2026-03-02', 10.0, 75.0, 50.0, 1.5, 0.0, 'USD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, currency, created_at)
+           VALUES (5, 'MIX', 'purchase', '2026-04-01', 10.0, 80.0, 0.0, 'AUD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, original_price, fx_rate, brokerage, currency, created_at)
+           VALUES (6, 'BAS', 'purchase', '2024-03-01', 10.0, 30.0, 20.0, 1.5, 0.0, 'USD', 'x');
+         INSERT INTO holdings_transactions (id, symbol, transaction_type, date, quantity, price, brokerage, currency, created_at)
+           VALUES (7, 'LOC.AX', 'purchase', '2026-03-02', 100.0, 5.0, 0.0, 'AUD', 'x');
+         INSERT INTO symbol_info (symbol, currency, updated_at) VALUES ('FXS', 'USD', 'x'), ('MIX', 'USD', 'x'), ('BAS', 'USD', 'x'), ('LOC.AX', 'AUD', 'x');
+         INSERT INTO holdings_symbol_fields (symbol, field_key, value) VALUES ('BAS', 'pl_basis_date', '2025-01-02'), ('BAS', 'pl_basis_price', '40');",
+    )
+    .unwrap();
+    for (sym, price) in [("FXS", 120.0), ("MIX", 60.0), ("BAS", 50.0), ("LOC.AX", 6.0), ("USDAUD=X", 1.4)] {
+        conn.execute(
+            "INSERT INTO cached_current_prices (symbol, price, last_updated, price_date) VALUES (?1, ?2, ?3, '2026-10-23')",
+            params![sym, price, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let body = get_json(&db_path, "/api/portfolio/holdings").await;
+    let fxs = find(&body["holdings"], "FXS");
+    // Cost: A$7,623 (brokerage A$3), or US$5,302 at each purchase's own rate,
+    // the fee converted at its own. Now 50 × US$120 = US$6,000.
+    // Price: (6,000 − 5,302) × 1.4. Currency: 5,302 × 1.4 − 7,623.
+    assert!(close_to(&fxs["pl_price"], 698.0 * 1.4), "got {}", fxs["pl_price"]);
+    assert!(close_to(&fxs["pl_currency"], 5302.0 * 1.4 - 7623.0), "got {}", fxs["pl_currency"]);
+    let parts = fxs["pl_price"].as_f64().unwrap() + fxs["pl_currency"].as_f64().unwrap() + fxs["dividends"].as_f64().unwrap();
+    assert!(close_to(&fxs["pl"], parts), "the parts make up the P/L: {} vs {parts}", fxs["pl"]);
+
+    // A purchase recorded in AUD has no rate of its own to split by.
+    let mix = find(&body["holdings"], "MIX");
+    assert_eq!(mix["is_international"], true, "the fixture must reach the guard");
+    assert!(mix["pl_price"].is_null() && mix["pl_currency"].is_null(), "got {} / {}", mix["pl_price"], mix["pl_currency"]);
+    // A baseline is valued at today's rate: no currency part to report.
+    let bas = find(&body["holdings"], "BAS");
+    assert_eq!(bas["basis_date"], "2025-01-02", "the fixture must be measured from its baseline");
+    assert!(bas["pl_price"].is_null() && bas["pl_currency"].is_null(), "got {} / {}", bas["pl_price"], bas["pl_currency"]);
+    // Bought and priced in AUD: nothing to split.
+    let loc = find(&body["holdings"], "LOC.AX");
+    assert!(loc["pl_price"].is_null() && loc["pl_currency"].is_null());
+}
+
 /// A lot that is half sold carries half its fee; the rest left with the
 /// shares that were sold.
 #[actix_web::test]

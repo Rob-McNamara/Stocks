@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { calculateSMA, calculateEMA, getLatestSMA, smaTrend } from './sma'
 import { toWeeklyBars } from './bars'
 import { mapLimit } from './async'
-import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from './holdings'
+import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots, plSources } from './holdings'
 import { parseChartDefaults, FALLBACK_CHART_DEFAULTS, CHART_HEIGHT_RANGE } from './chartDefaults'
 import { parseLayoutWidth, LAYOUT_WIDTHS, FALLBACK_LAYOUT_WIDTH } from './layout'
 
@@ -267,6 +267,36 @@ describe('getRemainingPurchaseLots', () => {
       { id: 3, symbol: 'BBB.AX', transaction_type: 'purchase', date: '2025-02-01', quantity: 5, price: 3 },
     ], 'AAA.AX')
     expect(lots).toEqual([])
+  })
+})
+
+describe('plSources', () => {
+  // SGOV: A$7,207 in; the US price made A$7, the dollar's fall cost A$63.
+  it('gives the price and currency parts, each as a share of the cost', () => {
+    const sources = plSources(7.12, -62.96, 0, 7207)!
+    expect(sources.map((s) => s.source)).toEqual(['price', 'currency'])
+    expect(sources[0].pct).toBeCloseTo(0.0988, 4)
+    expect(sources[1].pct).toBeCloseTo(-0.8736, 4)
+  })
+
+  // The P/L counts dividends too, so the parts only account for it with them.
+  it('adds dividends when there are any, so the parts add up to the P/L', () => {
+    const sources = plSources(100, -40, 25, 1000)!
+    expect(sources.map((s) => s.source)).toEqual(['price', 'currency', 'dividends'])
+    expect(sources.reduce((sum, s) => sum + s.amount, 0)).toBe(85)
+    expect(sources.reduce((sum, s) => sum + s.pct!, 0)).toBeCloseTo(8.5, 9)
+  })
+
+  // A holding bought in AUD, or one measured from a baseline, has no split,
+  // and an older API sends none: the P/L then stands alone.
+  it('has nothing to say without both parts', () => {
+    expect(plSources(null, null, 0, 1000)).toBeNull()
+    expect(plSources(undefined, undefined, 5, 1000)).toBeNull()
+    expect(plSources(10, null, 0, 1000)).toBeNull()
+  })
+
+  it('leaves the percentages out when there is no cost to divide by', () => {
+    expect(plSources(10, -2, 0, 0)!.map((s) => s.pct)).toEqual([null, null])
   })
 })
 

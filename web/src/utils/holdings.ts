@@ -81,3 +81,36 @@ export function getRemainingPurchaseLots(
   })
   return lots.filter((l) => l.quantity > 0 && l.date)
 }
+
+/** One source of a holding's P/L, in AUD, and as a percentage of its cost. */
+export interface PlSource {
+  /** Read as "from price", "from currency", "from dividends". */
+  source: 'price' | 'currency' | 'dividends'
+  amount: number
+  pct: number | null
+}
+
+/**
+ * Where a foreign holding's P/L came from: its own price, the exchange rate,
+ * and dividends when it has had any. The amounts add up to the P/L, and each
+ * percentage is of the same cost the P/L's is, so those add up too.
+ *
+ * Null when the API sent no split — a holding bought in AUD, or one measured
+ * from a baseline — so a caller shows the P/L alone rather than parts that
+ * would not account for it.
+ */
+export function plSources(
+  price: number | null | undefined,
+  currency: number | null | undefined,
+  dividends: number,
+  invested: number,
+): PlSource[] | null {
+  if (price == null || currency == null) return null
+  const pct = (amount: number) => (invested > 0 ? (amount / invested) * 100 : null)
+  const sources: PlSource[] = [
+    { source: 'price', amount: price, pct: pct(price) },
+    { source: 'currency', amount: currency, pct: pct(currency) },
+  ]
+  if (dividends !== 0) sources.push({ source: 'dividends', amount: dividends, pct: pct(dividends) })
+  return sources
+}

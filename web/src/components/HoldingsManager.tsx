@@ -1,6 +1,6 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { apiClient, type HoldingTransactionPayload, type PortfolioHolding, type PortfolioLot, type CashAccount } from '../services/api'
-import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots } from '../utils/holdings'
+import { getActiveHoldingSymbols, getEarliestRemainingPurchaseDate, getRemainingPurchaseLots, plSources } from '../utils/holdings'
 import { settlementAccountsFor } from '../utils/cash'
 import { SECTORS } from '../utils/sectors'
 import PriceChart from './PriceChart'
@@ -705,6 +705,8 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
     nativeAvgCost: h.native_avg_cost,
     pl: h.pl,
     plPct: h.pl_pct,
+    plPrice: h.pl_price,
+    plCurrency: h.pl_currency,
     basisDate: h.basis_date,
     longName: h.long_name,
     instrumentType: h.instrument_type,
@@ -1321,13 +1323,24 @@ export default function HoldingsManager({ scope, onLoading, onTransactionsChange
                     const pl = item.currentValue - item.invested + item.dividends
                     const pct = item.invested > 0 ? (pl / item.invested) * 100 : null
                     return (
-                      <div style={{ color: pl >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
-                        {/* A baseline replaces the purchase as the basis, so
-                            there is one figure — labelled with the period it
-                            actually covers rather than left to be assumed. */}
-                        P/L{item.basisDate ? ` since ${item.basisDate}` : ''}: {pl >= 0 ? '+' : '-'}{aud}{Math.abs(pl).toFixed(2)}
-                        {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
-                      </div>
+                      <>
+                        <div style={{ color: pl >= 0 ? '#4caf50' : '#f44336', fontWeight: 600 }}>
+                          {/* A baseline replaces the purchase as the basis, so
+                              there is one figure — labelled with the period it
+                              actually covers rather than left to be assumed. */}
+                          P/L{item.basisDate ? ` since ${item.basisDate}` : ''}: {pl >= 0 ? '+' : '-'}{aud}{Math.abs(pl).toFixed(2)}
+                          {pct !== null && <span style={{ fontWeight: 400, marginLeft: 4 }}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
+                        </div>
+                        {/* A foreign holding's P/L can fall while the price
+                            above it has risen, when the currency fell further.
+                            The parts below add up to the P/L and say which. */}
+                        {plSources(item.plPrice, item.plCurrency, item.dividends, item.invested)?.map((s) => (
+                          <div key={s.source} style={{ fontSize: 12, color: s.amount >= 0 ? '#4caf50' : '#f44336' }}>
+                            <span style={{ color: '#999' }}>from {s.source}:</span> {s.amount >= 0 ? '+' : '-'}{aud}{Math.abs(s.amount).toFixed(2)}
+                            {s.pct !== null && <span style={{ marginLeft: 4 }}>({s.pct >= 0 ? '+' : ''}{s.pct.toFixed(1)}%)</span>}
+                          </div>
+                        ))}
+                      </>
                     )
                   })()}
                 </div>
