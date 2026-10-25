@@ -135,6 +135,24 @@ pub fn local_date(ts: i64, gmtoffset: Option<i64>) -> Option<NaiveDate> {
         .map(|dt| dt.date_naive())
 }
 
+/// The trading date of a daily bar: `local_date` with an hour's grace.
+///
+/// Yahoo gives one offset for a whole series — the exchange's offset now —
+/// though the bars span both sides of every clock change. That is harmless for
+/// a bar stamped at the open, hours from midnight, but an FX pair's bars are
+/// stamped at midnight London time: read in the UK's winter, a summer bar's
+/// 23:00 UTC lands an hour short, on the day before. Read on the day the
+/// clocks went back, every USD/AUD rate from late March to late October was
+/// filed a day early, each weekday holding the next one's rate. No series this
+/// app reads stamps a bar in the last hour of its day, so the grace moves
+/// nothing else.
+///
+/// For bars only. A quote's time can fall in the last hour of a trading day —
+/// an FX quote late in the London evening — and has to keep `local_date`.
+pub fn bar_date(ts: i64, gmtoffset: Option<i64>) -> Option<NaiveDate> {
+    local_date(ts + 3600, gmtoffset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +180,43 @@ mod tests {
         assert_eq!(quote.close_at(1), None);
         let ts = result.events.unwrap().dividends.unwrap().values().next().unwrap().date.unwrap();
         assert_eq!(local_date(ts, Some(39600)), NaiveDate::from_ymd_opt(2026, 1, 5));
+    }
+
+    /// USD/AUD's bars are stamped at midnight London time: 23:00 UTC the day
+    /// before in summer time, 00:00 UTC in winter. Whichever offset Yahoo
+    /// reports with the series, every bar keeps its own date.
+    #[test]
+    fn an_fx_bar_keeps_its_date_across_a_uk_clock_change() {
+        const BST: Option<i64> = Some(3600);
+        const GMT: Option<i64> = Some(0);
+        // Tuesday 15 Sep 2026, London midnight in summer time.
+        let summer = Utc.with_ymd_and_hms(2026, 9, 14, 23, 0, 0).unwrap().timestamp();
+        // Wednesday 14 Jan 2026, London midnight in winter time.
+        let winter = Utc.with_ymd_and_hms(2026, 1, 14, 0, 0, 0).unwrap().timestamp();
+        for offset in [BST, GMT] {
+            assert_eq!(bar_date(summer, offset), NaiveDate::from_ymd_opt(2026, 9, 15), "summer bar, offset {offset:?}");
+            assert_eq!(bar_date(winter, offset), NaiveDate::from_ymd_opt(2026, 1, 14), "winter bar, offset {offset:?}");
+        }
+        // The bug: read with the winter offset, the summer bar was Monday's.
+        assert_eq!(local_date(summer, GMT), NaiveDate::from_ymd_opt(2026, 9, 14));
+    }
+
+    /// Bars stamped at the open are hours from midnight, so the grace leaves
+    /// them where `local_date` puts them, either side of a clock change.
+    #[test]
+    fn a_bar_stamped_at_the_open_keeps_its_date() {
+        // ASX opens 10:00 Sydney: 23:00 UTC the day before in daylight saving.
+        let asx_summer = Utc.with_ymd_and_hms(2026, 1, 4, 23, 0, 0).unwrap().timestamp();
+        let asx_winter = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap().timestamp();
+        for offset in [Some(39600), Some(36000)] {
+            assert_eq!(bar_date(asx_summer, offset), NaiveDate::from_ymd_opt(2026, 1, 5));
+            assert_eq!(bar_date(asx_winter, offset), NaiveDate::from_ymd_opt(2026, 6, 1));
+        }
+        // NYSE opens 09:30 New York.
+        let nyse = Utc.with_ymd_and_hms(2026, 7, 6, 13, 30, 0).unwrap().timestamp();
+        for offset in [Some(-14400), Some(-18000)] {
+            assert_eq!(bar_date(nyse, offset), NaiveDate::from_ymd_opt(2026, 7, 6));
+        }
     }
 
     #[test]

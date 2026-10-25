@@ -85,10 +85,11 @@ impl OhlBar {
 /// Convert a Yahoo bar timestamp to the exchange-local trading date. Yahoo
 /// stamps daily bars at the market open, so for exchanges ahead of UTC the UTC
 /// date is a day early — the date must be taken in exchange time. This matches
-/// `yahoo_local_date` in the API, and getting it wrong would file OHLC against
-/// the neighbouring day's close.
+/// the API's history reader, and getting it wrong would file OHLC against the
+/// neighbouring day's close — as FX bars read across a UK clock change were
+/// (see `stocks::yahoo::bar_date`).
 fn yahoo_local_date(ts: i64, gmtoffset: Option<i64>) -> Option<NaiveDate> {
-    stocks::yahoo::local_date(ts, gmtoffset)
+    stocks::yahoo::bar_date(ts, gmtoffset)
 }
 
 #[tokio::main]

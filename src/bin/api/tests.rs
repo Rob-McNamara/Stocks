@@ -4278,6 +4278,90 @@ fn fx_rate_on_reads_stored_rates_as_of_a_date() {
     assert_eq!(fx_rate_on(&conn, "GBP", "2026-08-07"), None);
 }
 
+fn stored_rate(date: &str, fetched_at: &str) -> StoredRate {
+    StoredRate {
+        date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+        rate: 1.4,
+        fetched_at: chrono::DateTime::parse_from_rfc3339(fetched_at).ok().map(|at| at.with_timezone(&Utc)),
+    }
+}
+
+fn day(date: &str) -> NaiveDate {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap()
+}
+
+/// A trade is recorded at its own day's rate. The stored history was only
+/// brought up to date when the API started, and the record form took its
+/// newest close however old: a purchase on Tuesday 15 September 2026 was
+/// recorded at 1 September's rate, 0.43% off the day's.
+#[test]
+fn a_stored_rate_from_days_earlier_is_not_the_days_rate() {
+    let first_of_september = stored_rate("2026-09-01", "2026-09-02T03:00:00+00:00");
+    assert!(!is_rate_for(&first_of_september, day("2026-09-15")), "two weeks stale");
+    assert!(is_rate_for(&first_of_september, day("2026-09-01")), "its own day");
+
+    // Friday's close is the weekend's rate, but not Monday's: Monday has a
+    // close of its own.
+    let friday = stored_rate("2026-09-11", "2026-09-12T06:00:00+00:00");
+    assert!(is_rate_for(&friday, day("2026-09-12")));
+    assert!(is_rate_for(&friday, day("2026-09-13")));
+    assert!(!is_rate_for(&friday, day("2026-09-14")));
+}
+
+/// A close fetched while its day is still trading is that moment's rate.
+/// The API starting mid-session stored 5 October as 1.4357; the day closed
+/// at 1.4385.
+#[test]
+fn a_close_fetched_before_its_day_ended_is_not_the_days_rate() {
+    assert!(!is_rate_for(&stored_rate("2026-10-05", "2026-10-05T11:03:00+00:00"), day("2026-10-05")));
+    assert!(is_rate_for(&stored_rate("2026-10-05", "2026-10-06T00:30:00+00:00"), day("2026-10-05")));
+    // No usable fetch time: it cannot be known to be final.
+    assert!(!is_rate_for(&stored_rate("2026-10-05", "x"), day("2026-10-05")));
+}
+
+async fn get_fx_rate(db_path: &std::path::Path, uri: &str) -> serde_json::Value {
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.to_path_buf())).service(get_fx_rate_for_date),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::get().uri(uri).to_request();
+    let resp = actix_web::test::call_service(&app, req).await;
+    assert!(resp.status().is_success(), "{} returned {}", uri, resp.status());
+    actix_web::test::read_body_json(resp).await
+}
+
+/// With the history up to date the form's lookup needs no network, and it
+/// names the day the rate is from, so a weekend date shows Friday's.
+#[actix_web::test]
+async fn the_rate_lookup_gives_the_days_own_stored_close_and_its_date() {
+    let (_file, db_path) = setup_test_db();
+    let conn = open_db(&db_path).unwrap();
+    for (date, close, fetched_at) in [
+        ("2026-09-14", 1.3982, "2026-09-15T02:00:00+00:00"),
+        ("2026-09-15", 1.4010, "2026-09-16T02:00:00+00:00"),
+        ("2026-09-18", 1.4054, "2026-09-19T02:00:00+00:00"),
+    ] {
+        conn.execute(
+            "INSERT INTO prices (symbol, date, close, fetched_at) VALUES ('USDAUD=X', ?1, ?2, ?3)",
+            params![date, close, fetched_at],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let tuesday = get_fx_rate(&db_path, "/api/fx-rate?currency=USD&date=2026-09-15").await;
+    assert_eq!(tuesday["rate"], 1.4010);
+    assert_eq!(tuesday["date"], "2026-09-15");
+    assert_eq!(tuesday["source"], "stored");
+
+    let saturday = get_fx_rate(&db_path, "/api/fx-rate?currency=usd&date=2026-09-19").await;
+    assert_eq!(saturday["rate"], 1.4054);
+    assert_eq!(saturday["date"], "2026-09-18", "the rate's own day, not the one asked for");
+
+    let aud = get_fx_rate(&db_path, "/api/fx-rate?currency=AUD&date=2026-09-15").await;
+    assert_eq!(aud["rate"], 1.0);
+}
+
 /// A 40-week EMA is not a 200-day EMA. The weekly figure steps once a week
 /// from one close per week, so it is far less sensitive to a single day's
 /// move — using daily bars would quietly report a different indicator.

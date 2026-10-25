@@ -46,7 +46,7 @@ pub(crate) async fn fetch_fx_rate_on_date(currency: &str, target_date: NaiveDate
     let mut best: Option<(f64, String)> = None;
     let gmtoffset = result.gmtoffset();
     for (i, ts) in timestamps.iter().enumerate() {
-        let date_str = yahoo_local_date(*ts, gmtoffset)
+        let date_str = stocks::yahoo::bar_date(*ts, gmtoffset)
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
         if date_str <= target_str
@@ -57,6 +57,74 @@ pub(crate) async fn fetch_fx_rate_on_date(currency: &str, target_date: NaiveDate
     best.ok_or_else(|| format!("No FX rate found on or before {}", target_str))
 }
 
+/// How far before a date the last stored rate may sit and still stand for it
+/// once the history is up to date: a weekend, or a day the FX market did not
+/// trade. The sector rotation allows the same.
+const FX_LOOKBACK_DAYS: i64 = 7;
+
+/// One stored daily rate: the day it is for, its close, and when it was fetched.
+pub(crate) struct StoredRate {
+    pub(crate) date: NaiveDate,
+    pub(crate) rate: f64,
+    pub(crate) fetched_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// The last stored rate for `currency` on or before `date`.
+pub(crate) fn stored_rate_on_or_before(conn: &Connection, currency: &str, date: NaiveDate) -> rusqlite::Result<Option<StoredRate>> {
+    let row = conn
+        .query_row(
+            "SELECT date, close, fetched_at FROM prices
+              WHERE symbol = ?1 AND close IS NOT NULL AND date <= ?2
+              ORDER BY date DESC LIMIT 1",
+            params![fx_pair_symbol(currency), date.format("%Y-%m-%d").to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, Option<String>>(2)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(day, rate, fetched_at)| {
+        Some(StoredRate {
+            date: NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok()?,
+            rate,
+            fetched_at: fetched_at
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+                .map(|at| at.with_timezone(&Utc)),
+        })
+    }))
+}
+
+/// Whether a stored rate is `date`'s own, so it can be given without asking
+/// Yahoo first.
+///
+/// It is when nothing newer can exist for the date: the close is for the date
+/// itself, or for the Friday before a weekend the date falls in, and it was
+/// fetched after its day's trading had ended. A close fetched mid-session is
+/// that moment's rate, not the day's. Anything further back is the stored
+/// history falling behind — it is only brought up to date when the API starts
+/// and on the startup refresh — and is days stale: that is how a purchase on
+/// 15 September came to be recorded at 1 September's rate.
+pub(crate) fn is_rate_for(stored: &StoredRate, date: NaiveDate) -> bool {
+    let only_weekend_since = stored
+        .date
+        .iter_days()
+        .skip(1)
+        .take_while(|day| *day <= date)
+        .all(|day| matches!(day.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun));
+    // The FX day ends at midnight London time, which is never later than
+    // midnight UTC.
+    let day_closed = stored.fetched_at.is_some_and(|at| at.date_naive() > stored.date);
+    stored.date <= date && only_weekend_since && day_closed
+}
+
+/// Re-read a currency's last year of daily rates from Yahoo and store them,
+/// so the newest day is present and every earlier close is the day's final one.
+pub(crate) async fn refresh_fx_history(db_path: &Path, currency: &str) -> Result<(), String> {
+    let pair = fx_pair_symbol(currency);
+    let records = fetch_price_history_from_yahoo(http_client(), &pair, 365).await?;
+    let mut conn = open_db(db_path).map_err(|err| err.to_string())?;
+    let tx = conn.transaction().map_err(|err| err.to_string())?;
+    persist_price_history(&tx, &pair, &records);
+    tx.commit().map_err(|err| err.to_string())
+}
+
 #[utoipa::path(get, path = "/api/v1/fx-rate", tag = "fx", responses((status = 200, description = "Get fx rate for date")))]
 #[get("/api/fx-rate")]
 pub(crate) async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web::Query<FxRateQuery>) -> impl Responder {
@@ -65,13 +133,40 @@ pub(crate) async fn get_fx_rate_for_date(db_path: web::Data<PathBuf>, query: web
         Ok(d) => d,
         Err(_) => return err_bad_request("Invalid date format, use YYYY-MM-DD"),
     };
-    // Prefer the stored rate history: it covers every past date, avoids a Yahoo
-    // round trip per lookup, and returns the same rate the valuation code will
-    // use. Only fall through to the network when the date is not yet stored.
-    if let Ok(conn) = open_db(db_path.as_ref())
-        && let Some(rate) = fx_rate_on(&conn, &currency, &query.date)
-    {
-        return HttpResponse::Ok().json(serde_json::json!({ "rate": rate, "date": query.date, "source": "stored" }));
+    if currency == "AUD" {
+        return HttpResponse::Ok().json(serde_json::json!({ "rate": 1.0, "date": query.date, "source": "base" }));
+    }
+    let stored = || {
+        open_db(db_path.as_ref())
+            .and_then(|conn| stored_rate_on_or_before(&conn, &currency, target_date))
+            .unwrap_or_else(|err| {
+                let _ = insert_event_log(&db_path, "warn", "fx_fetch", "api", None, &format!("Stored {currency}/AUD rates could not be read: {err}"));
+                None
+            })
+    };
+    // The date given back is the rate's own, so the form shows which day it
+    // came from rather than repeating the day it was asked for.
+    let reply = |found: StoredRate| {
+        HttpResponse::Ok().json(serde_json::json!({
+            "rate": found.rate,
+            "date": found.date.format("%Y-%m-%d").to_string(),
+            "source": "stored",
+        }))
+    };
+
+    // The stored history, when it holds the date's own rate: it avoids a
+    // Yahoo round trip and is the rate the valuation code will use.
+    if let Some(found) = stored().filter(|found| is_rate_for(found, target_date)) {
+        return reply(found);
+    }
+    // Otherwise it is behind the date, or holds a close taken mid-session:
+    // bring it up to date first. A close within the lookback then stands for
+    // the date, as a Friday does for a weekend.
+    if let Err(err) = refresh_fx_history(&db_path, &currency).await {
+        let _ = insert_event_log(&db_path, "warn", "fx_fetch", "api", None, &format!("{currency}/AUD rates not refreshed for {target_date}: {err}"));
+    }
+    if let Some(found) = stored().filter(|found| (target_date - found.date).num_days() <= FX_LOOKBACK_DAYS) {
+        return reply(found);
     }
 
     match fetch_fx_rate_on_date(&currency, target_date).await {

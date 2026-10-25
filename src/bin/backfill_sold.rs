@@ -123,7 +123,7 @@ async fn fetch_daily(
         // Dated in exchange time, like every other writer. This tool used the
         // UTC date, which files an ASX bar a day early during daylight saving
         // (it opens at 23:00 UTC the previous day).
-        let Some(date) = stocks::yahoo::local_date(*ts, gmtoffset) else { continue };
+        let Some(date) = stocks::yahoo::bar_date(*ts, gmtoffset) else { continue };
         bars.push(Bar {
             date: date.format("%Y-%m-%d").to_string(),
             open: quote.open_at(i),

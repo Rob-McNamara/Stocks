@@ -296,7 +296,7 @@ pub(crate) fn chart_history(result: &ChartResult, symbol: &str) -> Result<Vec<Pr
 
     let mut records = Vec::with_capacity(timestamps.len());
     for (index, ts) in timestamps.iter().enumerate() {
-        let day = yahoo_local_date(*ts, gmtoffset).ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?;
+        let day = stocks::yahoo::bar_date(*ts, gmtoffset).ok_or_else(|| format!("Invalid timestamp {} for {}", ts, symbol))?;
         let date = day.format("%Y-%m-%d").to_string();
 
         let mut close = quote.close_at(index);

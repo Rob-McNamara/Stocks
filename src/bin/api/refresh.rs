@@ -178,6 +178,13 @@ pub(crate) async fn refresh_all(db_path: web::Data<PathBuf>, query: web::Query<R
     let dividends = refresh_dividends_for_symbols(&db_path, holding_symbols).await;
     errors.extend(dividends.errors.clone());
 
+    // A foreign dividend is converted at its ex-date's stored rate, and the
+    // stored rates were otherwise only brought up to date when the API started:
+    // left running for a fortnight, it recorded September's dividends at
+    // 1 September's rate. Already-current rates cost one query and no fetch.
+    let fx = sync_fx_history(db_path.as_ref(), 600).await;
+    errors.extend(fx.errors);
+
     // Record what was just fetched, as the dividend refresh endpoints do.
     // Without this an event fetched here sat in the ledger as an unrecorded
     // row, missing from the cash balance, until someone pressed the separate

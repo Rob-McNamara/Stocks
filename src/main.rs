@@ -406,9 +406,10 @@ async fn fetch_and_store(
 /// bars at the market open; for exchanges ahead of UTC (ASX opens 10:00
 /// Sydney = 23:00 UTC the *previous* day during daylight saving) the UTC
 /// date is one day early, so the date is taken in exchange time:
-/// UTC + meta.gmtoffset.
+/// UTC + meta.gmtoffset, with `stocks::yahoo::bar_date`'s grace for a series
+/// read across a clock change.
 fn bar_date(ts: i64, gmtoffset: Option<i64>) -> String {
-    stocks::yahoo::local_date(ts, gmtoffset)
+    stocks::yahoo::bar_date(ts, gmtoffset)
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
         .format("%Y-%m-%d")
         .to_string()
@@ -573,9 +574,11 @@ mod tests {
         assert_eq!(bar_date(ts, Some(EST)), "2026-01-05");
     }
 
+    /// A stamp in the UTC day's last hour would be carried into the next by
+    /// `stocks::yahoo::bar_date`'s grace, so this one sits just before it.
     #[test]
     fn bar_date_missing_offset_falls_back_to_utc() {
-        let ts = utc_ts(2026, 1, 4, 23, 0);
+        let ts = utc_ts(2026, 1, 4, 22, 0);
         assert_eq!(bar_date(ts, None), "2026-01-04");
     }
 
