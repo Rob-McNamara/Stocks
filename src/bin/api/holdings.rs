@@ -35,6 +35,12 @@ pub(crate) struct HoldingTransaction {
     /// The fetched event this dividend stands for, when its own date was
     /// corrected away from the event's ex-date.
     pub(crate) source_ex_date: Option<String>,
+    /// Set on the rows a corporate action stands for, which are worked out
+    /// rather than stored: edit or delete the action, not the row.
+    pub(crate) corporate_action: Option<CorporateActionLink>,
+    /// For a parcel handed on by a merger with roll-over: when the original
+    /// shares were bought, which is when these count as acquired for CGT.
+    pub(crate) acquired_date: Option<String>,
     #[serde(default)]
     pub(crate) custom_fields: std::collections::HashMap<String, String>,
 }
@@ -134,10 +140,9 @@ pub(crate) async fn prepare_holding_payload(
         // refused with a misleading over-sell warning. It is an error.
         let held: f64 = match open_db(db_path).and_then(|conn| {
             conn.query_row(
-                "SELECT COALESCE(SUM(CASE WHEN transaction_type = 'purchase' THEN quantity ELSE -quantity END), 0)
-                 FROM holdings_transactions
-                 WHERE symbol = ?1 AND transaction_type IN ('purchase', 'sale')
-                   AND (?2 IS NULL OR id <> ?2)",
+                "SELECT COALESCE(SUM(quantity), 0)
+                 FROM share_movements
+                 WHERE symbol = ?1 AND (?2 IS NULL OR id IS NULL OR id <> ?2)",
                 params![symbol, excluding],
                 |row| row.get(0),
             )
@@ -359,6 +364,15 @@ pub(crate) fn migrate_symbol_rows(tx: &Connection, old_symbol: &str, new_symbol:
         .map_err(|e| format!("Clearing {} from {}: {}", old_symbol, table, e))?;
     }
 
+    // A corporate action names two symbols, in columns of its own.
+    for column in ["from_symbol", "to_symbol"] {
+        tx.execute(
+            &format!("UPDATE corporate_actions SET {column} = ?1 WHERE {column} = ?2"),
+            params![new_symbol, old_symbol],
+        )
+        .map_err(|e| format!("Renaming {} in corporate_actions: {}", old_symbol, e))?;
+    }
+
     // Settings keyed by symbol name in app_config. Left behind, a renamed
     // holding lost its manual valuation and its delisted marker — so the
     // refresh started asking Yahoo for it again — and an ETF override stopped
@@ -555,6 +569,8 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
             "franked_amount": tx.franked_amount,
             "franking_credit": tx.franking_credit,
             "dividend_type": tx.dividend_type,
+            "corporate_action": tx.corporate_action,
+            "acquired_date": tx.acquired_date,
             "per_share": false,
             "payment_date": tx.payment_date,
             "custom_fields": tx.custom_fields,
@@ -626,6 +642,8 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
                     "franked_amount": serde_json::Value::Null,
                     "franking_credit": serde_json::Value::Null,
                     "dividend_type": serde_json::Value::Null,
+                    "corporate_action": serde_json::Value::Null,
+                    "acquired_date": serde_json::Value::Null,
                     "per_share": true,
                     "payment_date": payment_date,
                     "custom_fields": serde_json::json!({}),
@@ -672,6 +690,8 @@ impl HoldingTransaction {
             payment_date: row.get(17)?,
             dividend_type: row.get(18)?,
             source_ex_date: row.get(19)?,
+            corporate_action: None,
+            acquired_date: None,
             custom_fields: std::collections::HashMap::new(),
         })
     }
@@ -723,6 +743,11 @@ pub(crate) fn fetch_holdings(db_path: &PathBuf) -> Result<Vec<HoldingTransaction
             }
         }
     }
+
+    // Before the dividend totals: a merger changes which shares were held on
+    // each later ex-date.
+    expand_corporate_actions(db_path, &conn, &mut transactions)?;
+    transactions.sort_by(|a, b| b.date.cmp(&a.date).then(b.id.cmp(&a.id)));
 
     let dividend_totals = calculate_dividend_totals(db_path, &transactions)?;
     for tx in &mut transactions {
@@ -1143,6 +1168,7 @@ pub(crate) fn to_portfolio_txs(rows: &[HoldingTransaction]) -> Vec<PortfolioTx> 
             amount: t.amount,
             brokerage: t.brokerage,
             dividends_total: t.dividends_total,
+            acquired: t.acquired_date.clone(),
         })
         .collect()
 }

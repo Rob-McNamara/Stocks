@@ -32,6 +32,8 @@ fn make_tx(id: i64, tx_type: &str, date: &str, quantity: f64, price: f64) -> Hol
         payment_date: None,
         dividend_type: None,
         source_ex_date: None,
+        corporate_action: None,
+        acquired_date: None,
         custom_fields: Default::default(),
     }
 }
@@ -6902,4 +6904,183 @@ async fn a_trusts_imported_franking_estimates_its_statement() {
     assert_eq!(figure(&report, "trusts", "13C"), 60.0, "the statement replaces the estimate");
     let line = section(&report, "trusts")["summary"].as_array().unwrap().iter().find(|l| l["item"] == "13C").unwrap().clone();
     assert!(line["note"].is_null());
+}
+
+// -------------------------------------------------------------------------
+// Corporate actions
+// -------------------------------------------------------------------------
+
+/// Soul Patts and Brickworks as they happened: 90 SOL and 80 BKW bought in
+/// January 2025, BKW merged into SOL on 23 September at 0.82 (80 became 66).
+fn sol_bkw(db_path: &PathBuf, rollover: bool, market_value: Option<f64>) -> serde_json::Value {
+    tax_tx(db_path, 1, "SOL.AX", "purchase", "2025-01-02", 90.0, 34.22, 21.90, None);
+    tax_tx(db_path, 2, "BKW.AX", "purchase", "2025-01-07", 80.0, 25.371, 11.95, None);
+    serde_json::json!({
+        "date": "2025-09-23", "from_symbol": "BKW.AX", "to_symbol": "SOL.AX",
+        "from_quantity": 80, "to_quantity": 66, "rollover": rollover, "market_value": market_value,
+    })
+}
+
+async fn post_action(db_path: &Path, uri: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let app = actix_web::test::init_service(
+        App::new()
+            .app_data(web::Data::new(db_path.to_path_buf()))
+            .service(preview_corporate_action)
+            .service(add_corporate_action)
+            .service(delete_corporate_action),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::post().uri(uri).set_json(body).to_request();
+    let response = actix_web::test::call_service(&app, req).await;
+    let status = response.status().as_u16();
+    let bytes = actix_web::test::read_body(response).await;
+    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+}
+
+/// With roll-over the merged shares carry their cost and purchase date: no
+/// gain on Brickworks, and the new parcel is held from January, not September.
+#[actix_web::test]
+async fn a_merger_with_rollover_carries_cost_and_purchase_dates() {
+    let (_file, db_path) = setup_test_db();
+    let body = sol_bkw(&db_path, true, None);
+
+    let (status, preview) = post_action(&db_path, "/api/corporate-actions/preview", body.clone()).await;
+    assert_eq!(status, 200, "{}", preview);
+    assert_eq!(preview["plan"]["held"], 80.0);
+    assert!((preview["plan"]["cost"].as_f64().unwrap() - 2041.63).abs() < 1e-6);
+    let (status, _) = post_action(&db_path, "/api/corporate-actions", body.clone()).await;
+    assert_eq!(status, 200);
+
+    let rows = fetch_holdings(&db_path).unwrap();
+    let merged_in: Vec<&HoldingTransaction> = rows.iter().filter(|t| t.symbol == "SOL.AX" && t.corporate_action.is_some()).collect();
+    assert_eq!(merged_in.len(), 1);
+    assert_eq!(merged_in[0].quantity, Some(66.0));
+    assert_eq!(merged_in[0].acquired_date.as_deref(), Some("2025-01-07"));
+    assert!((merged_in[0].quantity.unwrap() * merged_in[0].price.unwrap() - 2041.63).abs() < 1e-6);
+
+    // Entitlement moves on the merger's date, not before.
+    let txs = to_portfolio_txs(&rows);
+    let of = |symbol: &str| txs.iter().filter(|t| t.symbol == symbol).cloned().collect::<Vec<_>>();
+    assert_eq!(portfolio::shares_on_date(&of("BKW.AX"), "2025-08-21"), 80.0);
+    assert_eq!(portfolio::shares_on_date(&of("SOL.AX"), "2025-08-21"), 90.0);
+    assert_eq!(portfolio::shares_on_date(&of("BKW.AX"), "2025-10-01"), 0.0);
+    assert_eq!(portfolio::shares_on_date(&of("SOL.AX"), "2025-10-01"), 156.0);
+    let summary = portfolio::calc_symbol_summary(&of("SOL.AX"));
+    assert!((summary.remaining_cost - 5143.33).abs() < 1e-6, "both companies' cost, brokerage included");
+    assert!(portfolio::calc_symbol_summary(&of("BKW.AX")).realised_pl.abs() < 1e-6, "no gain on BKW");
+
+    // Counted through the view, everywhere shares are.
+    assert_eq!(load_holding_symbols(&db_path).unwrap(), vec!["SOL.AX".to_string()]);
+    assert!(load_exited_symbols(&db_path).unwrap().is_empty(), "merged, not sold");
+
+    // No capital gain in the merger's year; the roll-over is noted.
+    let report = tax_report(&db_path, "fy=2026&sections=cgt").await;
+    assert!(table_rows(&report, "cgt", "Parcels sold").is_empty());
+    assert_eq!(figure(&report, "cgt", "18H"), 0.0);
+    let notes = section(&report, "cgt")["notes"].to_string();
+    assert!(notes.contains("BKW.AX into SOL.AX on 2025-09-23: 80 shares, cost base 2,041.63"), "{}", notes);
+
+    // Selling the lot later: the BKW parcel is discounted from its January date.
+    tax_tx(&db_path, 3, "SOL.AX", "sale", "2026-02-01", 156.0, 35.0, 0.0, None);
+    let report = tax_report(&db_path, "fy=2026&sections=cgt").await;
+    let parcels = table_rows(&report, "cgt", "Parcels sold");
+    assert_eq!(parcels.len(), 2);
+    assert_eq!(parcels[1]["Acquired"], "2025-01-07");
+    assert_eq!(parcels[1]["Cost base (AUD)"], 2041.63);
+    assert_eq!(parcels[1]["12 months+"], "Yes");
+
+    // Nothing was sold in the merger, so the sales screens leave it out.
+    let sold = to_portfolio_txs(&fetch_holdings(&db_path).unwrap()).into_iter().filter(|t| !is_merger_disposal(t)).collect::<Vec<_>>();
+    assert!(portfolio::calc_sold_entries(&sold.iter().filter(|t| t.symbol == "BKW.AX").cloned().collect::<Vec<_>>()).is_empty());
+}
+
+/// Without roll-over Brickworks is disposed of for the value of the shares
+/// received, and the new parcel starts on the day at that value.
+#[actix_web::test]
+async fn a_merger_without_rollover_is_a_disposal_at_market_value() {
+    let (_file, db_path) = setup_test_db();
+    let body = sol_bkw(&db_path, false, Some(2640.0));
+    let (status, _) = post_action(&db_path, "/api/corporate-actions", body).await;
+    assert_eq!(status, 200);
+
+    let report = tax_report(&db_path, "fy=2026&sections=cgt").await;
+    let parcels = table_rows(&report, "cgt", "Parcels sold");
+    assert_eq!(parcels.len(), 1);
+    assert_eq!(parcels[0]["Symbol"], "BKW.AX");
+    assert_eq!(parcels[0]["Gain (AUD)"], 598.37, "2,640 received less the 2,041.63 cost");
+
+    let rows = fetch_holdings(&db_path).unwrap();
+    let merged_in = rows.iter().find(|t| t.symbol == "SOL.AX" && t.corporate_action.is_some()).unwrap();
+    assert_eq!(merged_in.acquired_date, None, "held from the merger");
+    assert!((merged_in.price.unwrap() - 40.0).abs() < 1e-9);
+}
+
+#[actix_web::test]
+async fn a_merger_is_checked_before_it_is_recorded() {
+    let (_file, db_path) = setup_test_db();
+    let body = sol_bkw(&db_path, true, None);
+    let mut too_many = body.clone();
+    too_many["from_quantity"] = serde_json::json!(100);
+    let (status, error) = post_action(&db_path, "/api/corporate-actions", too_many).await;
+    assert_eq!(status, 400);
+    assert!(error["error"]["message"].as_str().unwrap().contains("Only 80 BKW.AX were held on 2025-09-23"));
+
+    let mut no_value = body.clone();
+    no_value["rollover"] = serde_json::json!(false);
+    assert_eq!(post_action(&db_path, "/api/corporate-actions", no_value).await.0, 400);
+
+    assert_eq!(post_action(&db_path, "/api/corporate-actions", body.clone()).await.0, 200);
+    assert_eq!(post_action(&db_path, "/api/corporate-actions", body).await.0, 400, "the same action twice");
+}
+
+/// Deleting the action undoes it, and renaming a symbol carries it along.
+#[actix_web::test]
+async fn a_merger_is_undone_by_deleting_it_and_follows_a_rename() {
+    let (_file, db_path) = setup_test_db();
+    let body = sol_bkw(&db_path, true, None);
+    let (_, created) = post_action(&db_path, "/api/corporate-actions", body).await;
+    let id = created["action"]["id"].as_i64().unwrap();
+
+    rename_holdings_symbol(&db_path, "SOL.AX", "SOUL.AX").unwrap();
+    let conn = open_db(&db_path).unwrap();
+    let to: String = conn.query_row("SELECT to_symbol FROM corporate_actions WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+    assert_eq!(to, "SOUL.AX");
+    drop(conn);
+    assert!(audit_rows(&db_path, "corporate_actions").iter().any(|(action, _)| action == "INSERT"));
+
+    let app = actix_web::test::init_service(
+        App::new().app_data(web::Data::new(db_path.clone())).service(delete_corporate_action),
+    )
+    .await;
+    let req = actix_web::test::TestRequest::delete().uri(&format!("/api/corporate-actions/{}", id)).to_request();
+    assert_eq!(actix_web::test::call_service(&app, req).await.status(), 204);
+    let rows = fetch_holdings(&db_path).unwrap();
+    assert!(rows.iter().all(|t| t.corporate_action.is_none()));
+    assert_eq!(load_holding_symbols(&db_path).unwrap(), vec!["BKW.AX".to_string(), "SOUL.AX".to_string()]);
+}
+
+/// The value chart moves the shares on the merger's day without counting it
+/// as money in or out.
+#[test]
+fn a_merger_is_no_flow_on_the_value_chart() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "SOL.AX", "purchase", "2025-01-02", 90.0, 34.22, 21.90, None);
+    tax_tx(&db_path, 2, "BKW.AX", "purchase", "2025-01-07", 80.0, 25.371, 11.95, None);
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO corporate_actions (kind, date, from_symbol, to_symbol, from_quantity, to_quantity, rollover, created_at)
+             VALUES ('merger', '2025-09-23', 'BKW.AX', 'SOL.AX', 80, 66, 1, '2025-10-01')",
+            [],
+        )
+        .unwrap();
+        for (symbol, date, close) in [("SOL.AX", "2025-09-22", 40.0), ("BKW.AX", "2025-09-22", 32.8), ("SOL.AX", "2025-09-23", 40.0)] {
+            conn.execute("INSERT INTO prices (symbol, date, close, fetched_at) VALUES (?1, ?2, ?3, '2025-10-01')", params![symbol, date, close]).unwrap();
+        }
+    }
+    let conn = open_db(&db_path).unwrap();
+    let series = build_portfolio_history(&conn, Some("2025-09-22"), Some("2025-09-23")).unwrap();
+    let day = series.iter().find(|d| d.date == "2025-09-23").unwrap();
+    assert_eq!(day.flow, 0.0);
+    assert!((day.stocks - 156.0 * 40.0).abs() < 1e-6, "{}", day.stocks);
 }

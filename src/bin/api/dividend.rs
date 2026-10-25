@@ -79,11 +79,11 @@ pub(crate) fn load_exited_symbols(db_path: &PathBuf) -> Result<Vec<String>, Stri
     let conn = open_db(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
+            // A holding merged away was not sold: nothing to look back on.
             "SELECT symbol,
-                    SUM(CASE WHEN transaction_type='purchase' THEN quantity ELSE -quantity END) AS net_qty,
-                    SUM(CASE WHEN transaction_type='sale' THEN 1 ELSE 0 END) AS sales
-             FROM holdings_transactions
-             WHERE transaction_type IN ('purchase', 'sale')
+                    SUM(quantity) AS net_qty,
+                    SUM(CASE WHEN kind = 'sale' THEN 1 ELSE 0 END) AS sales
+             FROM share_movements
              GROUP BY symbol
              HAVING net_qty <= 1e-9 AND sales > 0
              ORDER BY symbol",
@@ -101,9 +101,8 @@ pub(crate) fn load_holding_symbols(db_path: &PathBuf) -> Result<Vec<String>, Str
     let conn = open_db(db_path).map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT symbol, SUM(CASE WHEN transaction_type='purchase' THEN quantity ELSE -quantity END) as net_qty
-             FROM holdings_transactions
-             WHERE transaction_type IN ('purchase', 'sale')
+            "SELECT symbol, SUM(quantity) AS net_qty
+             FROM share_movements
              GROUP BY symbol
              HAVING net_qty > 1e-9
              ORDER BY symbol",
@@ -122,10 +121,9 @@ pub(crate) fn load_sold_symbols(db_path: &PathBuf) -> Result<Vec<String>, String
     let mut stmt = conn
         .prepare(
             "SELECT symbol
-             FROM holdings_transactions
-             WHERE transaction_type IN ('purchase', 'sale')
+             FROM share_movements
              GROUP BY symbol
-             HAVING SUM(CASE WHEN transaction_type='purchase' THEN quantity ELSE -quantity END) <= 1e-9
+             HAVING SUM(quantity) <= 1e-9
              ORDER BY symbol",
         )
         .map_err(|e| e.to_string())?;

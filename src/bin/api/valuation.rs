@@ -109,6 +109,26 @@ pub(crate) fn build_portfolio_history(
         .map_err(|e| e.to_string())?
         .into_iter()
         .collect();
+    // A merger's two legs move shares between symbols, never money, so they
+    // count as settled: no flow on the day, only the holding changes.
+    let mut trades = trades;
+    for action in load_corporate_actions(conn)? {
+        for (symbol, tx_type, quantity) in [
+            (action.from_symbol.clone(), "sale", action.from_quantity),
+            (action.to_symbol.clone(), "purchase", action.to_quantity),
+        ] {
+            trades.push(Trade {
+                date: action.date.clone(),
+                symbol,
+                tx_type: tx_type.to_string(),
+                quantity,
+                price_aud: 0.0,
+                brokerage_aud: 0.0,
+                has_cash_leg: true,
+            });
+        }
+    }
+    trades.sort_by(|a, b| a.date.cmp(&b.date));
 
     // Only accounts counted toward the portfolio; an everyday savings account
     // can be tracked without being treated as invested capital.
@@ -913,7 +933,8 @@ pub(crate) async fn get_hindsight(db_path: web::Data<PathBuf>) -> impl Responder
 
     let mut rows: Vec<HindsightRow> = Vec::new();
     for (symbol, txs) in &ctx.groups {
-        let sales = portfolio::sale_costs(txs);
+        let txs: Vec<PortfolioTx> = txs.iter().filter(|t| !is_merger_disposal(t)).cloned().collect();
+        let sales = portfolio::sale_costs(&txs);
         if sales.is_empty() {
             continue;
         }
@@ -1871,7 +1892,8 @@ pub(crate) async fn get_portfolio_sold(db_path: web::Data<PathBuf>) -> impl Resp
             return err_internal(err);
         }
     };
-    let txs = to_portfolio_txs(&rows);
+    // A holding merged away was exchanged, not sold.
+    let txs: Vec<PortfolioTx> = to_portfolio_txs(&rows).into_iter().filter(|t| !is_merger_disposal(t)).collect();
     let mut entries: Vec<portfolio::SoldEntry> = Vec::new();
     for (_, group) in portfolio::group_by_symbol(&txs) {
         entries.extend(portfolio::calc_sold_entries(&group));

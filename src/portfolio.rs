@@ -68,6 +68,10 @@ pub struct PortfolioTx {
     pub amount: Option<f64>,
     pub brokerage: Option<f64>,
     pub dividends_total: f64,
+    /// When the shares were acquired for CGT, where that isn't `date`. A
+    /// merger's roll-over hands a parcel to the new company on the merger's
+    /// date but keeps the original purchase's date for the 12-month test.
+    pub acquired: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -352,7 +356,7 @@ pub fn walk_parcels(txs: &[PortfolioTx], adjustments: &[CostBaseAdjustment]) -> 
                 let (lot, native_lot) = purchase_lots(tx, qty, price);
                 lots.push(OpenParcel {
                     purchase_id: tx.id,
-                    acquired: tx.date.clone(),
+                    acquired: tx.acquired.clone().unwrap_or_else(|| tx.date.clone()),
                     quantity: qty,
                     cost_per_share: lot.price,
                     native_cost_per_share: native_lot.price,
@@ -834,6 +838,7 @@ mod tests {
             amount,
             brokerage: None,
             dividends_total: 0.0,
+            acquired: None,
         }
     }
 
@@ -1125,6 +1130,7 @@ mod tests {
             amount: None,
             brokerage: None,
             dividends_total: 0.0,
+            acquired: None,
         }
     }
 
@@ -1849,5 +1855,16 @@ mod tests {
         assert_eq!(sold[0].days_held, 100);
         assert!(close(sold[0].avg_purchase_price, 10.1));
         assert!(close(sold[0].realised_pl, 40.0 * 12.0 - 5.0 - 404.0));
+    }
+
+    /// A parcel handed on by a merger keeps its original purchase date for
+    /// the CGT discount, though it joins the new holding on the merger's date.
+    #[test]
+    fn a_parcels_acquisition_date_can_differ_from_its_transaction_date() {
+        let mut merged_in = make_tx(1, "purchase", "2025-09-23", Some(66.0), Some(30.9338));
+        merged_in.acquired = Some("2025-01-07".to_string());
+        let txs = vec![merged_in, make_tx(2, "sale", "2026-02-01", Some(66.0), Some(35.0))];
+        assert_eq!(walk_parcels(&txs, &[]).sales[0].parcels[0].acquired, "2025-01-07");
+        assert_eq!(calc_sold_entries(&txs)[0].days_held, 390, "held from the original purchase");
     }
 }

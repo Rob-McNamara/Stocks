@@ -292,6 +292,52 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
 
+    // Corporate actions that change what is held without a trade: a merger or
+    // takeover paid in shares, where `from_quantity` shares of `from_symbol`
+    // became `to_quantity` shares of `to_symbol` on `date` (the implementation
+    // date). Stored once, as the user records it; the holdings loader expands
+    // it into the parcels that move (see `corporate::expand_corporate_actions`).
+    //
+    // `rollover` is the CGT choice: with scrip-for-scrip roll-over the new
+    // shares carry the old cost base and acquisition dates and there is no
+    // gain; without it the old shares are disposed of for `market_value` (AUD,
+    // the value of the shares received) and the new ones start at that value.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS corporate_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            date TEXT NOT NULL,
+            from_symbol TEXT NOT NULL,
+            to_symbol TEXT NOT NULL,
+            from_quantity REAL NOT NULL,
+            to_quantity REAL NOT NULL,
+            rollover INTEGER NOT NULL DEFAULT 1,
+            market_value REAL,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        );",
+    )
+    .map_err(|err| err.to_string())?;
+
+    // Every change in shares held, from trades and corporate actions alike.
+    // SQL that counts shares reads this rather than holdings_transactions, so
+    // a merger's shares leave one symbol and arrive at the other everywhere.
+    // `id` is the trade's, null for a corporate action's legs. A view keeps
+    // no data; it is dropped and recreated so an edit here always applies.
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS share_movements;
+         CREATE VIEW share_movements AS
+           SELECT id, symbol, date,
+                  CASE WHEN transaction_type = 'purchase' THEN quantity ELSE -quantity END AS quantity,
+                  transaction_type AS kind
+             FROM holdings_transactions WHERE transaction_type IN ('purchase', 'sale')
+           UNION ALL
+           SELECT NULL, from_symbol, date, -from_quantity, 'merger_out' FROM corporate_actions
+           UNION ALL
+           SELECT NULL, to_symbol, date, to_quantity, 'merger_in' FROM corporate_actions;",
+    )
+    .map_err(|err| err.to_string())?;
+
     // Migrate: add columns if they don't exist
     add_column_if_missing(&conn, "holdings_transactions", "brokerage", "REAL")?;
     // Which cash account a trade settles against — the source of funds on a
@@ -544,6 +590,9 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
         DROP TRIGGER IF EXISTS audit_tax_statements_insert;
         DROP TRIGGER IF EXISTS audit_tax_statements_update;
         DROP TRIGGER IF EXISTS audit_tax_statements_delete;
+        DROP TRIGGER IF EXISTS audit_corporate_actions_insert;
+        DROP TRIGGER IF EXISTS audit_corporate_actions_update;
+        DROP TRIGGER IF EXISTS audit_corporate_actions_delete;
     ";
     conn.execute_batch(drop_trigger_sql).map_err(|err| err.to_string())?;
 
@@ -898,6 +947,27 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
                     'other_net_foreign_income', OLD.other_net_foreign_income, 'foreign_tax_offset', OLD.foreign_tax_offset,
                     'amit_increase', OLD.amit_increase, 'amit_decrease', OLD.amit_decrease, 'notes', OLD.notes,
                     'updated_at', OLD.updated_at), NULL);
+        END;
+
+        -- corporate_actions
+        CREATE TRIGGER IF NOT EXISTS audit_corporate_actions_insert AFTER INSERT ON corporate_actions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'corporate_actions', 'INSERT', CAST(NEW.id AS TEXT), NULL,
+                json_object('id', NEW.id, 'kind', NEW.kind, 'date', NEW.date, 'from_symbol', NEW.from_symbol, 'to_symbol', NEW.to_symbol, 'from_quantity', NEW.from_quantity, 'to_quantity', NEW.to_quantity, 'rollover', NEW.rollover, 'market_value', NEW.market_value, 'notes', NEW.notes, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_corporate_actions_update AFTER UPDATE ON corporate_actions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'corporate_actions', 'UPDATE', CAST(NEW.id AS TEXT),
+                json_object('id', OLD.id, 'kind', OLD.kind, 'date', OLD.date, 'from_symbol', OLD.from_symbol, 'to_symbol', OLD.to_symbol, 'from_quantity', OLD.from_quantity, 'to_quantity', OLD.to_quantity, 'rollover', OLD.rollover, 'market_value', OLD.market_value, 'notes', OLD.notes, 'created_at', OLD.created_at),
+                json_object('id', NEW.id, 'kind', NEW.kind, 'date', NEW.date, 'from_symbol', NEW.from_symbol, 'to_symbol', NEW.to_symbol, 'from_quantity', NEW.from_quantity, 'to_quantity', NEW.to_quantity, 'rollover', NEW.rollover, 'market_value', NEW.market_value, 'notes', NEW.notes, 'created_at', NEW.created_at));
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_corporate_actions_delete AFTER DELETE ON corporate_actions
+        BEGIN
+            INSERT INTO audit_log (timestamp, table_name, action, row_id, old_values, new_values)
+            VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'corporate_actions', 'DELETE', CAST(OLD.id AS TEXT),
+                json_object('id', OLD.id, 'kind', OLD.kind, 'date', OLD.date, 'from_symbol', OLD.from_symbol, 'to_symbol', OLD.to_symbol, 'from_quantity', OLD.from_quantity, 'to_quantity', OLD.to_quantity, 'rollover', OLD.rollover, 'market_value', OLD.market_value, 'notes', OLD.notes, 'created_at', OLD.created_at), NULL);
         END;
     ";
     conn.execute_batch(trigger_sql).map_err(|err| err.to_string())?;

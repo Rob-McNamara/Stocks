@@ -1,8 +1,9 @@
 import { useEffect, useEffectEvent, useMemo, useState } from 'react'
-import { apiClient, OversellError, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
+import { apiClient, OversellError, type CorporateActionLink, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
 import { settlementAccountsFor, settlesByConversion } from '../utils/cash'
 import TaxReport from './TaxReport'
 import DividendImport from './DividendImport'
+import CorporateActions from './CorporateActions'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
@@ -25,6 +26,8 @@ interface TransactionRow {
   cash_account_id: number | null
   /** true for dividend_events rows (per-share amount); false for manual dividend transactions (total dollars) */
   perShare: boolean
+  /** A merger's side, worked out from a corporate action rather than stored */
+  corporateAction: CorporateActionLink | null
 }
 
 interface EditState {
@@ -82,6 +85,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   const [currencyOptions, setCurrencyOptions] = useState<string[]>([...SUPPORTED_CURRENCIES])
   const [showTaxReport, setShowTaxReport] = useState(false)
   const [showImport, setShowImport] = useState(false)
+  const [showCorporateActions, setShowCorporateActions] = useState(false)
 
   const loadLedger = async () => {
     const data = await apiClient.getTransactionsLedger()
@@ -185,6 +189,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         notes: r.per_share && r.payment_date ? `Payment: ${new Date(r.payment_date).toLocaleDateString()}` : r.notes,
         cash_account_id: r.cash_account_id,
         perShare: r.per_share,
+        corporateAction: r.corporate_action ?? null,
       }))
   }, [ledger, filter, symbolFilter])
 
@@ -383,6 +388,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           <h2>Transactions</h2>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <span style={{ color: '#888', fontSize: 14 }}>{rows.length} record{rows.length !== 1 ? 's' : ''}</span>
+            <button className="btn btn-secondary btn-small" onClick={() => setShowCorporateActions(true)}>
+              Corporate actions…
+            </button>
             <button className="btn btn-secondary btn-small" onClick={() => setShowImport(true)}>
               Import dividends…
             </button>
@@ -450,8 +458,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                       </div>
                     </td>
                     <td>
-                      <span style={{ color: typeColor(row.type), fontWeight: 600 }}>
-                        {typeLabel(row.type)}
+                      <span style={{ color: row.corporateAction ? '#7e57c2' : typeColor(row.type), fontWeight: 600 }}>
+                        {row.corporateAction ? 'Merger' : typeLabel(row.type)}
                       </span>
                     </td>
                     <td>{row.quantity !== null ? row.quantity.toFixed(2) : '—'}</td>
@@ -476,7 +484,16 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                     <td>{renderCashAccount(row)}</td>
                     <td style={{ color: '#888' }}>{row.notes || '—'}</td>
                     <td style={{ display: 'flex', gap: 6 }}>
-                      {row.id !== null && (
+                      {row.corporateAction && (
+                        <button
+                          className="btn btn-secondary btn-small"
+                          title="Worked out from a corporate action: change or delete the action itself"
+                          onClick={() => setShowCorporateActions(true)}
+                        >
+                          Action…
+                        </button>
+                      )}
+                      {row.id !== null && !row.corporateAction && (
                         <>
                           <button
                             className="btn btn-secondary btn-small"
@@ -662,6 +679,15 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       )}
 
       {showTaxReport && <TaxReport onClose={() => setShowTaxReport(false)} />}
+      {showCorporateActions && (
+        <CorporateActions
+          symbols={[...new Set(ledger.map((r) => r.symbol))].sort()}
+          onClose={() => setShowCorporateActions(false)}
+          onChanged={() => {
+            loadLedger().catch((err) => setError(err instanceof Error ? err.message : 'Failed to reload transactions'))
+          }}
+        />
+      )}
       {showImport && (
         <DividendImport
           onClose={() => setShowImport(false)}

@@ -45,7 +45,7 @@ database and is **not** one of them:
 
 - `watchlist_prices` — daily OHLC bars, superseded by `prices`. `init_db()` has
   not created it for some time and nothing writes to it, so a database created
-  today has 19 tables and no such table; one carried forward from an older
+  today has 20 tables and no such table; one carried forward from an older
   version still has it, holding whatever it held when writes stopped.
 
 It needs no triggers, and adding them would be wrong: a fresh database would
@@ -69,9 +69,11 @@ Shared by every binary, in `src/` (the `stocks` library):
 - `rotation.rs` — sector rotation: each period's price move (1D, 1W, 1M, 3M) to a given day, and the difference from a benchmark in percentage points. Also `trailing_moves`, the holdings heat map's 1W–2Y moves, which end on the holding's quote rather than a stored close; the startup refresh re-reads the holdings' recent bars (`sectors::reread_histories`) so a period does not start on a missing session.
 - `tax.rs` — Australian income-tax rules for the tax report: income years, the 12-month CGT discount, loss ordering, franking gross-up.
 
-The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `dividend`, `dividend_import` (CSV of dividend statements), `quotes`, `fx`, `valuation` (portfolio screens), `sectors` (the Dashboard's sector rotation sets, stored in `app_config` as `sector_rotation`, and each fund's top holdings, which come from Yahoo's quoteSummary behind a cookie-and-crumb session in `market`), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
+The API (`src/bin/api/`) is split by domain: `holdings`, `watchlist`, `cash`, `corporate` (mergers paid in shares), `dividend`, `dividend_import` (CSV of dividend statements), `quotes`, `fx`, `valuation` (portfolio screens), `sectors` (the Dashboard's sector rotation sets, stored in `app_config` as `sector_rotation`, and each fund's top holdings, which come from Yahoo's quoteSummary behind a cookie-and-crumb session in `market`), `charts`, `analysis`, `refresh`, `config`, `tax` (the tax report, symbol tax settings, trusts' annual tax statements), plus `schema` and `market` (Yahoo access). `main.rs` holds startup, routing, auth, the OpenAPI document and the shared helpers (`with_tx`, `collect_rows`, error responses); tests are in `tests.rs`. Each module starts `use super::*;` and its items are `pub(crate)`, so a handler can move between modules without import changes.
 
 A write that touches more than one row goes through `with_tx`, so it commits all-or-nothing.
+
+A corporate action (a merger paid in shares) is stored once in `corporate_actions` and never copied into `holdings_transactions`: `fetch_holdings` expands it into worked-out rows — the old holding's closing "sale" and a "purchase" per parcel handed on, carrying its cost and, under roll-over, its original purchase date (`acquired_date`). Those rows have negative ids and are not editable. Code that loads holdings must go through `fetch_holdings`, and SQL that counts shares must read the `share_movements` view rather than `holdings_transactions`, or a merged holding is miscounted.
 
 A recorded dividend is linked to its fetched `dividend_events` row by date — or by `source_ex_date` once its own date has been corrected (the import and the edit form both set it). Any new code that matches dividends to events must check both, or a corrected dividend reads as unrecorded and gets recorded a second time.
 

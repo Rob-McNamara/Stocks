@@ -470,6 +470,13 @@ export interface LedgerRow {
   franking_credit?: number | null
   /** A dividend's type from its statement: Interim, Final, Special… */
   dividend_type?: string | null
+  /**
+   * Set on rows a corporate action stands for (a merger's two sides). They are
+   * worked out, not stored: change or delete the action, not the row.
+   */
+  corporate_action?: CorporateActionLink | null
+  /** For a parcel a merger handed on with roll-over: when the original shares were bought */
+  acquired_date?: string | null
   /** true for fetched dividend events (per-share amounts); false for manual rows (totals) */
   per_share: boolean
   payment_date: string | null
@@ -807,6 +814,55 @@ export async function downloadTaxReportCsv(params: TaxReportParams): Promise<voi
   link.remove()
   // Revoked after a beat: Safari starts the download asynchronously.
   setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// ---------------------------------------------------------------------------
+// Corporate actions
+// ---------------------------------------------------------------------------
+
+export interface CorporateActionLink {
+  id: number
+  kind: string
+  /** The other side: the symbol merged into, or merged from */
+  counterpart: string
+  rollover: boolean
+}
+
+export interface CorporateAction {
+  id: number
+  kind: 'merger'
+  /** The implementation date */
+  date: string
+  from_symbol: string
+  to_symbol: string
+  from_quantity: number
+  to_quantity: number
+  /** Scrip-for-scrip roll-over: cost bases and purchase dates carry over */
+  rollover: boolean
+  /** Without roll-over: the AUD value of the shares received */
+  market_value: number | null
+  notes: string | null
+  created_at: string
+}
+
+export interface CorporateActionPayload {
+  kind?: 'merger'
+  date: string
+  from_symbol: string
+  to_symbol: string
+  from_quantity: number
+  to_quantity: number
+  rollover?: boolean
+  market_value?: number | null
+  notes?: string | null
+}
+
+export interface MergerPlan {
+  /** Shares of the old company held on the date */
+  held: number
+  parcels: { purchase_id: number; acquired: string; given_up: number; received: number; cost: number; native_cost: number }[]
+  cost: number
+  currency: string
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1334,38 @@ export const apiClient = {
       body: JSON.stringify({ fy }),
     })
     if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to record the export')
+  },
+
+  async getCorporateActions(): Promise<CorporateAction[]> {
+    const response = await apiFetch(`${API_BASE_URL}/corporate-actions`)
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to load corporate actions')
+    return response.json()
+  },
+
+  /** What recording the action would carry across, without recording it. */
+  async previewCorporateAction(payload: CorporateActionPayload): Promise<{ action: CorporateAction; plan: MergerPlan }> {
+    const response = await apiFetch(`${API_BASE_URL}/corporate-actions/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to check the corporate action')
+    return response.json()
+  },
+
+  async addCorporateAction(payload: CorporateActionPayload): Promise<{ action: CorporateAction; plan: MergerPlan }> {
+    const response = await apiFetch(`${API_BASE_URL}/corporate-actions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to record the corporate action')
+    return response.json()
+  },
+
+  async deleteCorporateAction(id: number): Promise<void> {
+    const response = await apiFetch(`${API_BASE_URL}/corporate-actions/${id}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to delete the corporate action')
   },
 
   /**

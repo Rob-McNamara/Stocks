@@ -20,6 +20,7 @@ mod dividend_import;
 mod refresh;
 mod analysis;
 mod cash;
+mod corporate;
 mod charts;
 mod tax;
 mod valuation;
@@ -45,6 +46,7 @@ use dividend_import::*;
 use refresh::*;
 use analysis::*;
 use cash::*;
+use corporate::*;
 use charts::*;
 use tax::*;
 use valuation::*;
@@ -241,7 +243,8 @@ impl utoipa::Modify for SecurityAddon {
         get_config, update_config, get_events,
         get_tax_years, get_tax_report, update_symbol_tax_settings,
         save_tax_statement, delete_tax_statement, record_tax_export,
-        update_account_tax_share, import_dividends, get_sector_rotation, get_sector_holdings,
+        update_account_tax_share, import_dividends,
+        get_corporate_actions, preview_corporate_action, add_corporate_action, delete_corporate_action, get_sector_rotation, get_sector_holdings,
     ),
     modifiers(&SecurityAddon)
 )]
@@ -401,6 +404,10 @@ async fn main() -> std::io::Result<()> {
             .service(record_tax_export)
             .service(update_account_tax_share)
             .service(import_dividends)
+            .service(get_corporate_actions)
+            .service(preview_corporate_action)
+            .service(add_corporate_action)
+            .service(delete_corporate_action)
             .service(get_sector_rotation)
             .service(get_sector_holdings)
             .service(get_meta)

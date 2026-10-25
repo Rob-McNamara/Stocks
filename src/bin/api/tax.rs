@@ -912,6 +912,13 @@ impl Inputs {
 
     /// The year's dividends of one kind, leaving out symbols that aren't the
     /// user's at all.
+    /// A merger's disposal of the old shares under scrip-for-scrip roll-over:
+    /// no capital gain, the cost carried to the new shares. Without roll-over
+    /// it is a disposal like any sale, at the value of the shares received.
+    fn is_rollover(&self, sale: &SaleMatch) -> bool {
+        self.tx(sale.sale_id).and_then(|t| t.corporate_action.as_ref()).is_some_and(|c| c.rollover)
+    }
+
     fn dividends_in(&self, fy: TaxYear, kind: IncomeKind) -> Vec<&HoldingTransaction> {
         self.txs
             .iter()
@@ -984,7 +991,7 @@ fn capital_by_year(inputs: &Inputs) -> BTreeMap<i32, CapitalGainsInput> {
         if owned <= 0.0 {
             continue;
         }
-        for sale in &walk.sales {
+        for sale in walk.sales.iter().filter(|s| !inputs.is_rollover(s)) {
             let Some(date) = rules::parse_date(&sale.date) else { continue };
             let entry = years.entry(TaxYear::containing(date).0).or_default();
             for parcel in &sale.parcels {
@@ -1074,9 +1081,30 @@ impl Builder<'_> {
             .flat_map(|(symbol, walk)| walk.sales.iter().map(move |s| (symbol, s)))
             .filter(|(_, sale)| rules::parse_date(&sale.date).is_some_and(|d| self.fy.contains(d)))
             .filter(|(symbol, _)| self.inputs.share_of(symbol) > 0.0)
+            .filter(|(_, sale)| !self.inputs.is_rollover(sale))
             .collect();
         sales.sort_by(|a, b| a.1.date.cmp(&b.1.date).then(a.0.cmp(b.0)));
         sales
+    }
+
+    /// Mergers this year where roll-over was chosen, said in words.
+    fn rollovers_in_year(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.inputs
+            .txs
+            .iter()
+            .filter(|t| t.transaction_type == "sale" && rules::parse_date(&t.date).is_some_and(|d| self.fy.contains(d)))
+            .filter(|t| self.inputs.share_of(&t.symbol) > 0.0)
+            .filter_map(|t| t.corporate_action.as_ref().filter(|c| c.rollover).map(|c| (t, c)))
+            .filter(|(_, c)| seen.insert(c.id))
+            .map(|(t, c)| {
+                let cost = t.quantity.unwrap_or(0.0) * t.price.unwrap_or(0.0);
+                format!(
+                    "{} into {} on {}: {} shares, cost base {} carried with each parcel's purchase date",
+                    t.symbol, c.counterpart, t.date, trim_number(t.quantity.unwrap_or(0.0)), money_text(cost)
+                )
+            })
+            .collect()
     }
 
     fn currency_of_tx(&self, id: i64) -> String {
@@ -1319,7 +1347,14 @@ impl Builder<'_> {
         if !adjusted.is_empty() {
             notes.push(format!("Cost bases include the AMIT adjustments from these annual tax statements: {}.", adjusted.join(", ")));
         }
-        notes.push("Not modelled: share splits and consolidations, returns of capital, demergers and other corporate actions. Adjust those parcels' cost bases by hand.".to_string());
+        let rollovers = self.rollovers_in_year();
+        if !rollovers.is_empty() {
+            notes.push(format!(
+                "Scrip-for-scrip roll-over chosen, so no capital gain: {}. A roll-over is still a CGT event; whether it changes the answer at 18G is for the return's instructions.",
+                rollovers.join("; ")
+            ));
+        }
+        notes.push("Mergers paid in shares are applied as recorded on the Transactions screen. Not modelled yet: share splits and consolidations, returns of capital, demergers and cash paid in a merger — adjust those parcels' cost bases by hand.".to_string());
         if carried_source == "computed" {
             notes.push("Losses carried forward are worked out from sales recorded in the app. If last year's return carried a different figure, enter it and generate again.".to_string());
         }
@@ -2267,7 +2302,7 @@ impl Builder<'_> {
             .prepare(
                 "SELECT timestamp, table_name, action, old_values, new_values FROM audit_log
                   WHERE timestamp > ?1
-                    AND table_name IN ('holdings_transactions', 'cash_transactions', 'cash_accounts', 'symbol_info', 'tax_statements', 'dividend_exclusions')
+                    AND table_name IN ('holdings_transactions', 'cash_transactions', 'cash_accounts', 'symbol_info', 'tax_statements', 'dividend_exclusions', 'corporate_actions')
                   ORDER BY timestamp",
             )
             .map_err(|e| e.to_string())?;
@@ -2316,6 +2351,13 @@ impl Builder<'_> {
                     let year = row.get("fy").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     (year == fy.0 || (self.sold_symbols.contains(&symbol) && year < fy.0))
                         .then(|| format!("{} {} annual tax statement {}", symbol, TaxYear(year).label(), verb))
+                }
+                "corporate_actions" => {
+                    let from = field("from_symbol").unwrap_or_default();
+                    let to = field("to_symbol").unwrap_or_default();
+                    let date = field("date");
+                    (in_year(date.as_deref()) || self.sold_symbols.contains(&to) || self.sold_symbols.contains(&from))
+                        .then(|| format!("{} → {} merger {} dated {}", from, to, verb, date.unwrap_or_default()))
                 }
                 "cash_accounts" => {
                     (action == "UPDATE" && old.get("tax_share_pct") != new.get("tax_share_pct"))

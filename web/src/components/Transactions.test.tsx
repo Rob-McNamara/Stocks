@@ -180,3 +180,21 @@ describe('tax figures', () => {
     expect(payload.dividend_type).toBeNull()
   })
 })
+
+describe('corporate actions in the ledger', () => {
+  it("shows a merger's rows as such, with no edit or delete of their own", async () => {
+    mocked.getTransactionsLedger.mockResolvedValue({ rows: [
+      ...LEDGER,
+      row({ key: 'm', id: -1000, symbol: 'BKW.AX', transaction_type: 'sale', date: '2025-09-23', quantity: 80, price: 25.52,
+        notes: 'Merged into SOL.AX: 80 BKW.AX → 66 SOL.AX (roll-over)',
+        corporate_action: { id: 1, kind: 'merger', counterpart: 'SOL.AX', rollover: true } }),
+    ] })
+    await renderScreen()
+    const merged = screen.getByText('BKW.AX').closest('tr')!
+    expect(within(merged).getByText('Merger')).toBeTruthy()
+    expect(within(merged).queryByText('Edit')).toBeNull()
+    expect(within(merged).queryByText('Delete')).toBeNull()
+    expect(within(merged).getByText('Action…')).toBeTruthy()
+  })
+})
+
