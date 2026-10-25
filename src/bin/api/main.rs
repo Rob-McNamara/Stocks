@@ -16,6 +16,7 @@ mod quotes;
 mod fx;
 mod holdings;
 mod dividend;
+mod dividend_import;
 mod refresh;
 mod analysis;
 mod cash;
@@ -40,6 +41,7 @@ use quotes::*;
 use fx::*;
 use holdings::*;
 use dividend::*;
+use dividend_import::*;
 use refresh::*;
 use analysis::*;
 use cash::*;
@@ -239,7 +241,7 @@ impl utoipa::Modify for SecurityAddon {
         get_config, update_config, get_events,
         get_tax_years, get_tax_report, update_symbol_tax_settings,
         save_tax_statement, delete_tax_statement, record_tax_export,
-        update_account_tax_share, get_sector_rotation, get_sector_holdings,
+        update_account_tax_share, import_dividends, get_sector_rotation, get_sector_holdings,
     ),
     modifiers(&SecurityAddon)
 )]
@@ -398,6 +400,7 @@ async fn main() -> std::io::Result<()> {
             .service(delete_tax_statement)
             .service(record_tax_export)
             .service(update_account_tax_share)
+            .service(import_dividends)
             .service(get_sector_rotation)
             .service(get_sector_holdings)
             .service(get_meta)

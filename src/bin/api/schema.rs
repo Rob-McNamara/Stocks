@@ -310,6 +310,17 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
     // unknown rather than guessing. The unfranked amount is the remainder.
     add_column_if_missing(&conn, "holdings_transactions", "franked_amount", "REAL")?;
     add_column_if_missing(&conn, "holdings_transactions", "franking_credit", "REAL")?;
+    // A dividend's payment date and type (Interim, Final, Special…) as its
+    // statement or the broker gives them. The payment date decides the tax
+    // year and the day the cash lands; null falls back to the fetched event.
+    add_column_if_missing(&conn, "holdings_transactions", "payment_date", "TEXT")?;
+    add_column_if_missing(&conn, "holdings_transactions", "dividend_type", "TEXT")?;
+    // The ex-date of the fetched dividend_events row this dividend stands
+    // for, kept when the dividend's own date is corrected to the actual one.
+    // Every match between a recorded dividend and a fetched event checks it
+    // as well as `date`; without it a corrected date looks unrecorded, and
+    // the event is recorded a second time.
+    add_column_if_missing(&conn, "holdings_transactions", "source_ex_date", "TEXT")?;
     // A trendline's two anchors. `price` above is the first anchor's price, so
     // an existing horizontal level needs no migration: its extra columns are
     // simply null.
@@ -615,7 +626,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'INSERT', CAST(NEW.id AS TEXT), NULL,
                 json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
                     'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
-                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount, 'franked_amount', NEW.franked_amount, 'franking_credit', NEW.franking_credit));
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount, 'franked_amount', NEW.franked_amount, 'franking_credit', NEW.franking_credit, 'payment_date', NEW.payment_date, 'dividend_type', NEW.dividend_type, 'source_ex_date', NEW.source_ex_date));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_update AFTER UPDATE ON holdings_transactions
         BEGIN
@@ -623,10 +634,10 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'UPDATE', CAST(NEW.id AS TEXT),
                 json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
                     'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
-                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount, 'franked_amount', OLD.franked_amount, 'franking_credit', OLD.franking_credit),
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount, 'franked_amount', OLD.franked_amount, 'franking_credit', OLD.franking_credit, 'payment_date', OLD.payment_date, 'dividend_type', OLD.dividend_type, 'source_ex_date', OLD.source_ex_date),
                 json_object('id', NEW.id, 'symbol', NEW.symbol, 'transaction_type', NEW.transaction_type, 'date', NEW.date,
                     'quantity', NEW.quantity, 'price', NEW.price, 'amount', NEW.amount, 'brokerage', NEW.brokerage,
-                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount, 'franked_amount', NEW.franked_amount, 'franking_credit', NEW.franking_credit));
+                    'notes', NEW.notes, 'currency', NEW.currency, 'original_price', NEW.original_price, 'fx_rate', NEW.fx_rate, 'created_at', NEW.created_at, 'cash_account_id', NEW.cash_account_id, 'withholding_amount', NEW.withholding_amount, 'franked_amount', NEW.franked_amount, 'franking_credit', NEW.franking_credit, 'payment_date', NEW.payment_date, 'dividend_type', NEW.dividend_type, 'source_ex_date', NEW.source_ex_date));
         END;
         CREATE TRIGGER IF NOT EXISTS audit_holdings_transactions_delete AFTER DELETE ON holdings_transactions
         BEGIN
@@ -634,7 +645,7 @@ pub fn init_db(path: &PathBuf) -> Result<(), String> {
             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'holdings_transactions', 'DELETE', CAST(OLD.id AS TEXT),
                 json_object('id', OLD.id, 'symbol', OLD.symbol, 'transaction_type', OLD.transaction_type, 'date', OLD.date,
                     'quantity', OLD.quantity, 'price', OLD.price, 'amount', OLD.amount, 'brokerage', OLD.brokerage,
-                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount, 'franked_amount', OLD.franked_amount, 'franking_credit', OLD.franking_credit), NULL);
+                    'notes', OLD.notes, 'currency', OLD.currency, 'original_price', OLD.original_price, 'fx_rate', OLD.fx_rate, 'created_at', OLD.created_at, 'cash_account_id', OLD.cash_account_id, 'withholding_amount', OLD.withholding_amount, 'franked_amount', OLD.franked_amount, 'franking_credit', OLD.franking_credit, 'payment_date', OLD.payment_date, 'dividend_type', OLD.dividend_type, 'source_ex_date', OLD.source_ex_date), NULL);
         END;
 
         -- holdings_custom_fields

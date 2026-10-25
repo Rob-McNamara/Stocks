@@ -28,6 +28,13 @@ pub(crate) struct HoldingTransaction {
     /// gives them. Null when not entered.
     pub(crate) franked_amount: Option<f64>,
     pub(crate) franking_credit: Option<f64>,
+    /// A dividend's payment date and type from its statement; null when not
+    /// recorded (the fetched event's payment date is used instead).
+    pub(crate) payment_date: Option<String>,
+    pub(crate) dividend_type: Option<String>,
+    /// The fetched event this dividend stands for, when its own date was
+    /// corrected away from the event's ex-date.
+    pub(crate) source_ex_date: Option<String>,
     #[serde(default)]
     pub(crate) custom_fields: std::collections::HashMap<String, String>,
 }
@@ -62,6 +69,12 @@ pub(crate) struct NewHoldingTransaction {
     /// The franking credit from the statement, AUD. Same semantics.
     #[serde(default, deserialize_with = "deserialize_explicit_null")]
     pub(crate) franking_credit: Option<Option<f64>>,
+    /// A dividend's payment date (YYYY-MM-DD) and type. Absent keeps the
+    /// stored value on an edit; `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_explicit_null")]
+    pub(crate) payment_date: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_explicit_null")]
+    pub(crate) dividend_type: Option<Option<String>>,
     /// Set true to record a sale of more shares than currently held
     /// (the API responds 409 with a warning otherwise).
     pub(crate) confirm: Option<bool>,
@@ -515,6 +528,9 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
         by_symbol.entry(tx.symbol.clone()).or_default().push(tx.clone());
         if tx.transaction_type == "dividend" {
             manual_dividend_keys.insert(format!("{}|{}", tx.symbol, tx.date));
+            if let Some(source) = &tx.source_ex_date {
+                manual_dividend_keys.insert(format!("{}|{}", tx.symbol, source));
+            }
         }
     }
 
@@ -538,8 +554,9 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
             "withholding_amount": tx.withholding_amount,
             "franked_amount": tx.franked_amount,
             "franking_credit": tx.franking_credit,
+            "dividend_type": tx.dividend_type,
             "per_share": false,
-            "payment_date": serde_json::Value::Null,
+            "payment_date": tx.payment_date,
             "custom_fields": tx.custom_fields,
         }))
         .collect();
@@ -608,6 +625,7 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
                     "withholding_amount": serde_json::Value::Null,
                     "franked_amount": serde_json::Value::Null,
                     "franking_credit": serde_json::Value::Null,
+                    "dividend_type": serde_json::Value::Null,
                     "per_share": true,
                     "payment_date": payment_date,
                     "custom_fields": serde_json::json!({}),
@@ -625,7 +643,7 @@ pub(crate) async fn get_transactions_ledger(db_path: web::Data<PathBuf>) -> impl
 }
 
 /// The columns `HoldingTransaction::from_row` reads, in its order.
-pub(crate) const HOLDING_COLUMNS: &str = "id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount, franked_amount, franking_credit";
+pub(crate) const HOLDING_COLUMNS: &str = "id, symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount, franked_amount, franking_credit, payment_date, dividend_type, source_ex_date";
 
 impl HoldingTransaction {
     /// One row selected with `HOLDING_COLUMNS`. The one place the mapping is
@@ -651,6 +669,9 @@ impl HoldingTransaction {
             withholding_amount: row.get(14)?,
             franked_amount: row.get(15)?,
             franking_credit: row.get(16)?,
+            payment_date: row.get(17)?,
+            dividend_type: row.get(18)?,
+            source_ex_date: row.get(19)?,
             custom_fields: std::collections::HashMap::new(),
         })
     }
@@ -745,8 +766,8 @@ pub(crate) fn insert_holding_transaction(
         let created_at = Utc::now().to_rfc3339();
         let currency = transaction.currency.as_deref().unwrap_or("AUD");
         conn.execute(
-            "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount, franked_amount, franking_credit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO holdings_transactions (symbol, transaction_type, date, quantity, price, amount, brokerage, notes, created_at, currency, original_price, fx_rate, cash_account_id, withholding_amount, franked_amount, franking_credit, payment_date, dividend_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 symbol,
                 tx_type,
@@ -764,6 +785,8 @@ pub(crate) fn insert_holding_transaction(
                 transaction.withholding_amount.flatten(),
                 transaction.franked_amount.flatten(),
                 transaction.franking_credit.flatten(),
+                transaction.payment_date.clone().flatten(),
+                transaction.dividend_type.clone().flatten(),
             ],
         )
         .map_err(|err| err.to_string())?;
@@ -869,6 +892,14 @@ pub(crate) fn modify_holding_transaction(
     // and the old leg already deleted, so the ledger silently lost it.
     with_tx(db_path, |conn| {
 
+        // Where the row was before the edit, so a dividend moved off its
+        // fetched event's date can keep pointing at it.
+        let (old_symbol, old_date): (String, String) = conn
+            .query_row("SELECT symbol, date FROM holdings_transactions WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("Transaction {} not found", id))?;
+
         let stored = conn
             .query_row(
                 "SELECT currency, quantity, price, original_price, fx_rate, amount FROM holdings_transactions WHERE id = ?1",
@@ -909,7 +940,7 @@ pub(crate) fn modify_holding_transaction(
 
         let currency = transaction.currency.as_deref().unwrap_or("AUD");
         conn.execute(
-            "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11, cash_account_id = ?13, withholding_amount = CASE WHEN ?15 THEN ?14 ELSE withholding_amount END, franked_amount = CASE WHEN ?17 THEN ?16 ELSE franked_amount END, franking_credit = CASE WHEN ?19 THEN ?18 ELSE franking_credit END WHERE id = ?12",
+            "UPDATE holdings_transactions SET symbol = ?1, transaction_type = ?2, date = ?3, quantity = ?4, price = ?5, amount = ?6, brokerage = ?7, notes = ?8, currency = ?9, original_price = ?10, fx_rate = ?11, cash_account_id = ?13, withholding_amount = CASE WHEN ?15 THEN ?14 ELSE withholding_amount END, franked_amount = CASE WHEN ?17 THEN ?16 ELSE franked_amount END, franking_credit = CASE WHEN ?19 THEN ?18 ELSE franking_credit END, payment_date = CASE WHEN ?21 THEN ?20 ELSE payment_date END, dividend_type = CASE WHEN ?23 THEN ?22 ELSE dividend_type END WHERE id = ?12",
             params![
                 symbol,
                 tx_type,
@@ -930,9 +961,15 @@ pub(crate) fn modify_holding_transaction(
                 transaction.franked_amount.is_some(),
                 transaction.franking_credit.flatten(),
                 transaction.franking_credit.is_some(),
+                transaction.payment_date.clone().flatten(),
+                transaction.payment_date.is_some(),
+                transaction.dividend_type.clone().flatten(),
+                transaction.dividend_type.is_some(),
             ],
         )
         .map_err(|err| err.to_string())?;
+
+        keep_source_event(conn, id, &old_symbol, &old_date)?;
 
         // Rewrite the settlement leg from the row as just stored: an edited price,
         // quantity or account has to flow through, and clearing the account removes
@@ -967,9 +1004,11 @@ pub(crate) fn remove_holding_transaction(db_path: &Path, id: i64) -> Result<bool
     // together or not at all.
     with_tx(db_path, |conn| {
         // Captured before the delete so the exclusion below knows what went.
+        // The event a dividend stands for, which is not its own date once
+        // that was corrected.
         let doomed: Option<(String, String)> = conn
             .query_row(
-                "SELECT symbol, date FROM holdings_transactions WHERE id = ?1 AND transaction_type = 'dividend'",
+                "SELECT symbol, COALESCE(source_ex_date, date) FROM holdings_transactions WHERE id = ?1 AND transaction_type = 'dividend'",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1007,6 +1046,38 @@ pub(crate) fn remove_holding_transaction(db_path: &Path, id: i64) -> Result<bool
         }
         Ok(affected > 0)
     })
+}
+
+/// After a dividend's date changes, remember the fetched event it stood for.
+///
+/// A recorded dividend is matched to its `dividend_events` row by date. Move
+/// the date — correcting Yahoo's US ex-date to the ASX one, say — and the
+/// event looks unrecorded: the ledger lists it, the dividend totals count it
+/// again, and the next refresh records it a second time. `source_ex_date`
+/// keeps the link. Only the first move sets it, so it always names the event.
+pub(crate) fn keep_source_event(conn: &Connection, id: i64, old_symbol: &str, old_date: &str) -> Result<(), String> {
+    let (symbol, date, kind, source): (String, String, String, Option<String>) = conn
+        .query_row(
+            "SELECT symbol, date, transaction_type, source_ex_date FROM holdings_transactions WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|err| err.to_string())?;
+    if kind != "dividend" || source.is_some() || date == old_date || symbol != old_symbol {
+        return Ok(());
+    }
+    let was_event: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dividend_events WHERE symbol = ?1 AND ex_date = ?2",
+            params![symbol, old_date],
+            |r| r.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+    if was_event > 0 {
+        conn.execute("UPDATE holdings_transactions SET source_ex_date = ?2 WHERE id = ?1", params![id, old_date])
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn load_holdings_symbol_fields(db_path: &PathBuf) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>, String> {

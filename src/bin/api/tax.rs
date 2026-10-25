@@ -883,8 +883,13 @@ impl Inputs {
         self.symbols.get(symbol).map_or(IncomeKind::Company, |s| s.kind)
     }
 
+    /// When a dividend was paid: as recorded on it from its statement, else
+    /// the fetched event's date for the event it stands for.
     fn paid(&self, tx: &HoldingTransaction) -> Option<String> {
-        self.payment_dates.get(&(tx.symbol.clone(), tx.date.clone())).cloned()
+        tx.payment_date.clone().or_else(|| {
+            let event_date = tx.source_ex_date.clone().unwrap_or_else(|| tx.date.clone());
+            self.payment_dates.get(&(tx.symbol.clone(), event_date)).cloned()
+        })
     }
 
     /// The year a dividend is taxed in: when it was paid, for a company or a
@@ -1030,6 +1035,9 @@ struct Totals {
     interest: Option<f64>,
     dividends: Option<(f64, f64, f64, f64)>,
     trusts: Option<TaxStatementFigures>,
+    /// Trusts whose franking in `trusts` is estimated from their recorded
+    /// distributions, having no annual tax statement yet.
+    trusts_estimated: Vec<String>,
     capital: Option<(bool, CapitalGainsResult)>,
     foreign: Option<(f64, f64)>,
     deductions: Option<f64>,
@@ -1394,6 +1402,7 @@ impl Builder<'_> {
                 text(label.as_str()),
                 text(tx.date.as_str()),
                 paid.map_or(serde_json::Value::Null, text),
+                tx.dividend_type.clone().map_or(serde_json::Value::Null, text),
                 opt(tx.quantity.map(|q| q * owned), ColumnKind::Quantity),
                 num(gross, ColumnKind::Money),
                 opt(franked, ColumnKind::Money),
@@ -1462,7 +1471,8 @@ impl Builder<'_> {
                 title: "Dividends".into(),
                 columns: vec![
                     col("Symbol", ColumnKind::Text), col("Ex-date", ColumnKind::Date), col("Paid", ColumnKind::Date),
-                    col("Shares", ColumnKind::Quantity), col("Gross (AUD)", ColumnKind::Money), col("Franked", ColumnKind::Money),
+                    col("Type", ColumnKind::Text), col("Shares", ColumnKind::Quantity), col("Gross (AUD)", ColumnKind::Money),
+                    col("Franked", ColumnKind::Money),
                     col("Unfranked", ColumnKind::Money), col("Franking credit", ColumnKind::Money),
                     col("TFN withheld", ColumnKind::Money), col("Franking from", ColumnKind::Text),
                 ],
@@ -1710,6 +1720,10 @@ impl Builder<'_> {
         let distributions: Vec<HoldingTransaction> = self.inputs.dividends_in(fy, IncomeKind::Trust).into_iter().cloned().collect();
         // (the user's share, the whole payment, how many) per symbol.
         let mut by_symbol: BTreeMap<String, (f64, f64, usize)> = BTreeMap::new();
+        // (franked, franking credit) per symbol, from distributions that
+        // carry franking — a broker's dividend summary, imported. Stands in
+        // for a missing annual statement's 13C and 13Q.
+        let mut franking_estimates: BTreeMap<String, (f64, f64)> = BTreeMap::new();
         let mut distribution_rows = Vec::new();
         for tx in &distributions {
             let info = self.inputs.symbols.get(&tx.symbol);
@@ -1723,6 +1737,11 @@ impl Builder<'_> {
             entry.0 += gross;
             entry.1 += gross_full;
             entry.2 += 1;
+            if let Some((franked, credit, _)) = tx.franked_amount.and(Self::franking(tx, info, gross_full)) {
+                let estimate = franking_estimates.entry(tx.symbol.clone()).or_insert((0.0, 0.0));
+                estimate.0 += r2(franked * owned);
+                estimate.1 += r2(credit * owned);
+            }
             distribution_rows.push(vec![
                 text(share_label(&tx.symbol, owned)),
                 text(tx.date.as_str()),
@@ -1753,6 +1772,7 @@ impl Builder<'_> {
         let mut statement_rows = Vec::new();
         let mut panel = Vec::new();
         let mut missing = Vec::new();
+        let mut estimated = Vec::new();
         let mut to_enter = Vec::new();
         let mut cash_without = 0.0;
         for symbol in &symbols {
@@ -1761,7 +1781,16 @@ impl Builder<'_> {
             // A joint holding's statement is for the whole holding; the
             // return takes the user's share of every figure on it.
             let statement = statements.get(symbol);
-            let yours = statement.map(|s| scale_figures(&s.figures, owned));
+            let mut yours = statement.map(|s| scale_figures(&s.figures, owned));
+            // No statement yet: the franking recorded on the distributions is
+            // the best figure there is, and is shown as an estimate. The
+            // statement replaces it the moment it is entered.
+            let estimate = if statement.is_none() { franking_estimates.get(symbol).copied() } else { None };
+            if let Some((franked, credit)) = estimate {
+                add(&mut totals.franked_distributions, Some(franked));
+                add(&mut totals.franking_credits, Some(credit));
+                estimated.push(symbol.clone());
+            }
             match &yours {
                 Some(f) => {
                     add(&mut totals.non_primary_income, f.non_primary_income);
@@ -1782,10 +1811,13 @@ impl Builder<'_> {
                     to_enter.push(row);
                 }
             }
+            if let Some((franked, credit)) = estimate {
+                yours = Some(TaxStatementFigures { franked_distributions: Some(franked), franking_credits: Some(credit), ..Default::default() });
+            }
             let f = yours.unwrap_or_default();
             statement_rows.push(vec![
                 text(share_label(symbol, owned)),
-                text(if statement.is_some() { "Entered" } else { "Missing" }),
+                text(if statement.is_some() { "Entered" } else if estimate.is_some() { "Missing — franking estimated" } else { "Missing" }),
                 num(cash, ColumnKind::Money),
                 opt(f.non_primary_income, ColumnKind::Money),
                 opt(f.franked_distributions, ColumnKind::Money),
@@ -1819,18 +1851,30 @@ impl Builder<'_> {
             });
         }
         if !missing.is_empty() {
+            let estimate_note = if estimated.is_empty() {
+                String::new()
+            } else {
+                format!(" Until then 13C and 13Q use the franking recorded on the distributions of {}, as an estimate.", estimated.join(", "))
+            };
             self.warn("trusts", format!(
-                "No {} annual tax statement entered for {}. Their distributions are listed as cash received, which is not what goes on the return.",
+                "No {} annual tax statement entered for {}. Their distributions are listed as cash received, which is not what goes on the return.{}",
                 fy.label(),
-                missing.join(", ")
+                missing.join(", "),
+                estimate_note
             ));
         }
         self.totals.trusts = Some(totals.clone());
+        self.totals.trusts_estimated = estimated.clone();
 
+        let estimated_note = (!estimated.is_empty()).then(|| format!("includes estimates for {}", estimated.join(", ")));
+        let maybe_noted = |l: TaxSummaryLine| match &estimated_note {
+            Some(note) => noted(l, note.clone()),
+            None => l,
+        };
         let mut summary = vec![
             line(Some("13U"), "Non-primary production income", totals.non_primary_income.unwrap_or(0.0)),
-            line(Some("13C"), "Franked distributions from trusts", totals.franked_distributions.unwrap_or(0.0)),
-            line(Some("13Q"), "Share of franking credits", totals.franking_credits.unwrap_or(0.0)),
+            maybe_noted(line(Some("13C"), "Franked distributions from trusts", totals.franked_distributions.unwrap_or(0.0))),
+            maybe_noted(line(Some("13Q"), "Share of franking credits", totals.franking_credits.unwrap_or(0.0))),
             line(Some("13R"), "Share of credit for TFN amounts withheld", totals.tfn_withheld.unwrap_or(0.0)),
             noted(line(Some("18H"), "Capital gains from trusts (in the Capital gains section)", totals.total_capital_gains.unwrap_or(0.0)), "already netted there"),
             noted(line(Some("20E"), "Foreign source income from trusts", totals.assessable_foreign_income.unwrap_or(0.0)), "add to item 20"),
@@ -2072,7 +2116,8 @@ impl Builder<'_> {
                 "SELECT e.symbol, e.ex_date, e.payment_date, e.amount FROM dividend_events e
                   WHERE e.ex_date >= ?1
                     AND NOT EXISTS (SELECT 1 FROM holdings_transactions h
-                                     WHERE h.symbol = e.symbol AND h.date = e.ex_date AND h.transaction_type = 'dividend')
+                                     WHERE h.symbol = e.symbol AND (h.date = e.ex_date OR h.source_ex_date = e.ex_date)
+                                       AND h.transaction_type = 'dividend')
                     AND NOT EXISTS (SELECT 1 FROM dividend_exclusions x WHERE x.symbol = e.symbol AND x.ex_date = e.ex_date)
                   ORDER BY e.ex_date",
             )
@@ -2356,8 +2401,15 @@ fn label_summary(totals: &Totals) -> TaxSection {
     }
     if let Some(t) = &totals.trusts {
         summary.push(line(Some("13U"), "Share of net income from trusts (non-primary production)", t.non_primary_income.unwrap_or(0.0)));
-        summary.push(line(Some("13C"), "Franked distributions from trusts", t.franked_distributions.unwrap_or(0.0)));
-        summary.push(line(Some("13Q"), "Share of franking credits from franked dividends", t.franking_credits.unwrap_or(0.0)));
+        let estimated = |l: TaxSummaryLine| {
+            if totals.trusts_estimated.is_empty() {
+                l
+            } else {
+                noted(l, format!("includes estimates for {}", totals.trusts_estimated.join(", ")))
+            }
+        };
+        summary.push(estimated(line(Some("13C"), "Franked distributions from trusts", t.franked_distributions.unwrap_or(0.0))));
+        summary.push(estimated(line(Some("13Q"), "Share of franking credits from franked dividends", t.franking_credits.unwrap_or(0.0))));
         summary.push(line(Some("13R"), "Share of credit for TFN amounts withheld", t.tfn_withheld.unwrap_or(0.0)));
     }
     if let Some((event, result)) = &totals.capital {

@@ -2,6 +2,7 @@ import { useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { apiClient, OversellError, type HoldingTransactionPayload, type LedgerRow , type CashAccount } from '../services/api'
 import { settlementAccountsFor, settlesByConversion } from '../utils/cash'
 import TaxReport from './TaxReport'
+import DividendImport from './DividendImport'
 
 const SUPPORTED_CURRENCIES = ['AUD', 'USD', 'GBP', 'EUR', 'JPY', 'CAD', 'HKD', 'SGD', 'NZD']
 
@@ -43,6 +44,8 @@ interface EditState {
   withholding: string
   franked: string
   franking_credit: string
+  payment_date: string
+  dividend_type: string
   custom_fields: Record<string, string>
 }
 
@@ -78,6 +81,7 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
   // Server-driven currency list from /api/meta; static list is the offline fallback
   const [currencyOptions, setCurrencyOptions] = useState<string[]>([...SUPPORTED_CURRENCIES])
   const [showTaxReport, setShowTaxReport] = useState(false)
+  const [showImport, setShowImport] = useState(false)
 
   const loadLedger = async () => {
     const data = await apiClient.getTransactionsLedger()
@@ -249,6 +253,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       withholding: tx?.withholding_amount != null ? tx.withholding_amount.toString() : '',
       franked: tx?.franked_amount != null ? tx.franked_amount.toString() : '',
       franking_credit: tx?.franking_credit != null ? tx.franking_credit.toString() : '',
+      payment_date: tx?.payment_date ?? '',
+      dividend_type: tx?.dividend_type ?? '',
       custom_fields: tx?.custom_fields ?? {},
     })
   }
@@ -307,6 +313,8 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
         payload.withholding_amount = optional(editing.withholding)
         payload.franked_amount = optional(editing.franked)
         payload.franking_credit = optional(editing.franking_credit)
+        payload.payment_date = editing.payment_date || null
+        payload.dividend_type = editing.dividend_type.trim() || null
       }
       if (Object.keys(editing.custom_fields).length > 0) {
         payload.custom_fields = editing.custom_fields
@@ -375,6 +383,9 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
           <h2>Transactions</h2>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <span style={{ color: '#888', fontSize: 14 }}>{rows.length} record{rows.length !== 1 ? 's' : ''}</span>
+            <button className="btn btn-secondary btn-small" onClick={() => setShowImport(true)}>
+              Import dividends…
+            </button>
             <button className="btn btn-secondary btn-small" onClick={() => setShowTaxReport(true)}>
               Tax report…
             </button>
@@ -591,6 +602,21 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
                   </div>
                   <div style={{ display: 'flex', gap: 10 }}>
                     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <label style={{ fontSize: 13, color: '#666' }}>Payment date</label>
+                      <input type="date" className="config-input" value={editing.payment_date} onChange={(e) => setEditing({ ...editing, payment_date: e.target.value })} />
+                    </div>
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <label style={{ fontSize: 13, color: '#666' }}>Type</label>
+                      <input type="text" className="config-input" list="dividend-types" value={editing.dividend_type} placeholder="—" onChange={(e) => setEditing({ ...editing, dividend_type: e.target.value })} />
+                      <datalist id="dividend-types">
+                        <option value="Interim" />
+                        <option value="Final" />
+                        <option value="Special" />
+                      </datalist>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 10 }}>
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
                       <label style={{ fontSize: 13, color: '#666' }}>Tax withheld{editing.currency !== 'AUD' ? ` (${editing.currency})` : ''}</label>
                       <input type="number" min="0" step="0.01" className="config-input" value={editing.withholding} placeholder="—" onChange={(e) => setEditing({ ...editing, withholding: e.target.value })} />
                     </div>
@@ -636,6 +662,14 @@ export default function Transactions({ onLoading, holdingsVersion }: { onLoading
       )}
 
       {showTaxReport && <TaxReport onClose={() => setShowTaxReport(false)} />}
+      {showImport && (
+        <DividendImport
+          onClose={() => setShowImport(false)}
+          onImported={() => {
+            loadLedger().catch((err) => setError(err instanceof Error ? err.message : 'Failed to reload transactions'))
+          }}
+        />
+      )}
     </div>
   )
 }

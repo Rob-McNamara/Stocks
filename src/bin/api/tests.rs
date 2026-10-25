@@ -29,6 +29,9 @@ fn make_tx(id: i64, tx_type: &str, date: &str, quantity: f64, price: f64) -> Hol
         withholding_amount: None,
         franked_amount: None,
         franking_credit: None,
+        payment_date: None,
+        dividend_type: None,
+        source_ex_date: None,
         custom_fields: Default::default(),
     }
 }
@@ -777,6 +780,8 @@ fn integration_insert_and_fetch_holding_transaction() {
         withholding_amount: None,
         franked_amount: None,
         franking_credit: None,
+        payment_date: None,
+        dividend_type: None,
         confirm: None,
     };
 
@@ -814,6 +819,8 @@ fn integration_insert_transaction_rejects_zero_quantity() {
         withholding_amount: None,
         franked_amount: None,
         franking_credit: None,
+        payment_date: None,
+        dividend_type: None,
         confirm: None,
     };
 
@@ -2908,6 +2915,8 @@ fn trade_payload(symbol: &str, tx_type: &str, qty: f64, price: f64) -> NewHoldin
         withholding_amount: None,
         franked_amount: None,
         franking_credit: None,
+        payment_date: None,
+        dividend_type: None,
         confirm: None,
     }
 }
@@ -6069,6 +6078,206 @@ async fn the_worksheet_lists_what_still_has_to_be_entered() {
 }
 
 // -------------------------------------------------------------------------
+// Dividend import
+// -------------------------------------------------------------------------
+
+#[test]
+fn the_import_reads_quoted_fields_a_bom_and_crlf() {
+    let rows = parse_csv("\u{feff}a,b\r\n\"x, y\",\"say \"\"hi\"\"\"\r\n\r\nlast,\n").unwrap();
+    assert_eq!(rows, vec![
+        vec!["a".to_string(), "b".to_string()],
+        vec!["x, y".to_string(), "say \"hi\"".to_string()],
+        vec!["last".to_string(), String::new()],
+    ]);
+    assert!(parse_csv("a,\"open").is_err());
+}
+
+/// A broker's own column names are understood, and what can be worked out
+/// is: the total from per share × units, the franked part from the total.
+#[test]
+fn the_import_understands_a_brokers_headers() {
+    let text = "Code,Ex-div date,Payment Date,Type,Dividend per share,Units,Est. Unfranked Amount,Est. Total Dividend\n\
+                ADH,10-Mar-2026,07/04/2026,Interim,$0.0550,750,$0.00,\"$41.25\"\n\
+                XYZ,2026-01-01,,,0.10,100,5.00,9.00\n";
+    let rows = read_import_rows(text).unwrap();
+    let first = rows[0].1.as_ref().unwrap();
+    assert_eq!(first.symbol, "ADH");
+    assert_eq!(first.ex_date.to_string(), "2026-03-10");
+    assert_eq!(first.payment_date.unwrap().to_string(), "2026-04-07");
+    assert_eq!(first.dividend_type.as_deref(), Some("Interim"));
+    assert_eq!(first.franked, Some(41.25), "the total less the unfranked part");
+    assert!(rows[1].1.as_ref().unwrap_err().contains("per share × units (10.00) doesn't make the total 9.00"));
+
+    assert!(read_import_rows("symbol,total\nADH,1\n").unwrap_err().contains("ex_date"));
+}
+
+fn import_csv(db_path: &Path, text: &str, shortfall: bool) -> Vec<ImportPlanRow> {
+    plan_dividend_import(db_path, text, ImportOptions { shortfall_is_withholding: shortfall }).unwrap()
+}
+
+fn apply_all(db_path: &Path, text: &str, shortfall: bool) -> Vec<ImportPlanRow> {
+    let mut plan = import_csv(db_path, text, shortfall);
+    let lines: std::collections::HashSet<usize> = plan.iter().filter(|r| r.selected).map(|r| r.line).collect();
+    apply_dividend_import(db_path, &mut plan, &lines).unwrap();
+    plan
+}
+
+const IMPORT_HEADER: &str = "symbol,ex_date,payment_date,dividend_type,dividend_per_share,units,unfranked_amount,franked_amount,total_amount,franking_credit,withholding_tax,currency\n";
+
+/// The everyday case: a recorded dividend gains its payment date, type and
+/// franking, and its cash moves to the day it was paid.
+#[test]
+fn an_import_fills_in_a_recorded_dividend() {
+    let (_file, db_path) = setup_test_db();
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("INSERT INTO cash_accounts (id, name, currency, include_in_portfolio, created_at) VALUES (1, 'Bank', 'AUD', 1, '2024-01-01')", []).unwrap();
+    }
+    tax_tx(&db_path, 1, "CBA.AX", "purchase", "2025-01-02", 10.0, 100.0, 0.0, None);
+    tax_tx(&db_path, 2, "CBA.AX", "dividend", "2025-08-20", 10.0, 2.6, 0.0, None);
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("UPDATE holdings_transactions SET cash_account_id = 1 WHERE id = 2", []).unwrap();
+        sync_trade_cash_leg(&conn, 2).unwrap();
+    }
+    let text = format!("{IMPORT_HEADER}CBA.AX,2025-08-20,2025-09-29,Final,2.60,10,0.00,26.00,26.00,11.14,,AUD\n");
+
+    let plan = import_csv(&db_path, &text, false);
+    assert_eq!(plan[0].status, "update");
+    assert!(plan[0].selected);
+    let fields: Vec<&str> = plan[0].changes.iter().map(|c| c.field).collect();
+    assert_eq!(fields, vec!["Payment date", "Type", "Franked", "Franking credit"], "and nothing that merely agrees");
+
+    apply_all(&db_path, &text, false);
+    let conn = open_db(&db_path).unwrap();
+    let stored: (Option<String>, Option<String>, Option<f64>, Option<f64>) = conn
+        .query_row("SELECT payment_date, dividend_type, franked_amount, franking_credit FROM holdings_transactions WHERE id = 2", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap();
+    assert_eq!(stored, (Some("2025-09-29".into()), Some("Final".into()), Some(26.0), Some(11.14)));
+    let leg_date: String = conn.query_row("SELECT date FROM cash_transactions WHERE holding_tx_id = 2", [], |r| r.get(0)).unwrap();
+    assert_eq!(leg_date, "2025-09-29", "the cash lands on the payment date");
+    drop(conn);
+
+    assert_eq!(import_csv(&db_path, &text, false)[0].status, "unchanged", "importing twice changes nothing");
+}
+
+/// Yahoo dates a US-domiciled ASX fund by its US ex-date. Correcting it to
+/// the ASX one must not make the fetched event look unrecorded.
+#[test]
+fn a_corrected_ex_date_keeps_its_fetched_event() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "VTS.AX", "purchase", "2025-01-02", 7.0, 400.0, 0.0, None);
+    tax_tx(&db_path, 2, "VTS.AX", "dividend", "2025-09-30", 7.0, 1.3886, 0.0, None);
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("INSERT INTO dividend_events (symbol, ex_date, amount, fetched_at) VALUES ('VTS.AX', '2025-09-30', 1.3886, '2025-10-01')", []).unwrap();
+        conn.execute("INSERT INTO app_config (key, value) VALUES ('dividend_record_from', '2025-01-01')", []).unwrap();
+    }
+    let text = format!("{IMPORT_HEADER}VTS.AX,2025-09-29,2025-10-27,Interim,1.1803,7,8.26,0.00,8.26,0.00,,AUD\n");
+
+    let plan = import_csv(&db_path, &text, false);
+    assert_eq!(plan[0].matched_date.as_deref(), Some("2025-09-30"));
+    assert!(!plan[0].selected, "a 15% lower total waits for the user");
+    assert!(plan[0].warnings[0].contains("-15.0%"));
+
+    // Read as net of US tax: the gross stays and the gap is the tax.
+    let plan = apply_all(&db_path, &text, true);
+    assert!(plan[0].applied);
+    let conn = open_db(&db_path).unwrap();
+    let (date, source, amount, withheld): (String, Option<String>, f64, f64) = conn
+        .query_row("SELECT date, source_ex_date, amount, withholding_amount FROM holdings_transactions WHERE id = 2", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap();
+    assert_eq!(date, "2025-09-29");
+    assert_eq!(source.as_deref(), Some("2025-09-30"));
+    assert!((amount - 9.7202).abs() < 1e-9, "the gross is kept");
+    assert!((withheld - 1.4602).abs() < 1e-6);
+    drop(conn);
+
+    let recorded = record_new_dividends(&db_path).unwrap();
+    assert_eq!(recorded.recorded, 0, "the event is still the recorded dividend, not a new one");
+    let holdings = fetch_holdings(&db_path).unwrap();
+    let total = holdings.iter().find(|t| t.symbol == "VTS.AX").unwrap().dividends_total;
+    assert!((total - (9.7202 - 1.4602)).abs() < 1e-6, "counted once, net of the tax: {}", total);
+}
+
+/// A dividend the app never recorded is recorded from the statement, and
+/// credited where the app's own dividends go.
+#[test]
+fn an_import_records_a_missing_dividend() {
+    let (_file, db_path) = setup_test_db();
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("INSERT INTO cash_accounts (id, name, currency, include_in_portfolio, created_at) VALUES (4, 'Dividends', 'AUD', 1, '2024-01-01')", []).unwrap();
+        conn.execute("INSERT INTO app_config (key, value) VALUES ('dividend_account_AUD', '4')", []).unwrap();
+    }
+    tax_tx(&db_path, 1, "SOL.AX", "purchase", "2025-01-02", 90.0, 30.0, 0.0, None);
+    tax_tx(&db_path, 2, "NOH.AX", "purchase", "2026-01-02", 10.0, 3.0, 0.0, None);
+    let text = format!(
+        "{IMPORT_HEADER}SOL.AX,2025-08-21,2025-09-05,Final,0.59,90,0.00,53.10,53.10,22.76,,AUD\n\
+         BKW.AX,2025-08-21,2025-09-05,Final,0.484,80,0.00,38.72,38.72,16.59,,AUD\n\
+         SOL.AX,2025-08-21,2025-09-05,Final,0.59,90,0.00,53.10,53.10,22.76,,AUD\n\
+         NOH.AX,2025-08-21,,,0.10,10,,,,,,AUD\n"
+    );
+    let plan = import_csv(&db_path, &text, false);
+    assert_eq!(plan[0].status, "create");
+    assert!(plan[0].selected);
+    assert!(plan[0].changes.iter().any(|c| c.field == "Credited to" && c.to.as_deref() == Some("Dividends")));
+    assert_eq!(plan[1].error.as_deref(), Some("No BKW.AX holding in the app"));
+    assert_eq!(plan[2].error.as_deref(), Some("Same dividend as line 2"));
+    assert!(plan[3].warnings[0].contains("no NOH.AX held"), "{:?}", plan[3].warnings);
+    assert!(!plan[3].selected);
+
+    apply_all(&db_path, &text, false);
+    let conn = open_db(&db_path).unwrap();
+    let (amount, franked, leg_date, leg_amount): (f64, f64, String, f64) = conn
+        .query_row(
+            "SELECT h.amount, h.franked_amount, c.date, c.amount FROM holdings_transactions h
+               JOIN cash_transactions c ON c.holding_tx_id = h.id WHERE h.symbol = 'SOL.AX' AND h.transaction_type = 'dividend'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((amount, franked, leg_date.as_str(), leg_amount), (53.1, 53.1, "2025-09-05", 53.1));
+    let noh: i64 = conn.query_row("SELECT COUNT(*) FROM holdings_transactions WHERE symbol = 'NOH.AX' AND transaction_type = 'dividend'", [], |r| r.get(0)).unwrap();
+    assert_eq!(noh, 0, "an unticked row is not written");
+}
+
+/// The edit form moving a dividend's date has the same problem as the
+/// import, and the same fix.
+#[test]
+fn editing_a_dividends_date_keeps_its_fetched_event() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "AAA.AX", "purchase", "2025-01-02", 10.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 2, "AAA.AX", "dividend", "2025-09-30", 10.0, 0.5, 0.0, None);
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("INSERT INTO dividend_events (symbol, ex_date, amount, fetched_at) VALUES ('AAA.AX', '2025-09-30', 0.5, '2025-10-01')", []).unwrap();
+    }
+    let mut edit = trade_payload("AAA.AX", "dividend", 10.0, 0.5);
+    edit.date = "2025-09-29".to_string();
+    edit.amount = Some(5.0);
+    edit.payment_date = Some(Some("2025-10-20".into()));
+    modify_holding_transaction(&db_path, 2, "AAA.AX", edit).unwrap();
+    let conn = open_db(&db_path).unwrap();
+    let (source, paid): (Option<String>, Option<String>) = conn
+        .query_row("SELECT source_ex_date, payment_date FROM holdings_transactions WHERE id = 2", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(source.as_deref(), Some("2025-09-30"));
+    assert_eq!(paid.as_deref(), Some("2025-10-20"));
+}
+
+#[actix_web::test]
+async fn a_file_the_import_cant_read_is_a_bad_request() {
+    let (_file, db_path) = setup_test_db();
+    let app = actix_web::test::init_service(App::new().app_data(web::Data::new(db_path.clone())).service(import_dividends)).await;
+    let req = actix_web::test::TestRequest::post()
+        .uri("/api/dividends/import")
+        .set_json(serde_json::json!({ "csv": "name,amount\nx,1\n" }))
+        .to_request();
+    assert_eq!(actix_web::test::call_service(&app, req).await.status(), 400);
+}
+
+// -------------------------------------------------------------------------
 // Sector rotation
 // -------------------------------------------------------------------------
 
@@ -6472,4 +6681,83 @@ fn an_empty_newest_close_is_completed_from_the_meta() {
     // With no meta to complete it, the empty bar is still left out.
     let bars = chart_history(&chart(None), "XOM").unwrap();
     assert_eq!(bars.iter().map(|b| b.date.as_str()).collect::<Vec<_>>(), ["2026-10-22"]);
+}
+
+/// A fund with tax taken at source whose statement is short by no more than
+/// that tax is showing the net. Replacing the gross with it lost the income
+/// and the tax both, and the standing rate then came off the net again.
+#[test]
+fn a_short_total_on_a_withholding_symbol_is_read_as_tax_withheld() {
+    let (_file, db_path) = setup_test_db();
+    tax_tx(&db_path, 1, "VTS.AX", "purchase", "2025-01-02", 7.0, 400.0, 0.0, None);
+    tax_tx(&db_path, 2, "VTS.AX", "dividend", "2025-09-29", 7.0, 1.3886, 0.0, None);
+    tax_tx(&db_path, 3, "LOW.AX", "purchase", "2025-01-02", 10.0, 10.0, 0.0, None);
+    tax_tx(&db_path, 4, "LOW.AX", "dividend", "2025-09-29", 10.0, 1.0, 0.0, None);
+    for (symbol, pct) in [("VTS.AX", 30.0), ("LOW.AX", 10.0)] {
+        store_symbol_tax_settings(&db_path, symbol, &SymbolTaxPayload {
+            income_kind: None,
+            franking_pct: None,
+            dividend_withholding_pct: Some(Some(pct)),
+            tax_share_pct: None,
+        })
+        .unwrap();
+    }
+    let text = format!(
+        "{IMPORT_HEADER}VTS.AX,2025-09-29,2025-10-27,Interim,1.1803,7,8.26,0.00,8.26,0.00,,AUD\n\
+         LOW.AX,2025-09-29,2025-10-27,Interim,0.80,10,8.00,0.00,8.00,0.00,,AUD\n"
+    );
+
+    // Unasked: 15% short on a 30% standing rate is tax withheld.
+    let plan = import_csv(&db_path, &text, false);
+    assert!(plan[0].selected, "{:?}", plan[0].warnings);
+    let withheld = plan[0].changes.iter().find(|c| c.field == "Tax withheld").unwrap();
+    assert_eq!(withheld.to.as_deref(), Some("1.46 (15.0% of the 9.72 recorded)"));
+    assert!(plan[0].changes.iter().all(|c| c.field != "Total (AUD)"), "the gross stays");
+
+    // 20% short is more than a 10% rate explains: still for the user to judge.
+    assert!(!plan[1].selected);
+    assert!(plan[1].warnings[0].contains("-20.0%"));
+}
+
+/// Until a fund's annual statement is in, the franking a broker's summary
+/// put on its distributions stands in for 13C and 13Q — said to be an
+/// estimate, and replaced by the statement once entered.
+#[actix_web::test]
+async fn a_trusts_imported_franking_estimates_its_statement() {
+    let (_file, db_path) = setup_test_db();
+    store_symbol_tax_settings(&db_path, "VAS.AX", &SymbolTaxPayload {
+        income_kind: Some(Some("trust".into())),
+        franking_pct: None,
+        dividend_withholding_pct: None,
+        tax_share_pct: None,
+    })
+    .unwrap();
+    tax_tx(&db_path, 1, "VAS.AX", "purchase", "2024-01-02", 40.0, 90.0, 0.0, None);
+    tax_tx(&db_path, 2, "VAS.AX", "dividend", "2024-10-01", 40.0, 1.0959, 0.0, None);
+    tax_tx(&db_path, 3, "VAS.AX", "dividend", "2025-01-02", 40.0, 0.8208, 0.0, None);
+    {
+        let conn = open_db(&db_path).unwrap();
+        conn.execute("UPDATE holdings_transactions SET franked_amount = 36.30, franking_credit = 15.56 WHERE id = 2", []).unwrap();
+        conn.execute("UPDATE holdings_transactions SET franked_amount = 22.23 WHERE id = 3", []).unwrap();
+    }
+
+    let report = tax_report(&db_path, "fy=2025&sections=trusts,checks").await;
+    assert_eq!(figure(&report, "trusts", "13C"), 58.53);
+    // The second distribution's credit is grossed up at 30%: 22.23 × 3/7.
+    assert_eq!(figure(&report, "trusts", "13Q"), 15.56 + 9.53);
+    let line = section(&report, "trusts")["summary"].as_array().unwrap().iter().find(|l| l["item"] == "13C").unwrap().clone();
+    assert_eq!(line["note"], "includes estimates for VAS.AX");
+    assert_eq!(table_rows(&report, "trusts", "Annual tax statements")[0]["Statement"], "Missing — franking estimated");
+    assert!(has_check(&report, "Until then 13C and 13Q use the franking recorded on the distributions of VAS.AX"));
+
+    store_tax_statement(&db_path, "VAS.AX", 2025, &TaxStatementFigures {
+        franked_distributions: Some(60.0),
+        franking_credits: Some(25.71),
+        ..Default::default()
+    })
+    .unwrap();
+    let report = tax_report(&db_path, "fy=2025&sections=trusts").await;
+    assert_eq!(figure(&report, "trusts", "13C"), 60.0, "the statement replaces the estimate");
+    let line = section(&report, "trusts")["summary"].as_array().unwrap().iter().find(|l| l["item"] == "13C").unwrap().clone();
+    assert!(line["note"].is_null());
 }

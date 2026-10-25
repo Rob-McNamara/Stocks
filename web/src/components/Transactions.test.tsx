@@ -55,7 +55,7 @@ function row(overrides: Record<string, unknown> = {}) {
 const LEDGER = [
   row({ key: 'a', id: 1, symbol: 'ZZZ.AX', date: '2026-03-01', quantity: 10, price: 5, brokerage: 9.5, cash_account_id: 6 }),
   row({ key: 'b', id: 2, symbol: 'AAA.AX', date: '2026-01-15', quantity: 2, price: 3, brokerage: 1.25, cash_account_id: 2, notes: 'zebra' }),
-  row({ key: 'c', id: 3, symbol: 'MMM.AX', date: '2026-02-10', transaction_type: 'dividend', quantity: null, price: null, amount: 300, brokerage: null, cash_account_id: 6, notes: 'apple', franked_amount: 300, franking_credit: 128.57 }),
+  row({ key: 'c', id: 3, symbol: 'MMM.AX', date: '2026-02-10', transaction_type: 'dividend', quantity: null, price: null, amount: 300, brokerage: null, cash_account_id: 6, notes: 'apple', franked_amount: 300, franking_credit: 128.57, payment_date: '2026-03-12', dividend_type: 'Interim' }),
   row({ key: 'd', id: null, symbol: 'DDD.AX', date: '2026-02-20', transaction_type: 'dividend', quantity: null, price: null, amount: 0.5, per_share: true, brokerage: null, cash_account_id: null }),
 ]
 
@@ -160,11 +160,15 @@ describe('tax figures', () => {
     const dividendRow = screen.getByText('MMM.AX').closest('tr')!
     fireEvent.click(within(dividendRow).getByText('Edit'))
 
-    const field = (label: string) => screen.getByText(label).parentElement!.querySelector('input') as HTMLInputElement
+    const dialog = within(document.querySelector('.modal-card') as HTMLElement)
+    const field = (label: string) => dialog.getByText(label).parentElement!.querySelector('input') as HTMLInputElement
     expect(field('Franked amount').value).toBe('300')
     expect(field('Franking credit').value).toBe('128.57')
     expect(field('Tax withheld').value).toBe('')
+    expect(field('Payment date').value).toBe('2026-03-12')
+    expect(field('Type').value).toBe('Interim')
     fireEvent.change(field('Franking credit'), { target: { value: '128.58' } })
+    fireEvent.change(field('Type'), { target: { value: '' } })
     fireEvent.click(screen.getByText('Save'))
 
     await waitFor(() => expect(mocked.updateHoldingTransaction).toHaveBeenCalled())
@@ -172,5 +176,7 @@ describe('tax figures', () => {
     expect(payload.franked_amount).toBe(300)
     expect(payload.franking_credit).toBe(128.58)
     expect(payload.withholding_amount).toBeNull()
+    expect(payload.payment_date).toBe('2026-03-12')
+    expect(payload.dividend_type).toBeNull()
   })
 })

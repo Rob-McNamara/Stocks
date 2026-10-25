@@ -775,9 +775,15 @@ pub(crate) fn sync_trade_cash_leg(conn: &Connection, holding_tx_id: i64) -> Resu
     // account before the money existed, so use the payment date when the
     // fetched event knows it.
     let settle_date = if tx_type == "dividend" {
+        // The payment date recorded on the dividend itself (from its
+        // statement) wins; otherwise the fetched event's, found by the event
+        // the dividend stands for.
         conn.query_row(
-            "SELECT payment_date FROM dividend_events WHERE symbol = ?1 AND ex_date = ?2",
-            params![symbol, date],
+            "SELECT COALESCE(h.payment_date,
+                             (SELECT e.payment_date FROM dividend_events e
+                               WHERE e.symbol = h.symbol AND e.ex_date = COALESCE(h.source_ex_date, h.date)))
+               FROM holdings_transactions h WHERE h.id = ?1",
+            params![holding_tx_id],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()

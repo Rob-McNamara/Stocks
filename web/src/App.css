@@ -2005,3 +2005,62 @@
     break-before: page;
   }
 }
+
+/* Dividend import dialog (Transactions screen). */
+.import-card {
+  width: min(1100px, 100%);
+  height: 100%;
+  text-align: left;
+}
+
+.import-file {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.import-choose {
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+/* The native control is invisible over the button that stands for it. */
+.import-choose input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.import-help ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
+.import-summary {
+  font-size: 14px;
+  margin: 10px 0;
+}
+
+.import-table td {
+  vertical-align: top;
+}
+
+.import-changes {
+  white-space: normal !important;
+  min-width: 380px;
+}
+
+.import-unchanged td,
+.import-applied td {
+  color: #999;
+}
+
+.import-error {
+  color: #c62828;
+}
+

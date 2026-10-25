@@ -459,6 +459,8 @@ export interface LedgerRow {
   /** A dividend's franked amount and franking credit (AUD) from its statement */
   franked_amount?: number | null
   franking_credit?: number | null
+  /** A dividend's type from its statement: Interim, Final, Special… */
+  dividend_type?: string | null
   /** true for fetched dividend events (per-share amounts); false for manual rows (totals) */
   per_share: boolean
   payment_date: string | null
@@ -583,6 +585,9 @@ export interface HoldingTransactionPayload {
   withholding_amount?: number | null
   franked_amount?: number | null
   franking_credit?: number | null
+  /** A dividend's payment date (YYYY-MM-DD) and type. Omit to keep; null clears. */
+  payment_date?: string | null
+  dividend_type?: string | null
   /** Acknowledge an over-sell warning (server responds 409 otherwise) */
   confirm?: boolean
 }
@@ -793,6 +798,46 @@ export async function downloadTaxReportCsv(params: TaxReportParams): Promise<voi
   link.remove()
   // Revoked after a beat: Safari starts the download asynchronously.
   setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// ---------------------------------------------------------------------------
+// Dividend import
+// ---------------------------------------------------------------------------
+
+export interface DividendImportChange {
+  field: string
+  from: string | null
+  to: string | null
+}
+
+export interface DividendImportRow {
+  /** The file's line number; the header is line 1 */
+  line: number
+  symbol: string
+  ex_date: string
+  status: 'update' | 'create' | 'unchanged' | 'error'
+  transaction_id: number | null
+  /** The recorded dividend's ex-date, when the file corrects it */
+  matched_date: string | null
+  changes: DividendImportChange[]
+  warnings: string[]
+  error: string | null
+  /** Ticked in the preview: a clean update or a new dividend */
+  selected: boolean
+  applied: boolean
+}
+
+export interface DividendImportResult {
+  applied: boolean
+  updated: number
+  created: number
+  counts: { update: number; create: number; unchanged: number; error: number }
+  rows: DividendImportRow[]
+}
+
+export interface DividendImportOptions {
+  /** A statement total lower than recorded is tax withheld: keep the gross, record the gap */
+  shortfall_is_withholding: boolean
 }
 
 export interface ChartDrawing {
@@ -1224,6 +1269,24 @@ export const apiClient = {
       body: JSON.stringify({ fy }),
     })
     if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to record the export')
+  },
+
+  /**
+   * Preview a dividend CSV (nothing is written), or apply the chosen lines.
+   * The server works the plan out afresh from the same file either way.
+   */
+  async importDividends(
+    csv: string,
+    options: DividendImportOptions,
+    apply?: { lines: number[] },
+  ): Promise<DividendImportResult> {
+    const response = await apiFetch(`${API_BASE_URL}/dividends/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv, options, apply: apply !== undefined, lines: apply?.lines }),
+    })
+    if (!response.ok) throw new Error((await apiErrorMessage(response)) || 'Failed to read the dividend file')
+    return response.json()
   },
 
   async getTransactionsLedger(): Promise<{ rows: LedgerRow[] }> {

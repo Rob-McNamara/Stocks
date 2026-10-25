@@ -287,7 +287,8 @@ pub(crate) fn record_new_dividends(db_path: &PathBuf) -> Result<DividendRecordRe
                    FROM dividend_events e
                   WHERE e.ex_date >= ?1
                     AND NOT EXISTS (SELECT 1 FROM holdings_transactions h
-                                     WHERE h.symbol = e.symbol AND h.date = e.ex_date
+                                     WHERE h.symbol = e.symbol
+                                       AND (h.date = e.ex_date OR h.source_ex_date = e.ex_date)
                                        AND h.transaction_type = 'dividend')
                   ORDER BY e.ex_date, e.symbol",
             )
@@ -357,6 +358,8 @@ pub(crate) fn record_new_dividends(db_path: &PathBuf) -> Result<DividendRecordRe
             withholding_amount: None,
             franked_amount: None,
             franking_credit: None,
+            payment_date: None,
+            dividend_type: None,
             confirm: None,
         };
         if currency != "AUD" {
@@ -549,6 +552,9 @@ pub(crate) fn calculate_dividend_totals(db_path: &PathBuf, transactions: &[Holdi
         for tx in symbol_transactions.iter().filter(|t| t.transaction_type == "dividend") {
             let Some(amount) = tx.amount else { continue };
             recorded_dates.insert(tx.date.as_str());
+            if let Some(source) = &tx.source_ex_date {
+                recorded_dates.insert(source.as_str());
+            }
             total += match withheld_on.get(&tx.id) {
                 // The explicit amount is in the trade's own currency.
                 Some(withheld) => {
